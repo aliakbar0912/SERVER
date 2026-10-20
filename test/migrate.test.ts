@@ -19,14 +19,20 @@ test('migrations apply once, revert, and re-apply', { skip: false }, async (t) =
   if (!tdb) return t.skip(SKIP_NO_PG);
   try {
     const first = await migrateUp(tdb.db, loadMigrations(repoMigrations));
-    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql']);
+    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql', '0004_auto_registration.sql']);
     const again = await migrateUp(tdb.db, loadMigrations(repoMigrations));
     assert.deepEqual(again, []);
     const status = await migrationStatus(tdb.db, loadMigrations(repoMigrations));
-    assert.equal(status.currentVersion, 3);
+    assert.equal(status.currentVersion, 4);
     assert.equal(status.pending.length, 0);
     const { rows } = await tdb.db.query("SELECT count(*)::int AS n FROM settings WHERE key = 'catalogue_version'");
     assert.equal(rows[0].n, 1);
+
+    // 0004 reverts cleanly on its own: its columns and setting go, everything else stays.
+    await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));
+    assert.equal((await tdb.db.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'devices' AND column_name = 'install_id'")).rows[0].n, 0);
+    assert.equal((await tdb.db.query("SELECT count(*)::int AS n FROM settings WHERE key = 'allow_auto_registration'")).rows[0].n, 0);
+    assert.notEqual((await tdb.db.query("SELECT to_regclass('public.device_models') AS t")).rows[0].t, null);
 
     // 0003 reverts cleanly on its own: the new table goes, the 0002 tables stay.
     await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));

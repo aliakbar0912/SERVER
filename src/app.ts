@@ -29,7 +29,7 @@ const routes: Route[] = [
   R('GET', '/healthz', async (ctx) => sendJson(ctx.res, 200, { status: 'ok' })),
   R('GET', '/readyz', readiness),
   R('GET', '/v1/client-config', clientConfig.clientConfigRoute),
-  R('POST', '/v1/devices/enroll', devices.enrollDevice),
+  R('POST', '/v1/devices/register', devices.registerDevice),
   R('GET', '/v1/device', catalogue.deviceRoute),
   R('GET', '/v1/catalogue', catalogue.catalogueRoute),
   R('GET', '/v1/catalogue/status', catalogue.catalogueStatusRoute),
@@ -62,10 +62,9 @@ const routes: Route[] = [
 
   R('GET', '/admin/api/devices', devices.listDevices),
   R('POST', '/admin/api/devices/:id/revoke', devices.revokeDevice),
+  R('POST', '/admin/api/devices/:id/unblock', devices.unblockDevice),
   R('GET', '/admin/api/devices/:id/models', devices.getDeviceModels),
   R('PUT', '/admin/api/devices/:id/models', devices.putDeviceModels),
-  R('GET', '/admin/api/enrollment-codes', devices.listEnrollmentCodes),
-  R('POST', '/admin/api/enrollment-codes', devices.createEnrollmentCode),
 
   R('GET', '/admin/api/usage', data.usage),
   R('GET', '/admin/api/logs', data.logs),

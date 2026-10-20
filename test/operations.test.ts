@@ -202,7 +202,7 @@ describe('HTTP: request IDs, owner-only health, device checks', () => {
     const text = await res.text();
     const body = JSON.parse(text);
     assert.equal(body.database.ok, true);
-    assert.equal(body.database.schemaVersion, 3);
+    assert.equal(body.database.schemaVersion, 4);
     assert.equal(body.database.pendingMigrations, 0);
     assert.equal(body.configuration.secretKeyringConfigured, true);
     assert.equal(body.activity.rateLimitStore, 'database');

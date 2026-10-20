@@ -1,6 +1,6 @@
 // Cryptographic helpers. Only Node built-ins are used.
 //  - Passwords: scrypt with a per-password salt, compared in constant time.
-//  - Tokens (admin sessions, CSRF, device tokens, enrollment codes): random values, stored only as SHA-256 hashes.
+//  - Tokens (admin sessions, CSRF, device tokens): random values, stored only as SHA-256 hashes.
 //  - Provider API keys: AES-256-GCM with a versioned keyring. The key id is stored with each ciphertext so keys can be rotated.
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
@@ -43,20 +43,6 @@ export function constantTimeEqualHex(a: string, b: string): boolean {
   const x = Buffer.from(a, 'hex');
   const y = Buffer.from(b, 'hex');
   return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
-}
-
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0, O, 1, I
-
-/** 16 characters, shown as four groups. Uniform over the alphabet. */
-export function enrollmentCode(): string {
-  let out = '';
-  for (let i = 0; i < 16; i++) out += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
-  return out.match(/.{4}/g)!.join('-');
-}
-
-/** Accepts the code with or without dashes and in any case. */
-export function normalizeEnrollmentCode(input: string): string {
-  return input.toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
 export interface Keyring {

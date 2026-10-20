@@ -1,87 +1,56 @@
-// Desktop devices: owner-issued enrollment codes (one use, short-lived), per-device tokens (hashed, revocable), and device listing.
+// Desktop devices: automatic registration (no codes), per-device tokens (hashed, blockable), and device listing.
+//
+// A desktop app registers itself the first time it starts: it sends a random installation id it generated and keeps,
+// and gets a device token. The owner sees every registered computer in the admin site and can block it. A blocked
+// installation stays blocked when it registers again. New registrations can be switched off in Settings.
 import type { Ctx, DeviceAuth } from '../context.ts';
-import { enrollmentCode, normalizeEnrollmentCode, randomToken, sha256Hex } from '../crypto.ts';
+import { randomToken, sha256Hex } from '../crypto.ts';
 import { fail, readJson, requireObject, rejectUnknown, sendJson, str, uuidParam, clientAddress } from '../http/util.ts';
 import { guardOwner } from './auth.ts';
-import { catalogueVersion } from './catalogue.ts';
+import { catalogueVersion, readSettings } from './catalogue.ts';
 import { setDeviceAccess } from './registry.ts';
 
-const CODE_MINUTES = 15;
-const MAX_OUTSTANDING_CODES = 20;
-const ENROLL_PER_IP = 10;
-const ENROLL_WINDOW_SECONDS = 15 * 60;
+const REGISTER_PER_IP = 10;
+const REGISTER_WINDOW_SECONDS = 15 * 60;
 const DEVICE_TOUCH_SECONDS = 60;
+const INSTALL_ID = /^[A-Za-z0-9_-]{16,64}$/;
 
-/** Owner: creates a one-time enrollment code. The code is returned once; only its hash is stored. */
-export async function createEnrollmentCode(ctx: Ctx): Promise<void> {
-  const s = await guardOwner(ctx, { write: true, sensitive: true });
-  const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ['label']);
-  const label = str(body, 'label', { max: 80, optional: true }) ?? '';
-  const { rows: outstanding } = await ctx.deps.db.query('SELECT count(*)::int AS n FROM enrollment_codes WHERE used_at IS NULL AND expires_at > now()');
-  if (outstanding[0].n >= MAX_OUTSTANDING_CODES) fail(409, 'too_many_codes', 'too many enrollment codes are waiting; let them expire or use one first');
-  const code = enrollmentCode();
-  const { rows } = await ctx.deps.db.query(
-    `INSERT INTO enrollment_codes (code_hash, label, created_by, expires_at)
-     VALUES ($1, $2, $3, now() + make_interval(mins => $4))
-     RETURNING expires_at`,
-    [sha256Hex(normalizeEnrollmentCode(code)), label, s.ownerId, CODE_MINUTES],
-  );
-  sendJson(ctx.res, 201, { code, label, expiresAt: new Date(rows[0].expires_at).toISOString() });
-}
-
-export async function listEnrollmentCodes(ctx: Ctx): Promise<void> {
-  await guardOwner(ctx, { write: false });
-  const { rows } = await ctx.deps.db.query(
-    `SELECT id, label, created_at, expires_at, used_at, device_id,
-            (used_at IS NULL AND expires_at > now()) AS usable
-       FROM enrollment_codes ORDER BY created_at DESC LIMIT 100`,
-  );
-  sendJson(ctx.res, 200, {
-    codes: rows.map((r) => ({
-      id: r.id,
-      label: r.label,
-      createdAt: r.created_at,
-      expiresAt: r.expires_at,
-      usedAt: r.used_at,
-      deviceId: r.device_id,
-      status: r.used_at ? 'used' : r.usable ? 'waiting' : 'expired',
-    })),
-  });
-}
-
-/** Desktop: exchanges a valid code for a device token. Every failure returns the same message. */
-export async function enrollDevice(ctx: Ctx): Promise<void> {
+/**
+ * POST /v1/devices/register { installId, deviceName }: returns a device token for this installation.
+ * The same installation registering again gets a fresh token (the old one stops working). A blocked one is refused.
+ */
+export async function registerDevice(ctx: Ctx): Promise<void> {
   const { db, config } = ctx.deps;
   const ip = clientAddress(ctx.req, config.trustProxy);
   // Persistent, so a restart does not reset the counter. Shared by every process.
-  const limit = await ctx.deps.limits.hit(`enroll:ip:${ip}`, ENROLL_PER_IP, ENROLL_WINDOW_SECONDS);
-  if (!limit.allowed) fail(429, 'rate_limited', 'too many enrollment attempts; try again later', { 'retry-after': String(limit.retryAfterSeconds) });
+  const limit = await ctx.deps.limits.hit(`register:ip:${ip}`, REGISTER_PER_IP, REGISTER_WINDOW_SECONDS);
+  if (!limit.allowed) fail(429, 'rate_limited', 'too many registrations from this network; try again later', { 'retry-after': String(limit.retryAfterSeconds) });
   const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ['code', 'deviceName']);
-  const code = str(body, 'code', { min: 16, max: 40 })!;
+  rejectUnknown(body, ['installId', 'deviceName']);
+  const installId = str(body, 'installId', { min: 16, max: 64 })!;
+  if (!INSTALL_ID.test(installId)) fail(400, 'invalid_request', 'installId must be 16 to 64 letters, digits, _ or -');
   const deviceName = str(body, 'deviceName', { min: 1, max: 80 })!;
-  const invalid = () => fail(400, 'invalid_enrollment_code', 'the enrollment code is not valid, has expired, or was already used');
   const token = randomToken(32);
 
   const result = await db.transaction(async (q) => {
-    const { rows } = await q.query(
-      `SELECT id FROM enrollment_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() FOR UPDATE`,
-      [sha256Hex(normalizeEnrollmentCode(code))],
-    );
-    if (!rows[0]) return null;
+    const { rows } = await q.query('SELECT id, status FROM devices WHERE install_id = $1 FOR UPDATE', [installId]);
+    const existing = rows[0];
+    if (existing) {
+      if (existing.status !== 'active') return { blocked: true as const };
+      await q.query('UPDATE devices SET token_hash = $2, name = $3, last_seen_at = now() WHERE id = $1', [existing.id, sha256Hex(token), deviceName]);
+      return { id: existing.id as string, created: false };
+    }
+    const settings = await readSettings(q);
+    if (settings.allow_auto_registration === false) return { closed: true as const };
     const dev = await q.query(
-      `INSERT INTO devices (name, token_hash, created_by, last_seen_at)
-       SELECT $1, $2, created_by, now() FROM enrollment_codes WHERE id = $3
-       RETURNING id`,
-      [deviceName, sha256Hex(token), rows[0].id],
+      `INSERT INTO devices (name, token_hash, install_id, registered_via, last_seen_at) VALUES ($1, $2, $3, 'auto', now()) RETURNING id`,
+      [deviceName, sha256Hex(token), installId],
     );
-    await q.query('UPDATE enrollment_codes SET used_at = now(), device_id = $2 WHERE id = $1', [rows[0].id, dev.rows[0].id]);
-    return dev.rows[0].id as string;
+    return { id: dev.rows[0].id as string, created: true };
   });
-  if (!result) invalid();
-  await ctx.deps.limits.clear(`enroll:ip:${ip}`);
-  sendJson(ctx.res, 201, { deviceId: result, token, catalogueVersion: await catalogueVersion(db) });
+  if ('blocked' in result) fail(403, 'device_blocked', 'the owner has blocked this computer');
+  if ('closed' in result) fail(403, 'registration_closed', 'the owner is not accepting new computers right now');
+  sendJson(ctx.res, result.created ? 201 : 200, { deviceId: result.id, token, catalogueVersion: await catalogueVersion(db) });
 }
 
 /** Authenticates the Bearer device token. Revoked devices are refused on every request. */
@@ -95,7 +64,7 @@ export async function authenticateDevice(ctx: Ctx): Promise<DeviceAuth> {
     [sha256Hex(match[1]), DEVICE_TOUCH_SECONDS],
   );
   const row = rows[0];
-  if (!row || row.status !== 'active') fail(401, 'device_revoked', 'this device is not allowed to use the service; sign in to the desktop app again after the owner re-enrolls it');
+  if (!row || row.status !== 'active') fail(401, 'device_revoked', 'this device is not allowed to use the service');
   if (row.touch) await ctx.deps.db.query('UPDATE devices SET last_seen_at = now() WHERE id = $1', [row.id]);
   return { deviceId: row.id, name: row.name, modelAccess: row.model_access };
 }
@@ -103,7 +72,7 @@ export async function authenticateDevice(ctx: Ctx): Promise<DeviceAuth> {
 export async function listDevices(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query(
-    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access,
+    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via,
             (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted
        FROM devices d ORDER BY d.created_at DESC LIMIT 500`,
   );
@@ -116,6 +85,7 @@ export async function listDevices(ctx: Ctx): Promise<void> {
       lastSeenAt: r.last_seen_at,
       revokedAt: r.revoked_at,
       modelAccess: r.model_access,
+      registeredVia: r.registered_via,
       grantedModels: r.granted,
     })),
   });
@@ -129,10 +99,22 @@ export async function revokeDevice(ctx: Ctx): Promise<void> {
   const confirm = str(body, 'confirmName', { max: 80, optional: true });
   const { rows } = await ctx.deps.db.query('SELECT name, status FROM devices WHERE id = $1', [id]);
   if (!rows[0]) fail(404, 'not_found', 'device not found');
-  if (confirm !== rows[0].name) fail(400, 'confirmation_mismatch', 'type the device name exactly to revoke it');
-  if (rows[0].status === 'revoked') fail(409, 'already_revoked', 'this device is already revoked');
+  if (confirm !== rows[0].name) fail(400, 'confirmation_mismatch', 'type the device name exactly to block it');
+  if (rows[0].status === 'revoked') fail(409, 'already_revoked', 'this device is already blocked');
   await ctx.deps.db.query("UPDATE devices SET status = 'revoked', revoked_at = now() WHERE id = $1", [id]);
   sendJson(ctx.res, 200, { id, status: 'revoked' });
+}
+
+/** POST /admin/api/devices/:id/unblock: the computer may register again; it gets a new token the next time it connects. */
+export async function unblockDevice(ctx: Ctx): Promise<void> {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const { rows } = await ctx.deps.db.query('SELECT status FROM devices WHERE id = $1', [id]);
+  if (!rows[0]) fail(404, 'not_found', 'device not found');
+  if (rows[0].status === 'active') fail(409, 'not_blocked', 'this device is not blocked');
+  // A new random token hash: the old token stays invalid, the desktop registers again to get a working one.
+  await ctx.deps.db.query("UPDATE devices SET status = 'active', revoked_at = NULL, token_hash = $2 WHERE id = $1", [id, sha256Hex(randomToken(32))]);
+  sendJson(ctx.res, 200, { id, status: 'active' });
 }
 
 

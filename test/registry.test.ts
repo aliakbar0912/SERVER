@@ -115,8 +115,7 @@ before(async () => {
   ids.noList = await provider('NoList', noListUrl, null);
 
   for (const code of ['A', 'B']) {
-    const c = await call('POST', '/admin/api/enrollment-codes', { owner: true, body: { label: code } });
-    const e = await call('POST', '/v1/devices/enroll', { body: { code: c.json.code, deviceName: `device ${code}` } });
+    const e = await call('POST', '/v1/devices/register', { body: { installId: `registry-install-${code}-0000`, deviceName: `device ${code}` } });
     assert.equal(e.status, 201, e.text);
     tokens[code] = e.json.token;
     deviceIds[code] = e.json.deviceId;

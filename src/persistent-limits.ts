@@ -23,7 +23,7 @@ export async function hitRate(q: Queryer, key: string, limit: number, windowSeco
   return { allowed: true, retryAfterSeconds: 0 };
 }
 
-/** Clears every window for a key after a success (for example a valid enrollment code). */
+/** Clears every window for a key after a success (for example a successful login). */
 export async function clearRate(q: Queryer, key: string): Promise<void> {
   await q.query('DELETE FROM rate_counters WHERE key = $1', [key]);
 }

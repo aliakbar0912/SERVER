@@ -137,6 +137,7 @@ export async function currentSettings(db: Queryer) {
     maxConcurrentPerDevice: Number(s.max_concurrent_per_device ?? 2),
     maxOutputTokens: Number(s.max_output_tokens ?? 8192),
     allowDirectProvider: s.allow_direct_provider === true,
+    allowAutoRegistration: s.allow_auto_registration !== false,
   };
 }
 
@@ -145,6 +146,7 @@ const SETTING_KEYS: Record<string, string> = {
   maxConcurrentPerDevice: 'max_concurrent_per_device',
   maxOutputTokens: 'max_output_tokens',
   allowDirectProvider: 'allow_direct_provider',
+  allowAutoRegistration: 'allow_auto_registration',
 };
 
 export async function patchSettings(ctx: Ctx): Promise<void> {
@@ -163,10 +165,15 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
     requireReauth(session);
     changes.push(['allow_direct_provider', direct]);
   }
+  const autoReg = bool(body, 'allowAutoRegistration', { optional: true });
+  if (autoReg !== undefined) changes.push(['allow_auto_registration', autoReg]);
   if (changes.length === 0) fail(400, 'invalid_request', 'no settings were given');
   await ctx.deps.db.transaction(async (q) => {
     for (const [k, v] of changes) {
-      await q.query('UPDATE settings SET value = $2, updated_at = now() WHERE key = $1', [k, JSON.stringify(v)]);
+      await q.query(
+        'INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()',
+        [k, JSON.stringify(v)],
+      );
     }
     if (changes.some(([k]) => k === 'max_output_tokens' || k === 'allow_direct_provider')) await bumpCatalogue(q);
   });

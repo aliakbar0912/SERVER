@@ -18,7 +18,7 @@ export interface Config {
   trustProxy: boolean;
   keyring: Keyring;
   logRetentionDays: number;
-  /** Public base URL of the API, shown to the owner for enrollment instructions. Optional. */
+  /** Public base URL of the API, announced to desktop apps in /v1/client-config. Optional. */
   publicApiOrigin: string | null;
   /** Redis for rate limits, cache and locks. Null means PostgreSQL holds the rate limits and there is no cache. */
   redis: RedisConfig | null;

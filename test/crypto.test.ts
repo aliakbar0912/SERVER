@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { hashPassword, verifyPassword, randomToken, sha256Hex, enrollmentCode, normalizeEnrollmentCode, parseKeyring, sealSecret, openSecret } from '../src/crypto.ts';
+import { hashPassword, verifyPassword, randomToken, sha256Hex, parseKeyring, sealSecret, openSecret } from '../src/crypto.ts';
 
 const key = (id: number) => `${id}=${crypto.randomBytes(32).toString('base64')}`;
 
@@ -19,12 +19,6 @@ test('tokens are random and hashed for storage', () => {
   assert.equal(randomToken().length, 43);
   assert.match(sha256Hex('abc'), /^[0-9a-f]{64}$/);
   assert.notEqual(sha256Hex('abc'), 'abc');
-});
-
-test('enrollment codes are grouped, unambiguous and normalize', () => {
-  const c = enrollmentCode();
-  assert.match(c, /^[A-HJ-NP-Z2-9]{4}(-[A-HJ-NP-Z2-9]{4}){3}$/);
-  assert.equal(normalizeEnrollmentCode(c.toLowerCase()), c.replace(/-/g, ''));
 });
 
 test('secrets round-trip, are bound to their row, and survive key rotation', () => {

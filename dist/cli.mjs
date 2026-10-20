@@ -153,15 +153,15 @@ function loadMigrations(dir = defaultMigrationsDir()) {
   const seen = /* @__PURE__ */ new Set();
   return files.map((file) => {
     const m = /^(\d{4})_([a-z0-9_]+)\.sql$/.exec(file);
-    const version = Number(m[1]);
-    if (seen.has(version)) throw new Error(`duplicate migration version ${version}`);
-    seen.add(version);
+    const version2 = Number(m[1]);
+    if (seen.has(version2)) throw new Error(`duplicate migration version ${version2}`);
+    seen.add(version2);
     const text = fs.readFileSync(path.join(dir, file), "utf8");
     const upIdx = text.indexOf("-- migrate:up");
     const downIdx = text.indexOf("-- migrate:down");
     if (upIdx < 0 || downIdx < 0 || downIdx < upIdx) throw new Error(`${file} must contain "-- migrate:up" followed by "-- migrate:down"`);
     return {
-      version,
+      version: version2,
       name: m[2],
       file,
       checksum: crypto.createHash("sha256").update(text).digest("hex"),
@@ -1364,12 +1364,12 @@ var CATALOGUE_CACHE_SECONDS = 300;
 async function cachedCatalogue(ctx) {
   const { db, limits } = ctx.deps;
   if (limits.kind !== "redis") return buildCatalogue(db);
-  const version = await catalogueVersion(db);
-  const key = `catalogue:v${version}`;
+  const version2 = await catalogueVersion(db);
+  const key = `catalogue:v${version2}`;
   const hit = await limits.cacheGet(key);
-  if (hit && hit.version === version) return hit;
+  if (hit && hit.version === version2) return hit;
   const cat = await buildCatalogue(db);
-  if (cat.version === version) await limits.cacheSet(key, cat, CATALOGUE_CACHE_SECONDS);
+  if (cat.version === version2) await limits.cacheSet(key, cat, CATALOGUE_CACHE_SECONDS);
   return cat;
 }
 async function catalogueRoute(ctx) {
@@ -2477,11 +2477,36 @@ async function adminHealth(ctx) {
   });
 }
 
+// src/modules/client-config.ts
+var CLIENT_CONFIG_SCHEMA = 1;
+var CLIENT_CONFIG_MAX_AGE_SECONDS = 7 * 24 * 3600;
+function clientConfigBody(config) {
+  return {
+    schema: CLIENT_CONFIG_SCHEMA,
+    instanceId: config.instanceId,
+    apiOrigin: config.publicApiOrigin,
+    apiVersions: ["v1"],
+    desktop: {
+      minVersion: config.desktop.minVersion,
+      latestVersion: config.desktop.latestVersion,
+      downloadUrl: config.desktop.downloadUrl
+    },
+    status: { message: config.desktop.statusMessage },
+    features: {},
+    maxAgeSeconds: CLIENT_CONFIG_MAX_AGE_SECONDS
+  };
+}
+async function clientConfigRoute(ctx) {
+  ctx.res.setHeader("cache-control", "public, max-age=300");
+  sendJson(ctx.res, 200, clientConfigBody(ctx.deps.config));
+}
+
 // src/app.ts
 var R = (method, path2, handler) => ({ method, parts: path2.split("/").filter(Boolean), handler });
 var routes = [
   R("GET", "/healthz", async (ctx) => sendJson(ctx.res, 200, { status: "ok" })),
   R("GET", "/readyz", readiness),
+  R("GET", "/v1/client-config", clientConfigRoute),
   R("POST", "/v1/devices/enroll", enrollDevice),
   R("GET", "/v1/device", deviceRoute),
   R("GET", "/v1/catalogue", catalogueRoute),
@@ -2643,14 +2668,15 @@ function createHandler(input) {
 }
 function createServer(deps) {
   const server = http.createServer(createHandler(deps));
-  server.requestTimeout = 3e5;
-  server.headersTimeout = 3e4;
+  server.requestTimeout = deps.config.requestTimeoutMs;
+  server.headersTimeout = deps.config.headersTimeoutMs;
   server.keepAliveTimeout = 65e3;
   return server;
 }
 
 // src/config.ts
 import fs3 from "node:fs";
+import crypto6 from "node:crypto";
 function bool2(v, fallback) {
   if (v === void 0 || v === "") return fallback;
   if (["1", "true", "yes", "on"].includes(v.toLowerCase())) return true;
@@ -2663,7 +2689,8 @@ function int2(v, fallback, min, max, name) {
   if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
   return n;
 }
-function origin(v, name) {
+var LOOPBACK2 = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function origin(v, name, production = false, ignored = []) {
   if (!v) return null;
   let u;
   try {
@@ -2671,8 +2698,53 @@ function origin(v, name) {
   } catch {
     throw new Error(`${name} must be a URL such as https://admin.YOUR_DOMAIN`);
   }
+  if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error(`${name} must start with https://`);
+  if (u.username || u.password) throw new Error(`${name} must not contain credentials`);
   if (u.pathname !== "/" || u.search || u.hash) throw new Error(`${name} must be an origin without a path`);
+  if (!production && /YOUR_DOMAIN/i.test(u.hostname)) {
+    ignored.push(`${name} still contains the YOUR_DOMAIN placeholder and is ignored; set a real address or remove the line`);
+    return null;
+  }
+  if (production) {
+    if (u.protocol !== "https:") throw new Error(`${name} must use https in production`);
+    if (LOOPBACK2.has(u.hostname) || u.hostname.endsWith(".localhost")) throw new Error(`${name} must not be a local address in production`);
+    if (/YOUR_DOMAIN/i.test(u.hostname)) throw new Error(`${name} still contains the YOUR_DOMAIN placeholder`);
+  }
   return u.origin;
+}
+function httpsUrl(v, name) {
+  if (!v) return null;
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new Error(`${name} must be an https URL`);
+  }
+  if (u.protocol !== "https:" || u.username || u.password) throw new Error(`${name} must be an https URL without credentials`);
+  return u.toString();
+}
+function version(v, name) {
+  if (!v) return null;
+  if (!/^\d+\.\d+\.\d+$/.test(v)) throw new Error(`${name} must look like 1.2.3`);
+  return v;
+}
+function environment(env) {
+  const devora = env.DEVORA_ENV;
+  if (devora && !["development", "production"].includes(devora)) throw new Error("DEVORA_ENV must be development or production");
+  if (devora === "development" && env.NODE_ENV === "production") {
+    throw new Error("DEVORA_ENV=development conflicts with NODE_ENV=production; set DEVORA_ENV=production on a server");
+  }
+  return devora === "production" || env.NODE_ENV === "production" ? "production" : "development";
+}
+function instanceId(env, keyring) {
+  const explicit = env.DEVORA_INSTANCE_ID;
+  if (explicit) {
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(explicit)) throw new Error("DEVORA_INSTANCE_ID must be 8 to 64 letters, digits, _ or -");
+    return explicit;
+  }
+  const first = [...keyring.keys.keys()].sort((a, b) => a - b)[0];
+  if (first === void 0) return "development";
+  return crypto6.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
 }
 function parseDatabase(env, production) {
   const sslDefault = production ? "require" : "disable";
@@ -2725,32 +2797,72 @@ function redisPrefix(v) {
   return v;
 }
 function loadConfig(env = process.env) {
-  const production = (env.DEVORA_ENV ?? "development") === "production";
-  if (env.DEVORA_ENV && !["development", "production"].includes(env.DEVORA_ENV)) throw new Error("DEVORA_ENV must be development or production");
+  const production = environment(env) === "production";
   const cookieSecure = bool2(env.COOKIE_SECURE, production);
   if (production && !cookieSecure) throw new Error("COOKIE_SECURE must be true in production");
   const keyring = parseKeyring(env.DEVORA_SECRET_KEYS ?? "", env.DEVORA_SECRET_ACTIVE_KEY ?? "");
   if (production && keyring.size === 0) throw new Error("DEVORA_SECRET_KEYS is required in production");
+  const ignoredSettings = [];
+  const adminOrigin = origin(env.ADMIN_ORIGIN, "ADMIN_ORIGIN", production, ignoredSettings);
+  if (production && !adminOrigin) throw new Error("ADMIN_ORIGIN is required in production (the https address of the admin website)");
+  const statusMessage = (env.DEVORA_STATUS_MESSAGE ?? "").trim();
+  if (statusMessage.length > 200) throw new Error("DEVORA_STATUS_MESSAGE may be at most 200 characters");
+  const headersTimeoutMs = int2(env.HEADERS_TIMEOUT_MS, 3e4, 1e3, 12e4, "HEADERS_TIMEOUT_MS");
+  const requestTimeoutMs = int2(env.REQUEST_TIMEOUT_MS, 3e5, 1e4, 36e5, "REQUEST_TIMEOUT_MS");
+  if (requestTimeoutMs <= headersTimeoutMs) throw new Error("REQUEST_TIMEOUT_MS must be larger than HEADERS_TIMEOUT_MS");
   return {
     env: production ? "production" : "development",
     host: env.HOST || "0.0.0.0",
     port: int2(env.PORT, 8080, 1, 65535, "PORT"),
     database: parseDatabase(env, production),
     poolSize: int2(env.DATABASE_POOL_SIZE, 10, 1, 50, "DATABASE_POOL_SIZE"),
-    adminOrigin: origin(env.ADMIN_ORIGIN, "ADMIN_ORIGIN"),
+    adminOrigin,
     cookieSecure,
     trustProxy: bool2(env.TRUST_PROXY, false),
     keyring,
     logRetentionDays: int2(env.DEVORA_LOG_RETENTION_DAYS, 30, 1, 3650, "DEVORA_LOG_RETENTION_DAYS"),
-    publicApiOrigin: origin(env.PUBLIC_API_ORIGIN, "PUBLIC_API_ORIGIN"),
+    publicApiOrigin: origin(env.PUBLIC_API_ORIGIN, "PUBLIC_API_ORIGIN", production, ignoredSettings),
     redis: env.REDIS_URL ? parseRedisUrl(env.REDIS_URL, env) : null,
     redisKeyPrefix: redisPrefix(env.REDIS_KEY_PREFIX),
-    discoveryIntervalHours: int2(env.DEVORA_DISCOVERY_INTERVAL_HOURS, 12, 0, 168, "DEVORA_DISCOVERY_INTERVAL_HOURS")
+    discoveryIntervalHours: int2(env.DEVORA_DISCOVERY_INTERVAL_HOURS, 12, 0, 168, "DEVORA_DISCOVERY_INTERVAL_HOURS"),
+    ignoredSettings,
+    requestTimeoutMs,
+    headersTimeoutMs,
+    desktop: {
+      minVersion: version(env.DEVORA_DESKTOP_MIN_VERSION, "DEVORA_DESKTOP_MIN_VERSION"),
+      latestVersion: version(env.DEVORA_DESKTOP_LATEST_VERSION, "DEVORA_DESKTOP_LATEST_VERSION"),
+      downloadUrl: httpsUrl(env.DEVORA_DESKTOP_DOWNLOAD_URL, "DEVORA_DESKTOP_DOWNLOAD_URL"),
+      statusMessage
+    },
+    instanceId: instanceId(env, keyring)
+  };
+}
+function configWarnings(c) {
+  const out = [...c.ignoredSettings];
+  if (c.env === "production" && !c.publicApiOrigin) out.push("PUBLIC_API_ORIGIN is not set: desktop apps cannot be moved to a new API domain automatically");
+  if (c.env === "production" && !c.trustProxy) out.push("TRUST_PROXY is false: behind Dokploy/Traefik every request appears to come from the proxy");
+  if (c.env === "production" && !c.redis) out.push("REDIS_URL is not set: rate limits use PostgreSQL and there is no cache");
+  return out;
+}
+function redactedConfig(c) {
+  return {
+    env: c.env,
+    host: c.host,
+    port: c.port,
+    database: `${c.database.host}:${c.database.port}/${c.database.database} (ssl ${c.database.ssl})`,
+    adminOrigin: c.adminOrigin,
+    publicApiOrigin: c.publicApiOrigin,
+    cookieSecure: c.cookieSecure,
+    trustProxy: c.trustProxy,
+    encryptionKeys: c.keyring.size,
+    redis: c.redis ? `${c.redis.host}:${c.redis.port}/${c.redis.db}${c.redis.tls ? " (tls)" : ""}` : null,
+    requestTimeoutMs: c.requestTimeoutMs,
+    desktopMinVersion: c.desktop.minVersion
   };
 }
 
 // src/db/pg-wire.ts
-import crypto6 from "node:crypto";
+import crypto7 from "node:crypto";
 import net2 from "node:net";
 import tls2 from "node:tls";
 import fs4 from "node:fs";
@@ -2836,7 +2948,7 @@ function parseError(body) {
   return new PgError(fields.M ?? "database error", fields.C ?? "", fields.D);
 }
 function hmac(key, data) {
-  return crypto6.createHmac("sha256", key).update(data).digest();
+  return crypto7.createHmac("sha256", key).update(data).digest();
 }
 var PgConnection = class _PgConnection {
   socket;
@@ -2945,7 +3057,7 @@ var PgConnection = class _PgConnection {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
   async scram(password) {
-    const nonce = crypto6.randomBytes(18).toString("base64");
+    const nonce = crypto7.randomBytes(18).toString("base64");
     const clientFirstBare = `n=,r=${nonce}`;
     const initial = Buffer.from(`n,,${clientFirstBare}`, "utf8");
     this.socket.write(frame("p", Buffer.concat([cstr("SCRAM-SHA-256"), int32(initial.length), initial])));
@@ -2958,10 +3070,10 @@ var PgConnection = class _PgConnection {
     const iterations = Number(attrs.i);
     if (!Number.isInteger(iterations) || iterations < 4096 || iterations > 1e6) throw new PgError("unacceptable SCRAM iteration count");
     const salted = await new Promise(
-      (resolve, reject) => crypto6.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
+      (resolve, reject) => crypto7.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
     );
     const clientKey = hmac(salted, "Client Key");
-    const storedKey = crypto6.createHash("sha256").update(clientKey).digest();
+    const storedKey = crypto7.createHash("sha256").update(clientKey).digest();
     const clientFinalNoProof = `c=biws,r=${attrs.r}`;
     const authMessage = `${clientFirstBare},${serverFirst},${clientFinalNoProof}`;
     const signature = hmac(storedKey, authMessage);
@@ -3181,6 +3293,8 @@ function usage2() {
 }
 async function serve() {
   const config = loadConfig();
+  log("info", "configuration", redactedConfig(config));
+  for (const w of configWarnings(config)) log("warn", w);
   const db = new Db(config.database, config.poolSize);
   const status = await migrationStatus(db);
   if (status.pending.length) {
@@ -3323,9 +3437,9 @@ async function redisCheck() {
   try {
     const ms = await redis.ping();
     const info = String(await redis.command("INFO", "server"));
-    const version = /redis_version:([^\r\n]+)/.exec(info)?.[1] ?? "unknown";
+    const version2 = /redis_version:([^\r\n]+)/.exec(info)?.[1] ?? "unknown";
     process.stdout.write(
-      `redis ok: ${redis.target}, version ${version}, round trip ${ms} ms, ${config.redis.password ? "password accepted" : "no password configured and none required"}, ${config.redis.tls ? "TLS" : "no TLS"}
+      `redis ok: ${redis.target}, version ${version2}, round trip ${ms} ms, ${config.redis.password ? "password accepted" : "no password configured and none required"}, ${config.redis.tls ? "TLS" : "no TLS"}
 `
     );
   } finally {

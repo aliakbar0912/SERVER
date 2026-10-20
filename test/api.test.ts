@@ -28,7 +28,7 @@ let deviceToken = '';
 let modelId = '';
 let fallbackModelId = '';
 let providerId = '';
-let codeValue = '';
+const INSTALL_ID = 'install-0123456789abcdef';
 
 interface Res {
   status: number;
@@ -102,7 +102,7 @@ describe('health and schema', () => {
     assert.equal((await call('GET', '/healthz')).status, 200);
     const ready = await call('GET', '/readyz');
     assert.equal(ready.status, 200);
-    assert.equal(ready.json.schemaVersion, 3);
+    assert.equal(ready.json.schemaVersion, 4);
   });
 
   test('desktop runtime configuration is public, versioned and free of secrets', async (t) => {
@@ -301,34 +301,41 @@ describe('providers and models', () => {
 });
 
 describe('desktop devices', () => {
-  test('the owner creates a one-time enrollment code', async (t) => {
+  test('a desktop registers itself with its installation id and gets a device token', async (t) => {
     if (!tdb) return t.skip(SKIP_NO_PG);
-    const res = await call('POST', '/admin/api/enrollment-codes', { session: true, body: { label: 'Ali laptop' } });
-    assert.equal(res.status, 201, res.text);
-    codeValue = res.json.code;
-    assert.match(codeValue, /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/);
-  });
-
-  test('enrollment exchanges the code for a device token, once', async (t) => {
-    if (!tdb) return t.skip(SKIP_NO_PG);
-    const res = await call('POST', '/v1/devices/enroll', { body: { code: codeValue.toLowerCase(), deviceName: 'Ali laptop' } });
+    const res = await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } });
     assert.equal(res.status, 201, res.text);
     deviceToken = res.json.token;
     assert.ok(deviceToken.length >= 40);
-    const reuse = await call('POST', '/v1/devices/enroll', { body: { code: codeValue, deviceName: 'Other' } });
-    assert.equal(reuse.status, 400);
-    assert.equal(reuse.json.error.code, 'invalid_enrollment_code');
+    const list = await call('GET', '/admin/api/devices', { session: true });
+    const dev = list.json.devices.find((d: any) => d.id === res.json.deviceId);
+    assert.equal(dev.name, 'Ali laptop');
+    assert.equal(dev.registeredVia, 'auto');
   });
 
-  test('a wrong code and an expired code get the same answer', async (t) => {
+  test('registering again from the same installation replaces the token; bad input is refused', async (t) => {
     if (!tdb) return t.skip(SKIP_NO_PG);
-    const wrong = await call('POST', '/v1/devices/enroll', { body: { code: 'AAAA-BBBB-CCCC-DDDD', deviceName: 'x' } });
-    assert.equal(wrong.status, 400);
-    await tdb!.db.query("INSERT INTO enrollment_codes (code_hash, expires_at) VALUES ($1, now() - interval '1 minute')", [
-      crypto.createHash('sha256').update('EEEEFFFFGGGGHHHH').digest('hex'),
-    ]);
-    const expired = await call('POST', '/v1/devices/enroll', { body: { code: 'EEEE-FFFF-GGGG-HHHH', deviceName: 'x' } });
-    assert.equal(expired.json.error.message, wrong.json.error.message);
+    const again = await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } });
+    assert.equal(again.status, 200, again.text);
+    assert.notEqual(again.json.token, deviceToken);
+    assert.equal((await call('GET', '/v1/catalogue', { device: deviceToken })).status, 401, 'the previous token no longer works');
+    deviceToken = again.json.token;
+    assert.equal((await call('GET', '/admin/api/devices', { session: true })).json.devices.length, 1, 'still one device');
+    assert.equal((await call('POST', '/v1/devices/register', { body: { installId: 'short', deviceName: 'x' } })).status, 400);
+    assert.equal((await call('POST', '/v1/devices/register', { body: { installId: 'x'.repeat(20) + '!!', deviceName: 'x' } })).status, 400);
+    assert.equal((await call('POST', '/v1/devices/register', { body: { installId: 'x'.repeat(20), deviceName: 'x', code: 'y' } })).status, 400);
+  });
+
+  test('the owner can stop new computers from registering; registered ones keep working', async (t) => {
+    if (!tdb) return t.skip(SKIP_NO_PG);
+    await call('PATCH', '/admin/api/settings', { session: true, body: { allowAutoRegistration: false } });
+    const blocked = await call('POST', '/v1/devices/register', { body: { installId: 'n'.repeat(24), deviceName: 'New PC' } });
+    assert.equal(blocked.status, 403);
+    assert.equal(blocked.json.error.code, 'registration_closed');
+    assert.equal((await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } })).status, 200, 'a known computer can still renew');
+    assert.equal((await call('GET', '/admin/api/settings', { session: true })).json.allowAutoRegistration, false);
+    await call('PATCH', '/admin/api/settings', { session: true, body: { allowAutoRegistration: true } });
+    deviceToken = (await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } })).json.token;
   });
 
   test('the device token is hashed in the database', async (t) => {
@@ -522,6 +529,20 @@ describe('central chat routing', () => {
     assert.equal(chat.status, 401);
     assert.equal(chat.json.error.code, 'device_revoked');
     assert.equal((await call('GET', '/v1/catalogue', { device: deviceToken })).status, 401);
+    // A blocked installation stays blocked when it registers again.
+    const again = await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } });
+    assert.equal(again.status, 403);
+    assert.equal(again.json.error.code, 'device_blocked');
+  });
+
+  test('unblocking lets the same computer register again, with a new token', async (t) => {
+    if (!tdb) return t.skip(SKIP_NO_PG);
+    const dev = (await call('GET', '/admin/api/devices', { session: true })).json.devices[0];
+    assert.equal((await call('POST', `/admin/api/devices/${dev.id}/unblock`, { session: true })).status, 200);
+    assert.equal((await call('GET', '/v1/catalogue', { device: deviceToken })).status, 401, 'the old token stays invalid');
+    const again = await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'Ali laptop' } });
+    assert.equal(again.status, 200);
+    assert.equal((await call('GET', '/v1/catalogue', { device: again.json.token })).status, 200);
   });
 });
 
@@ -551,7 +572,7 @@ describe('usage, logs and settings', () => {
     const res = await call('GET', '/admin/api/overview', { session: true });
     assert.equal(res.status, 200);
     assert.equal(res.json.providersEnabled, 1);
-    assert.equal(res.json.devicesActive, 0);
+    assert.equal(res.json.devicesActive, 1, 'the device was unblocked in the devices tests');
     assert.ok(res.json.failed24h >= 1);
   });
 

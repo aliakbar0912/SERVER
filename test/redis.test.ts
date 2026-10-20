@@ -304,7 +304,7 @@ describe('API server with Redis', () => {
 
   test('when Redis is down, limited routes answer 503 with a clean JSON error', async (t) => {
     if (skip(t)) return;
-    const res = await post(downBase, '/v1/devices/enroll', { code: 'AAAA-BBBB-CCCC-DDDD', deviceName: 'x' });
+    const res = await post(downBase, '/v1/devices/register', { installId: 'redis-down-install-0000', deviceName: 'x' });
     assert.equal(res.status, 503);
     assert.equal(res.json.error.code, 'service_unavailable');
     assert.equal(res.headers.get('retry-after'), '5');
@@ -317,7 +317,6 @@ describe('API server with Redis', () => {
     const login = await post(base, '/admin/api/auth/login', { email: OWNER_EMAIL, password: OWNER_PASSWORD });
     assert.equal(login.status, 200);
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
-    const auth = { cookie, 'x-csrf-token': login.json.csrfToken };
 
     const health = (await (await fetch(`${base}/admin/api/health`, { headers: { cookie } })).json()) as any;
     assert.equal(health.redis.configured, true);
@@ -332,10 +331,7 @@ describe('API server with Redis', () => {
     assert.equal(down.redis.ok, false);
     assert.equal(down.activity.rateLimitStore, 'unavailable');
 
-    assert.equal((await post(base, '/admin/api/auth/reauth', { password: OWNER_PASSWORD }, auth)).status, 200);
-    const code = await post(base, '/admin/api/enrollment-codes', { label: 'redis test' }, auth);
-    assert.equal(code.status, 201);
-    const enrolled = await post(base, '/v1/devices/enroll', { code: code.json.code, deviceName: 'redis test' });
+    const enrolled = await post(base, '/v1/devices/register', { installId: 'redis-test-install-0000', deviceName: 'redis test' });
     assert.equal(enrolled.status, 201);
     const cat = await fetch(`${base}/v1/catalogue`, { headers: { authorization: `Bearer ${enrolled.json.token}` } });
     assert.equal(cat.status, 200);
