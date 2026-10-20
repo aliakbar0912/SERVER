@@ -1,0 +1,3371 @@
+#!/usr/bin/env node
+
+// src/cli.ts
+import http2 from "node:http";
+
+// src/app.ts
+import http from "node:http";
+import crypto5 from "node:crypto";
+
+// src/http/util.ts
+var HttpError = class extends Error {
+  status;
+  code;
+  headers;
+  constructor(status, code, message, headers = {}) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+    this.code = code;
+    this.headers = headers;
+  }
+};
+function fail(status, code, message, headers) {
+  throw new HttpError(status, code, message, headers);
+}
+function sendJson(res, status, body, headers = {}) {
+  const payload = status === 204 ? "" : JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(payload),
+    ...headers
+  });
+  res.end(payload);
+}
+function sendError(res, err) {
+  sendJson(res, err.status, { error: { code: err.code, message: err.message } }, err.headers);
+}
+function sendOpenAiError(res, status, code, message, headers = {}) {
+  const type = status >= 500 ? "server_error" : status === 429 ? "rate_limit_error" : status === 401 || status === 403 ? "authentication_error" : "invalid_request_error";
+  sendJson(res, status, { error: { message, type, code } }, headers);
+}
+async function readJson(req, limit) {
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (declared > limit) fail(413, "payload_too_large", "the request body is too large");
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) {
+      req.destroy();
+      fail(413, "payload_too_large", "the request body is too large");
+    }
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text.trim()) return {};
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    fail(400, "invalid_json", "the request body is not valid JSON");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(400, "invalid_request", "the request body must be a JSON object");
+  return value;
+}
+function setCookie(name, value, opts) {
+  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${opts.maxAgeSeconds}${opts.secure ? "; Secure" : ""}`;
+}
+function clearCookie(name, secure) {
+  return `${name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? "; Secure" : ""}`;
+}
+function clientAddress(req, trustProxy) {
+  if (trustProxy) {
+    const xff = req.headers["x-forwarded-for"];
+    const last = (Array.isArray(xff) ? xff.join(",") : xff ?? "").split(",").map((s) => s.trim()).filter(Boolean).pop();
+    if (last) return last.slice(0, 64);
+  }
+  return (req.socket.remoteAddress ?? "unknown").slice(0, 64);
+}
+function userAgent(req) {
+  const ua = req.headers["user-agent"];
+  return (Array.isArray(ua) ? ua[0] : ua ?? "").slice(0, 300);
+}
+function requireObject(v, what = "body") {
+  if (!v || typeof v !== "object" || Array.isArray(v)) fail(400, "invalid_request", `${what} must be an object`);
+  return v;
+}
+function rejectUnknown(body, allowed) {
+  for (const k of Object.keys(body)) if (!allowed.includes(k)) fail(400, "invalid_request", `unknown field "${k}"`);
+}
+function str(body, key, opts) {
+  const raw = body[key];
+  if (raw === void 0 || raw === null) {
+    if (opts.optional) return void 0;
+    fail(400, "invalid_request", `${key} is required`);
+  }
+  if (typeof raw !== "string") fail(400, "invalid_request", `${key} must be a string`);
+  const value = opts.trim === false ? raw : raw.trim();
+  if (value.length < (opts.min ?? 0)) fail(400, "invalid_request", `${key} is too short`);
+  if (value.length > opts.max) fail(400, "invalid_request", `${key} is longer than ${opts.max} characters`);
+  if (opts.pattern && value && !opts.pattern.test(value)) fail(400, "invalid_request", `${key} has an invalid format`);
+  return value;
+}
+function int(body, key, opts) {
+  const raw = body[key];
+  if (raw === void 0 || raw === null) {
+    if (opts.optional) return void 0;
+    fail(400, "invalid_request", `${key} is required`);
+  }
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < opts.min || raw > opts.max) {
+    fail(400, "invalid_request", `${key} must be an integer from ${opts.min} to ${opts.max}`);
+  }
+  return raw;
+}
+function bool(body, key, opts = {}) {
+  const raw = body[key];
+  if (raw === void 0 || raw === null) {
+    if (opts.optional || opts.def !== void 0) return opts.def;
+    fail(400, "invalid_request", `${key} is required`);
+  }
+  if (typeof raw !== "boolean") fail(400, "invalid_request", `${key} must be true or false`);
+  return raw;
+}
+var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function uuidParam(value) {
+  if (!value || !UUID.test(value)) fail(404, "not_found", "not found");
+  return value;
+}
+var SENSITIVE_KEYS = /authorization|cookie|apikey|api_key|password|token|secret|content|messages|prompt/i;
+function log(level, msg, fields = {}) {
+  const safe = {};
+  for (const [k, v] of Object.entries(fields)) safe[k] = SENSITIVE_KEYS.test(k) ? "[redacted]" : v;
+  const line = JSON.stringify({ time: (/* @__PURE__ */ new Date()).toISOString(), level, msg, ...safe });
+  (level === "error" ? process.stderr : process.stdout).write(line + "\n");
+}
+
+// src/db/migrate.ts
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+var LOCK_KEY = 727001001;
+function defaultMigrationsDir() {
+  if (process.env.DEVORA_MIGRATIONS_DIR) return path.resolve(process.env.DEVORA_MIGRATIONS_DIR);
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const c of [path.join(here, "..", "migrations"), path.join(here, "..", "..", "migrations")]) {
+    if (fs.existsSync(c)) return c;
+  }
+  throw new Error("migrations directory not found; set DEVORA_MIGRATIONS_DIR");
+}
+function loadMigrations(dir = defaultMigrationsDir()) {
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}_[a-z0-9_]+\.sql$/.test(f)).sort();
+  const seen = /* @__PURE__ */ new Set();
+  return files.map((file) => {
+    const m = /^(\d{4})_([a-z0-9_]+)\.sql$/.exec(file);
+    const version = Number(m[1]);
+    if (seen.has(version)) throw new Error(`duplicate migration version ${version}`);
+    seen.add(version);
+    const text = fs.readFileSync(path.join(dir, file), "utf8");
+    const upIdx = text.indexOf("-- migrate:up");
+    const downIdx = text.indexOf("-- migrate:down");
+    if (upIdx < 0 || downIdx < 0 || downIdx < upIdx) throw new Error(`${file} must contain "-- migrate:up" followed by "-- migrate:down"`);
+    return {
+      version,
+      name: m[2],
+      file,
+      checksum: crypto.createHash("sha256").update(text).digest("hex"),
+      up: text.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
+      down: text.slice(downIdx + "-- migrate:down".length).trim()
+    };
+  });
+}
+async function ensureTable(c) {
+  await c.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version integer PRIMARY KEY,
+    name text NOT NULL,
+    checksum text NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+  )`);
+}
+async function withLock(db, fn) {
+  return db.withConnection(async (c) => {
+    await c.query("SELECT pg_advisory_lock($1)", [LOCK_KEY]);
+    try {
+      await ensureTable(c);
+      return await fn(c);
+    } finally {
+      await c.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY]).catch(() => void 0);
+    }
+  });
+}
+function verify(files, applied) {
+  const byVersion = new Map(files.map((f) => [f.version, f]));
+  for (const row of applied) {
+    const f = byVersion.get(row.version);
+    if (!f) throw new Error(`database has migration ${row.version} (${row.name}) that this server build does not contain; do not start an older build against a newer schema`);
+    if (f.checksum !== row.checksum) throw new Error(`migration ${f.file} was changed after it was applied; create a new migration instead`);
+  }
+}
+async function migrationStatus(db, files = loadMigrations()) {
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
+    verify(files, rows);
+    const appliedSet = new Set(rows.map((r) => r.version));
+    return {
+      applied: rows.map((r) => ({ version: r.version, name: r.name, appliedAt: r.applied_at.toISOString() })),
+      pending: files.filter((f) => !appliedSet.has(f.version)).map((f) => ({ version: f.version, name: f.name })),
+      currentVersion: rows.length ? Math.max(...rows.map((r) => r.version)) : 0,
+      latestVersion: files.length ? files[files.length - 1].version : 0
+    };
+  });
+}
+async function migrateUp(db, files = loadMigrations()) {
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
+    verify(files, rows);
+    const appliedSet = new Set(rows.map((r) => r.version));
+    const done = [];
+    for (const f of files) {
+      if (appliedSet.has(f.version)) continue;
+      await c.exec("BEGIN");
+      try {
+        await c.exec(f.up);
+        await c.query("INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)", [f.version, f.name, f.checksum]);
+        await c.exec("COMMIT");
+      } catch (e) {
+        await c.exec("ROLLBACK").catch(() => void 0);
+        throw new Error(`migration ${f.file} failed and was rolled back: ${e.message}`);
+      }
+      done.push(f.file);
+    }
+    return done;
+  });
+}
+async function migrateDown(db, steps, files = loadMigrations()) {
+  if (!Number.isInteger(steps) || steps < 1) throw new Error("steps must be a positive integer");
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version DESC");
+    verify(files, rows);
+    const reverted = [];
+    for (const row of rows.slice(0, steps)) {
+      const f = files.find((x) => x.version === row.version);
+      await c.exec("BEGIN");
+      try {
+        await c.exec(f.down);
+        await c.query("DELETE FROM schema_migrations WHERE version = $1", [f.version]);
+        await c.exec("COMMIT");
+      } catch (e) {
+        await c.exec("ROLLBACK").catch(() => void 0);
+        throw new Error(`reverting ${f.file} failed and was rolled back: ${e.message}`);
+      }
+      reverted.push(f.file);
+    }
+    return reverted;
+  });
+}
+
+// src/limits.ts
+import crypto2 from "node:crypto";
+
+// src/persistent-limits.ts
+async function hitRate(q, key, limit, windowSeconds) {
+  const { rows } = await q.query(
+    `INSERT INTO rate_counters (key, bucket, count)
+     VALUES ($1, (floor(extract(epoch FROM now()) / $2) * $2)::bigint, 1)
+     ON CONFLICT (key, bucket) DO UPDATE SET count = rate_counters.count + 1
+     RETURNING count::int AS count,
+               greatest(1, ceil(bucket + $2 - extract(epoch FROM now())))::int AS retry_after`,
+    [key, windowSeconds]
+  );
+  const r = rows[0];
+  if (r.count > limit) return { allowed: false, retryAfterSeconds: r.retry_after };
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+async function clearRate(q, key) {
+  await q.query("DELETE FROM rate_counters WHERE key = $1", [key]);
+}
+async function pruneRates(q) {
+  const { rowCount } = await q.query("DELETE FROM rate_counters WHERE bucket < extract(epoch FROM now())::bigint - 3600");
+  return rowCount;
+}
+async function acquireSlot(db, r) {
+  return db.transaction(async (q) => {
+    await q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`device-slot:${r.deviceId}`]);
+    await q.query("DELETE FROM device_request_leases WHERE device_id = $1 AND expires_at <= now()", [r.deviceId]);
+    if (r.clientRequestId) {
+      const seen = await q.query(
+        `SELECT 1 FROM device_request_leases WHERE device_id = $1 AND client_request_id = $2
+         UNION ALL
+         SELECT 1 FROM request_logs WHERE device_id = $1 AND client_request_id = $2
+         LIMIT 1`,
+        [r.deviceId, r.clientRequestId]
+      );
+      if (seen.rows.length) return "duplicate";
+    }
+    const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE device_id = $1", [r.deviceId]);
+    if (rows[0].n >= r.maxConcurrent) return "busy";
+    await q.query(
+      `INSERT INTO device_request_leases (device_id, request_id, client_request_id, expires_at)
+       VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
+      [r.deviceId, r.requestId, r.clientRequestId, r.leaseSeconds]
+    );
+    return "ok";
+  });
+}
+async function releaseSlot(q, requestId) {
+  await q.query("DELETE FROM device_request_leases WHERE request_id = $1", [requestId]);
+}
+async function activeLeaseCount(q) {
+  const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE expires_at > now()");
+  return rows[0].n;
+}
+
+// src/limits.ts
+var HIT_SCRIPT = `local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]); ttl = tonumber(ARGV[1]) end
+return {n, ttl}`;
+var UNLOCK_SCRIPT = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`;
+var RedisLimitStore = class {
+  constructor(redis, prefix = "devora") {
+    this.redis = redis;
+    this.prefix = prefix;
+  }
+  redis;
+  prefix;
+  kind = "redis";
+  k(kind, key) {
+    return `${this.prefix}:${kind}:${key}`;
+  }
+  async hit(key, limit, windowSeconds) {
+    const r = await this.redis.command("EVAL", HIT_SCRIPT, 1, this.k("rl", key), windowSeconds * 1e3);
+    const [count, ttlMs] = r;
+    if (count > limit) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlMs / 1e3)) };
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  async clear(key) {
+    await this.redis.command("DEL", this.k("rl", key));
+  }
+  async cacheGet(key) {
+    const v = await this.redis.command("GET", this.k("cache", key));
+    if (typeof v !== "string") return null;
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  async cacheSet(key, value, ttlSeconds) {
+    await this.redis.command("SET", this.k("cache", key), JSON.stringify(value), "EX", ttlSeconds);
+  }
+  async withLock(name, ttlMs, fn) {
+    const key = this.k("lock", name);
+    const token = crypto2.randomUUID();
+    const got = await this.redis.command("SET", key, token, "NX", "PX", ttlMs);
+    if (got !== "OK") return null;
+    try {
+      return await fn();
+    } finally {
+      await this.redis.command("EVAL", UNLOCK_SCRIPT, 1, key, token).catch(() => {
+      });
+    }
+  }
+};
+var DatabaseLimitStore = class {
+  constructor(db) {
+    this.db = db;
+  }
+  db;
+  kind = "database";
+  hit(key, limit, windowSeconds) {
+    return hitRate(this.db, key, limit, windowSeconds);
+  }
+  clear(key) {
+    return clearRate(this.db, key);
+  }
+  async cacheGet() {
+    return null;
+  }
+  async cacheSet() {
+  }
+  async withLock(_name, _ttlMs, fn) {
+    return fn();
+  }
+};
+
+// src/redis.ts
+import net from "node:net";
+import tls from "node:tls";
+import fs2 from "node:fs";
+var RedisUnavailableError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "RedisUnavailableError";
+    this.code = code;
+  }
+};
+var RedisReplyError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RedisReplyError";
+  }
+};
+function parseRedisUrl(raw, env = {}) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("REDIS_URL must look like redis://default:PASSWORD@host:6379/0");
+  }
+  if (u.protocol !== "redis:" && u.protocol !== "rediss:") throw new Error("REDIS_URL must start with redis:// or rediss://");
+  if (!u.hostname) throw new Error("REDIS_URL has no host");
+  const db = u.pathname && u.pathname !== "/" ? Number(u.pathname.slice(1)) : 0;
+  if (!Number.isInteger(db) || db < 0 || db > 15) throw new Error("REDIS_URL database number must be 0 to 15");
+  const port = u.port ? Number(u.port) : 6379;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("REDIS_URL port is invalid");
+  const num = (v, def, name) => {
+    if (v === void 0 || v === "") return def;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 100 || n > 6e4) throw new Error(`${name} must be an integer from 100 to 60000`);
+    return n;
+  };
+  const cfg = {
+    host: u.hostname.replace(/^\[|\]$/g, ""),
+    port,
+    username: u.username ? decodeURIComponent(u.username) : null,
+    password: u.password ? decodeURIComponent(u.password) : null,
+    db,
+    tls: u.protocol === "rediss:",
+    connectTimeoutMs: num(env.REDIS_CONNECT_TIMEOUT_MS, 5e3, "REDIS_CONNECT_TIMEOUT_MS"),
+    commandTimeoutMs: num(env.REDIS_COMMAND_TIMEOUT_MS, 2e3, "REDIS_COMMAND_TIMEOUT_MS")
+  };
+  if (env.REDIS_TLS_CA_FILE) {
+    if (!cfg.tls) throw new Error("REDIS_TLS_CA_FILE needs a rediss:// URL");
+    if (!fs2.existsSync(env.REDIS_TLS_CA_FILE)) throw new Error("REDIS_TLS_CA_FILE does not exist");
+    cfg.caFile = env.REDIS_TLS_CA_FILE;
+  }
+  return cfg;
+}
+var ReplyParser = class {
+  buf = Buffer.alloc(0);
+  push(chunk) {
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+  }
+  /** Returns [value] for one complete reply, or null when more bytes are needed. Error replies come back as RedisReplyError values. */
+  next() {
+    const r = this.read(0);
+    if (!r) return null;
+    this.buf = this.buf.subarray(r[1]);
+    return [r[0]];
+  }
+  line(at) {
+    const end = this.buf.indexOf("\r\n", at);
+    if (end < 0) return null;
+    return [this.buf.toString("utf8", at, end), end + 2];
+  }
+  read(at) {
+    if (at >= this.buf.length) return null;
+    const type = String.fromCharCode(this.buf[at]);
+    const l = this.line(at + 1);
+    if (!l) return null;
+    const [text, after] = l;
+    switch (type) {
+      case "+":
+        return [text, after];
+      case "-":
+        return [new RedisReplyError(text), after];
+      case ":":
+        return [Number(text), after];
+      case "$": {
+        const len = Number(text);
+        if (len < 0) return [null, after];
+        if (this.buf.length < after + len + 2) return null;
+        return [this.buf.toString("utf8", after, after + len), after + len + 2];
+      }
+      case "*": {
+        const n = Number(text);
+        if (n < 0) return [null, after];
+        const out = [];
+        let pos = after;
+        for (let i = 0; i < n; i++) {
+          const item = this.read(pos);
+          if (!item) return null;
+          out.push(item[0] instanceof RedisReplyError ? item[0].message : item[0]);
+          pos = item[1];
+        }
+        return [out, pos];
+      }
+      default:
+        throw new RedisUnavailableError("redis_protocol", `unexpected reply type from Redis`);
+    }
+  }
+};
+function encode(args) {
+  const parts = [Buffer.from(`*${args.length}\r
+`)];
+  for (const a of args) {
+    const b = Buffer.from(String(a), "utf8");
+    parts.push(Buffer.from(`$${b.length}\r
+`), b, Buffer.from("\r\n"));
+  }
+  return Buffer.concat(parts);
+}
+var BACKOFF_MIN_MS = 250;
+var BACKOFF_MAX_MS = 3e4;
+var Redis = class {
+  constructor(cfg, onEvent = () => {
+  }) {
+    this.cfg = cfg;
+    this.onEvent = onEvent;
+  }
+  cfg;
+  onEvent;
+  socket = null;
+  connecting = null;
+  /** Each connection has its own reply queue and parser, so a dying old connection never touches a new one. */
+  conns = /* @__PURE__ */ new Map();
+  closed = false;
+  failures = 0;
+  retryAt = 0;
+  lastError = null;
+  /** Host and port only, for logs and the health view. Never includes credentials. */
+  get target() {
+    return `${this.cfg.tls ? "rediss" : "redis"}://${this.cfg.host}:${this.cfg.port}/${this.cfg.db}`;
+  }
+  get connected() {
+    return this.socket !== null && !this.socket.destroyed;
+  }
+  get lastFailure() {
+    return this.lastError;
+  }
+  /** Sends one command. Connects (or reconnects) first when needed; fails fast during the backoff window. */
+  async command(...args) {
+    const socket = await this.ensure();
+    return this.send(socket, args);
+  }
+  async ping() {
+    const t = Date.now();
+    const r = await this.command("PING");
+    if (r !== "PONG") throw new RedisUnavailableError("redis_bad_reply", "Redis did not answer PING");
+    return Date.now() - t;
+  }
+  /** Graceful shutdown: QUIT, then close. Pending commands are rejected. */
+  async close() {
+    this.closed = true;
+    const s = this.socket;
+    if (!s || s.destroyed) return;
+    try {
+      await Promise.race([this.send(s, ["QUIT"]), new Promise((r) => setTimeout(r, 1e3).unref())]);
+    } catch {
+    }
+    s.destroy();
+    this.socket = null;
+  }
+  send(socket, args) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fail(socket, new RedisUnavailableError("redis_timeout", `Redis did not answer within ${this.cfg.commandTimeoutMs} ms`));
+      }, this.cfg.commandTimeoutMs);
+      timer.unref();
+      const conn = this.conns.get(socket);
+      if (!conn || socket.destroyed) {
+        clearTimeout(timer);
+        reject(new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
+        return;
+      }
+      conn.pending.push({ resolve, reject, timer });
+      socket.write(encode(args));
+    });
+  }
+  ensure() {
+    if (this.closed) return Promise.reject(new RedisUnavailableError("redis_closed", "the Redis client is shut down"));
+    if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket);
+    if (this.connecting) return this.connecting;
+    const now = Date.now();
+    if (now < this.retryAt) {
+      return Promise.reject(new RedisUnavailableError("redis_unavailable", `Redis is unavailable (${this.lastError ?? "connection failed"}); retrying in ${Math.ceil((this.retryAt - now) / 1e3)} s`));
+    }
+    this.connecting = this.open().then(
+      (s) => {
+        if (this.failures > 0) this.onEvent("info", "redis reconnected", { target: this.target });
+        this.failures = 0;
+        this.retryAt = 0;
+        this.lastError = null;
+        this.connecting = null;
+        return s;
+      },
+      (e) => {
+        this.failures += 1;
+        const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** (this.failures - 1));
+        this.retryAt = Date.now() + delay;
+        this.lastError = e.message;
+        this.connecting = null;
+        this.onEvent("error", "redis connection failed", { target: this.target, reason: e.message, retryInMs: delay });
+        throw e instanceof RedisUnavailableError ? e : new RedisUnavailableError("redis_unavailable", e.message);
+      }
+    );
+    return this.connecting;
+  }
+  open() {
+    return new Promise((resolve, reject) => {
+      const c = this.cfg;
+      const socket = c.tls ? tls.connect({ host: c.host, port: c.port, servername: net.isIP(c.host) ? void 0 : c.host, ca: c.caFile ? fs2.readFileSync(c.caFile) : void 0 }) : net.connect({ host: c.host, port: c.port });
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 3e4);
+      let settled = false;
+      const timer = setTimeout(() => done(new RedisUnavailableError("redis_timeout", `could not connect to Redis within ${c.connectTimeoutMs} ms`)), c.connectTimeoutMs);
+      timer.unref();
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) {
+          socket.destroy();
+          reject(err);
+        } else resolve(socket);
+      };
+      this.conns.set(socket, { pending: [], parser: new ReplyParser() });
+      socket.on("data", (chunk) => this.onData(socket, chunk));
+      socket.on("error", (e) => {
+        const err = new RedisUnavailableError("redis_unavailable", e.code ? `network error ${e.code}` : "network error");
+        if (!settled) done(err);
+        else this.fail(socket, err);
+      });
+      socket.on("close", () => {
+        if (!settled) done(new RedisUnavailableError("redis_unavailable", "the connection closed during setup"));
+        else this.fail(socket, new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
+      });
+      socket.once(c.tls ? "secureConnect" : "connect", async () => {
+        try {
+          if (c.password !== null) {
+            const args = c.username ? ["AUTH", c.username, c.password] : ["AUTH", c.password];
+            await this.send(socket, args).catch((e) => {
+              throw authError(e);
+            });
+          }
+          if (c.db)
+            await this.send(socket, ["SELECT", c.db]).catch((e) => {
+              throw authError(e);
+            });
+          await this.send(socket, ["PING"]).catch((e) => {
+            throw authError(e);
+          });
+          this.socket = socket;
+          done(null);
+        } catch (e) {
+          done(e instanceof Error ? e : new Error(String(e)));
+        }
+      });
+    });
+  }
+  onData(socket, chunk) {
+    const conn = this.conns.get(socket);
+    if (!conn) return;
+    conn.parser.push(chunk);
+    for (; ; ) {
+      let r;
+      try {
+        r = conn.parser.next();
+      } catch (e) {
+        this.fail(socket, e);
+        return;
+      }
+      if (!r) return;
+      const p = conn.pending.shift();
+      if (!p) continue;
+      clearTimeout(p.timer);
+      if (r[0] instanceof RedisReplyError) p.reject(r[0]);
+      else p.resolve(r[0]);
+    }
+  }
+  fail(socket, err) {
+    if (this.socket === socket) {
+      this.socket = null;
+      if (!this.closed) {
+        this.lastError = err.message;
+        this.onEvent("warn", "redis connection lost", { target: this.target, reason: err.message });
+      }
+    }
+    socket.destroy();
+    const pending = this.conns.get(socket)?.pending ?? [];
+    this.conns.delete(socket);
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+  }
+};
+function authError(e) {
+  const m = e instanceof Error ? e.message : "";
+  if (/NOAUTH/i.test(m)) return new RedisUnavailableError("redis_auth_required", "Redis requires a password; put it in REDIS_URL (redis://default:PASSWORD@host:6379/0)");
+  if (/WRONGPASS|invalid password|invalid username/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "Redis rejected the username or password in REDIS_URL");
+  if (/AUTH.*no password is set|without any password configured/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "REDIS_URL has a password but this Redis server has none set");
+  return e instanceof Error ? e : new Error(String(e));
+}
+
+// src/modules/auth.ts
+import crypto4 from "node:crypto";
+
+// src/crypto.ts
+import crypto3 from "node:crypto";
+import { promisify } from "node:util";
+var scryptAsync = promisify(crypto3.scrypt);
+var SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
+async function hashPassword(password) {
+  const salt = crypto3.randomBytes(16);
+  const key = await scryptAsync(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, maxmem: 64 * 1024 * 1024 });
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString("base64")}$${key.toString("base64")}`;
+}
+async function verifyPassword(password, stored) {
+  const parts = stored.split("$");
+  if (parts.length !== 6 || parts[0] !== "scrypt") return false;
+  const [N, r, p] = parts.slice(1, 4).map(Number);
+  const salt = Buffer.from(parts[4], "base64");
+  const expected = Buffer.from(parts[5], "base64");
+  const key = await scryptAsync(password, salt, expected.length, { N, r, p, maxmem: 64 * 1024 * 1024 });
+  return key.length === expected.length && crypto3.timingSafeEqual(key, expected);
+}
+var dummyHash = null;
+function burnPasswordTime(password) {
+  dummyHash ??= hashPassword("devora-dummy-password-for-timing");
+  return dummyHash.then((h) => verifyPassword(password, h));
+}
+function randomToken(bytes = 32) {
+  return crypto3.randomBytes(bytes).toString("base64url");
+}
+function sha256Hex(value) {
+  return crypto3.createHash("sha256").update(value, "utf8").digest("hex");
+}
+var CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function enrollmentCode() {
+  let out = "";
+  for (let i = 0; i < 16; i++) out += CODE_ALPHABET[crypto3.randomInt(CODE_ALPHABET.length)];
+  return out.match(/.{4}/g).join("-");
+}
+function normalizeEnrollmentCode(input) {
+  return input.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+function parseKeyring(spec, active) {
+  const keys = /* @__PURE__ */ new Map();
+  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const eq = entry.indexOf("=");
+    const id = Number(entry.slice(0, eq));
+    const key = Buffer.from(entry.slice(eq + 1), "base64");
+    if (eq < 1 || !Number.isInteger(id) || id < 1 || id > 999999) throw new Error("DEVORA_SECRET_KEYS entries must look like 1=<base64>");
+    if (key.length !== 32) throw new Error(`key ${id} must decode to 32 bytes`);
+    if (keys.has(id)) throw new Error(`key ${id} appears twice`);
+    keys.set(id, key);
+  }
+  if (keys.size === 0) return { size: 0, activeId: 0, keys };
+  const activeId = Number(active);
+  if (!Number.isInteger(activeId) || !keys.has(activeId)) throw new Error("DEVORA_SECRET_ACTIVE_KEY must name one of the ids in DEVORA_SECRET_KEYS");
+  return { size: keys.size, activeId, keys };
+}
+function sealSecret(keyring, plaintext, aad) {
+  const key = keyring.keys.get(keyring.activeId);
+  if (!key) throw new Error("no encryption key is configured; set DEVORA_SECRET_KEYS and DEVORA_SECRET_ACTIVE_KEY");
+  const iv = crypto3.randomBytes(12);
+  const cipher = crypto3.createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(aad, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return { keyVersion: keyring.activeId, iv, ciphertext, tag: cipher.getAuthTag() };
+}
+function openSecret(keyring, sealed, aad) {
+  const key = keyring.keys.get(sealed.keyVersion);
+  if (!key) throw new Error(`encryption key ${sealed.keyVersion} is not configured; restore it before reading this secret`);
+  const decipher = crypto3.createDecipheriv("aes-256-gcm", key, sealed.iv);
+  decipher.setAAD(Buffer.from(aad, "utf8"));
+  decipher.setAuthTag(sealed.tag);
+  return Buffer.concat([decipher.update(sealed.ciphertext), decipher.final()]).toString("utf8");
+}
+
+// src/modules/auth.ts
+var SESSION_COOKIE = "devora_admin";
+var SESSION_HOURS = 12;
+var REAUTH_MINUTES = 5;
+var LOCK_FAILURES = 5;
+var LOCK_MINUTES = 15;
+var LOGIN_PER_IP = 20;
+var LOGIN_WINDOW_SECONDS = 15 * 60;
+var INVALID = "invalid email or password";
+async function login(ctx) {
+  const { db, config, limits } = ctx.deps;
+  const ipKey = `login:ip:${ctx.ip}`;
+  const ipLimit = await limits.hit(ipKey, LOGIN_PER_IP, LOGIN_WINDOW_SECONDS);
+  if (!ipLimit.allowed) fail(429, "rate_limited", "too many login attempts; try again later", { "retry-after": String(ipLimit.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, 8 * 1024));
+  rejectUnknown(body, ["email", "password"]);
+  const email = str(body, "email", { min: 3, max: 254 }).toLowerCase();
+  const password = str(body, "password", { min: 1, max: 256, trim: false });
+  const { rows } = await db.query("SELECT id, email, password_hash, locked_until FROM owners WHERE email = $1", [email]);
+  const owner = rows[0];
+  const now = await dbNow(db);
+  if (!owner) {
+    await burnPasswordTime(password);
+    fail(401, "invalid_credentials", INVALID);
+  }
+  if (owner.locked_until && new Date(owner.locked_until) > now) fail(401, "invalid_credentials", INVALID);
+  const ok = await verifyPassword(password, owner.password_hash);
+  if (!ok) {
+    await db.query(
+      `UPDATE owners SET
+         failed_logins = CASE WHEN failed_logins + 1 >= $2 THEN 0 ELSE failed_logins + 1 END,
+         locked_until = CASE WHEN failed_logins + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE locked_until END
+       WHERE id = $1`,
+      [owner.id, LOCK_FAILURES, LOCK_MINUTES]
+    );
+    fail(401, "invalid_credentials", INVALID);
+  }
+  await limits.clear(ipKey);
+  await db.query("UPDATE owners SET failed_logins = 0, locked_until = NULL WHERE id = $1", [owner.id]);
+  const token = randomToken(32);
+  const csrf = randomToken(32);
+  await db.query(
+    `INSERT INTO admin_sessions (owner_id, token_hash, csrf_token, expires_at, ip, user_agent)
+     VALUES ($1, $2, $3, now() + make_interval(hours => $4), $5, $6)`,
+    [owner.id, sha256Hex(token), csrf, SESSION_HOURS, clientAddress(ctx.req, config.trustProxy), userAgent(ctx.req)]
+  );
+  sendJson(
+    ctx.res,
+    200,
+    { csrfToken: csrf, owner: { email: owner.email } },
+    { "set-cookie": setCookie(SESSION_COOKIE, token, { maxAgeSeconds: SESSION_HOURS * 3600, secure: config.cookieSecure }) }
+  );
+}
+async function dbNow(db) {
+  const { rows } = await db.query("SELECT now() AS t");
+  return new Date(rows[0].t);
+}
+async function ownerSession(ctx) {
+  const token = cookieValue(ctx.req.headers.cookie, SESSION_COOKIE);
+  if (!token) fail(401, "unauthenticated", "sign in required");
+  const { rows } = await ctx.deps.db.query(
+    `SELECT s.id, s.owner_id, s.csrf_token, s.expires_at, s.reauth_until, s.revoked_at, o.email, now() AS db_now
+       FROM admin_sessions s JOIN owners o ON o.id = s.owner_id
+      WHERE s.token_hash = $1`,
+    [sha256Hex(token)]
+  );
+  const row = rows[0];
+  const now = row ? new Date(row.db_now) : /* @__PURE__ */ new Date();
+  if (!row || row.revoked_at || new Date(row.expires_at) <= now) fail(401, "unauthenticated", "sign in required");
+  await ctx.deps.db.query("UPDATE admin_sessions SET last_seen_at = now() WHERE id = $1 AND last_seen_at < now() - interval '1 minute'", [row.id]);
+  return {
+    sessionId: row.id,
+    ownerId: row.owner_id,
+    email: row.email,
+    csrfToken: row.csrf_token,
+    reauthUntil: row.reauth_until ? new Date(row.reauth_until) : null,
+    dbNow: now
+  };
+}
+function requireCsrf(ctx, session) {
+  const sent = ctx.req.headers["x-csrf-token"];
+  const value = Array.isArray(sent) ? sent[0] : sent ?? "";
+  const a = Buffer.from(value, "utf8");
+  const b = Buffer.from(session.csrfToken, "utf8");
+  if (a.length === 0 || a.length !== b.length || !crypto4.timingSafeEqual(a, b)) {
+    fail(403, "csrf_failed", "the request could not be verified; reload the page and try again");
+  }
+}
+function requireReauth(session) {
+  if (!session.reauthUntil || session.reauthUntil <= session.dbNow) {
+    fail(403, "reauth_required", "confirm your password to make this change");
+  }
+}
+async function sessionInfo(ctx) {
+  const s = await ownerSession(ctx);
+  sendJson(ctx.res, 200, {
+    csrfToken: s.csrfToken,
+    owner: { email: s.email },
+    reauthUntil: s.reauthUntil && s.reauthUntil > s.dbNow ? s.reauthUntil.toISOString() : null
+  });
+}
+async function logout(ctx) {
+  const s = await ownerSession(ctx);
+  requireCsrf(ctx, s);
+  await ctx.deps.db.query("UPDATE admin_sessions SET revoked_at = now() WHERE id = $1", [s.sessionId]);
+  ctx.res.setHeader("set-cookie", clearCookie(SESSION_COOKIE, ctx.deps.config.cookieSecure));
+  ctx.res.writeHead(204);
+  ctx.res.end();
+}
+async function reauth(ctx) {
+  const s = await ownerSession(ctx);
+  requireCsrf(ctx, s);
+  const ipKey = `reauth:ip:${ctx.ip}`;
+  const limit = await ctx.deps.limits.hit(ipKey, LOGIN_PER_IP, LOGIN_WINDOW_SECONDS);
+  if (!limit.allowed) fail(429, "rate_limited", "too many attempts; try again later", { "retry-after": String(limit.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, 8 * 1024));
+  rejectUnknown(body, ["password"]);
+  const password = str(body, "password", { min: 1, max: 256, trim: false });
+  const { rows } = await ctx.deps.db.query("SELECT password_hash FROM owners WHERE id = $1", [s.ownerId]);
+  if (!rows[0] || !await verifyPassword(password, rows[0].password_hash)) {
+    fail(401, "invalid_credentials", "the password is not correct");
+  }
+  await ctx.deps.limits.clear(ipKey);
+  const { rows: up } = await ctx.deps.db.query(
+    `UPDATE admin_sessions SET reauth_until = now() + make_interval(mins => $2) WHERE id = $1 RETURNING reauth_until`,
+    [s.sessionId, REAUTH_MINUTES]
+  );
+  sendJson(ctx.res, 200, { reauthUntil: new Date(up[0].reauth_until).toISOString() });
+}
+async function guardOwner(ctx, opts) {
+  const s = await ownerSession(ctx);
+  if (opts.write) requireCsrf(ctx, s);
+  if (opts.sensitive) requireReauth(s);
+  return s;
+}
+function cookieValue(header, name) {
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return null;
+}
+
+// src/modules/upstream.ts
+var UpstreamError = class extends Error {
+  kind;
+  status;
+  constructor(kind, message, status) {
+    super(message);
+    this.name = "UpstreamError";
+    this.kind = kind;
+    this.status = status;
+  }
+};
+var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]"]);
+var BLOCKED_HOSTS = /* @__PURE__ */ new Set(["169.254.169.254", "100.100.100.200", "metadata.google.internal", "metadata"]);
+function normalizeBaseUrl(input) {
+  let u;
+  try {
+    u = new URL(input.trim());
+  } catch {
+    fail(400, "invalid_request", "baseUrl must be a full URL such as https://api.example.com/v1");
+  }
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && LOOPBACK.has(u.hostname))) {
+    fail(400, "invalid_request", "baseUrl must use https (plain http is allowed only for localhost)");
+  }
+  if (u.username || u.password) fail(400, "invalid_request", "baseUrl must not contain a username or password");
+  if (u.search || u.hash) fail(400, "invalid_request", "baseUrl must not contain a query string or fragment");
+  if (BLOCKED_HOSTS.has(u.hostname) || /^169\.254\./.test(u.hostname)) fail(400, "invalid_request", "this address is not allowed as a provider");
+  const path2 = u.pathname.replace(/\/+$/, "");
+  return `${u.protocol}//${u.host}${path2}`;
+}
+async function listUpstreamModels(f, baseUrl, apiKey, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await f(`${baseUrl}/models`, {
+      method: "GET",
+      headers: apiKey ? { authorization: `Bearer ${apiKey}`, accept: "application/json" } : { accept: "application/json" },
+      signal: controller.signal
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw new UpstreamError("timeout", `the provider did not answer within ${Math.round(timeoutMs / 1e3)} seconds`);
+    throw new UpstreamError("unreachable", "the provider could not be reached; check the base URL and the network");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (res.status === 401 || res.status === 403) {
+    await res.body?.cancel().catch(() => void 0);
+    throw new UpstreamError("auth", `the provider rejected the API key (HTTP ${res.status})`, res.status);
+  }
+  if (res.status === 404) {
+    await res.body?.cancel().catch(() => void 0);
+    throw new UpstreamError("rejected", "the base URL did not answer like an OpenAI-compatible API (HTTP 404); check that it ends with the API version, such as /v1", 404);
+  }
+  if (res.status === 429) {
+    await res.body?.cancel().catch(() => void 0);
+    throw new UpstreamError("rate_limited", "the provider is rate limiting requests (HTTP 429)", 429);
+  }
+  if (res.status >= 500) {
+    await res.body?.cancel().catch(() => void 0);
+    throw new UpstreamError("server", `the provider returned a server error (HTTP ${res.status})`, res.status);
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => void 0);
+    throw new UpstreamError("rejected", `the provider refused the request (HTTP ${res.status})`, res.status);
+  }
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    throw new UpstreamError("bad_response", "the provider did not return a model list in the expected format");
+  }
+  if (!json || !Array.isArray(json.data)) throw new UpstreamError("bad_response", "the provider did not return a model list in the expected format");
+  return json.data.map((m) => m?.id).filter((id) => typeof id === "string" && id.length > 0 && id.length <= 200);
+}
+function describeFailure(e) {
+  if (e instanceof UpstreamError) return { ok: false, message: e.message, kind: e.kind };
+  return { ok: false, message: "the provider test failed unexpectedly", kind: "internal" };
+}
+
+// src/modules/providers.ts
+var KEY_PATTERN = /^[\x21-\x7E]{8,512}$/;
+function toProvider(r, modelCount = 0) {
+  return {
+    id: r.id,
+    name: r.name,
+    adapter: r.adapter,
+    baseUrl: r.base_url,
+    authScheme: r.auth_scheme,
+    enabled: r.enabled,
+    timeoutMs: r.timeout_ms,
+    maxRetries: r.max_retries,
+    hasApiKey: r.has_key === true,
+    keyVersion: r.key_version ?? null,
+    modelCount,
+    lastTest: r.last_test_at ? { ok: r.last_test_ok, at: new Date(r.last_test_at).toISOString(), latencyMs: r.last_test_latency_ms, message: r.last_test_message, kind: r.last_test_kind ?? null } : null,
+    discovery: r.discovery_at ? { ok: r.discovery_ok, supported: r.discovery_supported, at: new Date(r.discovery_at).toISOString(), message: r.discovery_message } : null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  };
+}
+var SELECT_PROVIDER = `
+  SELECT p.*, (s.provider_id IS NOT NULL) AS has_key, s.key_version,
+         (SELECT count(*)::int FROM models m WHERE m.provider_id = p.id) AS model_count
+    FROM providers p LEFT JOIN provider_secrets s ON s.provider_id = p.id`;
+async function listProviders(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(`${SELECT_PROVIDER} ORDER BY p.name`);
+  sendJson(ctx.res, 200, { providers: rows.map((r) => toProvider(r, r.model_count)) });
+}
+async function loadProvider(q, id) {
+  const { rows } = await q.query(`${SELECT_PROVIDER} WHERE p.id = $1`, [id]);
+  if (!rows[0]) fail(404, "not_found", "provider not found");
+  return rows[0];
+}
+async function createProvider(ctx) {
+  await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["name", "adapter", "baseUrl", "authScheme", "enabled", "timeoutMs", "maxRetries"]);
+  const name = str(body, "name", { min: 1, max: 80 });
+  const adapter = str(body, "adapter", { max: 40, optional: true }) ?? "openai-compatible";
+  if (adapter !== "openai-compatible") fail(400, "invalid_request", "adapter must be openai-compatible");
+  const baseUrl = normalizeBaseUrl(str(body, "baseUrl", { min: 8, max: 2048 }));
+  const authScheme = str(body, "authScheme", { max: 10, optional: true }) ?? "bearer";
+  if (authScheme !== "bearer" && authScheme !== "none") fail(400, "invalid_request", "authScheme must be bearer or none");
+  const enabled = bool(body, "enabled", { def: true });
+  const timeoutMs = int(body, "timeoutMs", { min: 1e3, max: 6e5, optional: true }) ?? 12e4;
+  const maxRetries = int(body, "maxRetries", { min: 0, max: 3, optional: true }) ?? 0;
+  const created = await ctx.deps.db.transaction(async (q) => {
+    const { rows } = await q.query(
+      `INSERT INTO providers (name, adapter, base_url, auth_scheme, enabled, timeout_ms, max_retries)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [name, adapter, baseUrl, authScheme, enabled, timeoutMs, maxRetries]
+    );
+    await bumpCatalogue(q);
+    return rows[0].id;
+  }).catch((e) => {
+    if (e?.code === "23505") fail(409, "duplicate", "a provider with this name already exists");
+    throw e;
+  });
+  sendJson(ctx.res, 201, toProvider(await loadProvider(ctx.deps.db, created)));
+}
+async function updateProvider(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["name", "baseUrl", "authScheme", "enabled", "timeoutMs", "maxRetries"]);
+  const current = await loadProvider(ctx.deps.db, id);
+  const name = str(body, "name", { min: 1, max: 80, optional: true }) ?? current.name;
+  const baseUrl = body.baseUrl === void 0 ? current.base_url : normalizeBaseUrl(str(body, "baseUrl", { min: 8, max: 2048 }));
+  const authScheme = str(body, "authScheme", { max: 10, optional: true }) ?? current.auth_scheme;
+  if (authScheme !== "bearer" && authScheme !== "none") fail(400, "invalid_request", "authScheme must be bearer or none");
+  const enabled = bool(body, "enabled", { optional: true }) ?? current.enabled;
+  const timeoutMs = int(body, "timeoutMs", { min: 1e3, max: 6e5, optional: true }) ?? current.timeout_ms;
+  const maxRetries = int(body, "maxRetries", { min: 0, max: 3, optional: true }) ?? current.max_retries;
+  const endpointChanged = baseUrl !== current.base_url || authScheme !== current.auth_scheme;
+  await ctx.deps.db.transaction(async (q) => {
+    await q.query(
+      `UPDATE providers SET name = $2, base_url = $3, auth_scheme = $4, enabled = $5, timeout_ms = $6, max_retries = $7,
+              last_test_ok = CASE WHEN $8 THEN NULL ELSE last_test_ok END,
+              last_test_at = CASE WHEN $8 THEN NULL ELSE last_test_at END,
+              updated_at = now()
+        WHERE id = $1`,
+      [id, name, baseUrl, authScheme, enabled, timeoutMs, maxRetries, endpointChanged]
+    );
+    if (!enabled) await q.query("UPDATE models SET is_default = false WHERE provider_id = $1", [id]);
+    await bumpCatalogue(q);
+  }).catch((e) => {
+    if (e?.code === "23505") fail(409, "duplicate", "a provider with this name already exists");
+    throw e;
+  });
+  sendJson(ctx.res, 200, toProvider(await loadProvider(ctx.deps.db, id)));
+}
+async function deleteProvider(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["confirmName"]);
+  const current = await loadProvider(ctx.deps.db, id);
+  if (str(body, "confirmName", { max: 80, optional: true }) !== current.name) fail(400, "confirmation_mismatch", "type the provider name exactly to delete it");
+  await ctx.deps.db.transaction(async (q) => {
+    await q.query("DELETE FROM providers WHERE id = $1", [id]);
+    await bumpCatalogue(q);
+  });
+  sendJson(ctx.res, 200, { deleted: true });
+}
+var keyAad = (providerId) => `provider:${providerId}`;
+async function providerApiKey(deps, providerId) {
+  const { rows } = await deps.db.query("SELECT key_version, iv, ciphertext, tag FROM provider_secrets WHERE provider_id = $1", [providerId]);
+  if (!rows[0]) return null;
+  return openSecret(
+    deps.config.keyring,
+    { keyVersion: rows[0].key_version, iv: rows[0].iv, ciphertext: rows[0].ciphertext, tag: rows[0].tag },
+    keyAad(providerId)
+  );
+}
+async function setProviderKey(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  await loadProvider(ctx.deps.db, id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["apiKey"]);
+  const apiKey = str(body, "apiKey", { min: 8, max: 512, trim: false });
+  if (!KEY_PATTERN.test(apiKey)) fail(400, "invalid_request", "the API key contains spaces or unsupported characters");
+  const sealed = sealSecret(ctx.deps.config.keyring, apiKey, keyAad(id));
+  await ctx.deps.db.query(
+    `INSERT INTO provider_secrets (provider_id, key_version, iv, ciphertext, tag, updated_at)
+     VALUES ($1, $2, $3, $4, $5, now())
+     ON CONFLICT (provider_id) DO UPDATE SET key_version = EXCLUDED.key_version, iv = EXCLUDED.iv,
+       ciphertext = EXCLUDED.ciphertext, tag = EXCLUDED.tag, updated_at = now()`,
+    [id, sealed.keyVersion, sealed.iv, sealed.ciphertext, sealed.tag]
+  );
+  await ctx.deps.db.query("UPDATE providers SET last_test_ok = NULL, last_test_at = NULL, last_test_message = NULL WHERE id = $1", [id]);
+  sendJson(ctx.res, 200, { hasApiKey: true, keyVersion: sealed.keyVersion });
+}
+async function clearProviderKey(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  await loadProvider(ctx.deps.db, id);
+  await ctx.deps.db.query("DELETE FROM provider_secrets WHERE provider_id = $1", [id]);
+  sendJson(ctx.res, 200, { hasApiKey: false, keyVersion: null });
+}
+async function runProbe(ctx, providerId) {
+  const p = await loadProvider(ctx.deps.db, providerId);
+  const key = p.auth_scheme === "bearer" ? await providerApiKey(ctx.deps, providerId) : null;
+  if (p.auth_scheme === "bearer" && !key) return { ok: false, message: "no API key is stored for this provider", status: 0, models: [], latencyMs: 0, kind: "auth" };
+  const started = Date.now();
+  try {
+    const models = await listUpstreamModels(ctx.deps.fetch, p.base_url, key, Math.min(p.timeout_ms, 2e4));
+    return { ok: true, message: `reachable; ${models.length} model${models.length === 1 ? "" : "s"} listed`, status: 200, models, latencyMs: Date.now() - started, kind: null };
+  } catch (e) {
+    const d = describeFailure(e);
+    return { ok: false, message: d.message, status: 0, models: [], latencyMs: Date.now() - started, kind: d.kind };
+  }
+}
+async function testProvider(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const r = await runProbe(ctx, id);
+  await ctx.deps.db.query(
+    "UPDATE providers SET last_test_ok = $2, last_test_at = now(), last_test_latency_ms = $3, last_test_message = $4, last_test_kind = $5 WHERE id = $1",
+    [id, r.ok, r.latencyMs, r.message, r.kind]
+  );
+  await ctx.deps.limits.cacheSet("provider-health", null, 1).catch(() => void 0);
+  sendJson(ctx.res, 200, { ok: r.ok, message: r.message, latencyMs: r.latencyMs });
+}
+async function discoverModels(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  await loadProvider(ctx.deps.db, id);
+  const r = await discoverProvider(ctx.deps, id);
+  if (r.skipped) fail(409, "refresh_in_progress", r.message);
+  if (!r.ok && r.supported !== false) fail(502, "upstream_failed", r.message);
+  sendJson(ctx.res, 200, { found: r.found, added: r.added, supported: r.supported, message: r.message });
+}
+
+// src/modules/registry.ts
+async function allowedModelIds(db, deviceId, access) {
+  if (access === "all") return null;
+  const { rows } = await db.query("SELECT model_id FROM device_models WHERE device_id = $1", [deviceId]);
+  return new Set(rows.map((r) => r.model_id));
+}
+function isAllowed(allowed, modelId) {
+  return allowed === null || allowed.has(modelId);
+}
+var RECENT_MINUTES = 30;
+var TEST_FRESH_DAYS = 7;
+var PROVIDER_FAILURE_CODES = ["upstream_auth_failed", "upstream_timeout", "upstream_unreachable", "upstream_error", "upstream_rate_limited"];
+var HARD_TEST_FAILURES = ["auth", "timeout", "unreachable", "server"];
+async function providerHealth(db) {
+  const { rows } = await db.query(
+    `SELECT p.id, p.last_test_ok, p.last_test_kind, p.last_test_at,
+            (p.last_test_at > now() - make_interval(days => $2)) AS test_fresh,
+            recent.outcomes
+       FROM providers p
+       LEFT JOIN LATERAL (
+         SELECT json_agg(CASE WHEN l.status = 'ok' THEN 'ok' WHEN l.error_code IN (SELECT jsonb_array_elements_text($3::jsonb)) THEN 'fail' ELSE 'other' END ORDER BY l.created_at DESC) AS outcomes
+           FROM (SELECT status, error_code, created_at FROM request_logs
+                  WHERE provider_id = p.id AND created_at > now() - make_interval(mins => $1) AND status <> 'cancelled'
+                  ORDER BY created_at DESC LIMIT 5) l
+       ) recent ON true`,
+    [RECENT_MINUTES, TEST_FRESH_DAYS, PROVIDER_FAILURE_CODES]
+  );
+  const out = /* @__PURE__ */ new Map();
+  for (const r of rows) {
+    const outcomes = (r.outcomes ?? []).filter((o) => o !== "other");
+    let h;
+    if (outcomes[0] === "ok") h = { availability: "available", reason: "answering requests" };
+    else if (outcomes.length >= 3 && outcomes.slice(0, 3).every((o) => o === "fail")) h = { availability: "degraded", reason: "recent requests failed" };
+    else if (r.last_test_ok === true && r.test_fresh) h = { availability: "available", reason: "connectivity test passed" };
+    else if (r.last_test_ok === false && r.test_fresh && HARD_TEST_FAILURES.includes(r.last_test_kind)) h = { availability: "degraded", reason: "connectivity test failed" };
+    else h = { availability: "unknown", reason: "not checked recently" };
+    out.set(r.id, h);
+  }
+  return out;
+}
+async function discoverProvider(deps, providerId) {
+  const run = async () => {
+    const { rows } = await deps.db.query("SELECT id, base_url, auth_scheme, timeout_ms, enabled FROM providers WHERE id = $1", [providerId]);
+    const p = rows[0];
+    if (!p) return { ok: false, supported: null, found: 0, added: 0, message: "provider not found" };
+    const key = p.auth_scheme === "bearer" ? await providerApiKey(deps, providerId) : null;
+    if (p.auth_scheme === "bearer" && !key) {
+      return record(deps.db, providerId, { ok: false, supported: null, found: 0, added: 0, message: "no API key is stored for this provider" });
+    }
+    let ids;
+    try {
+      ids = await listUpstreamModels(deps.fetch, p.base_url, key, Math.min(p.timeout_ms, 2e4));
+    } catch (e) {
+      const unsupported = e instanceof UpstreamError && (e.kind === "bad_response" || e.kind === "rejected" && e.status === 404);
+      const message = unsupported ? "this provider does not offer a model list; add models by their exact id" : describeFailure(e).message;
+      return record(deps.db, providerId, { ok: false, supported: unsupported ? false : null, found: 0, added: 0, message });
+    }
+    let added = 0;
+    await deps.db.transaction(async (q) => {
+      for (const upstreamId of ids) {
+        const res = await q.query(
+          `INSERT INTO models (provider_id, upstream_model_id, display_name, enabled, capabilities, source, last_listed_at)
+           VALUES ($1, $2, $2, false, $3, 'discovered', now())
+           ON CONFLICT (provider_id, upstream_model_id) DO UPDATE SET last_listed_at = now()
+           RETURNING (xmax = 0) AS inserted`,
+          [providerId, upstreamId, unknownCapabilities()]
+        );
+        if (res.rows[0]?.inserted) added += 1;
+      }
+    });
+    return record(deps.db, providerId, {
+      ok: true,
+      supported: true,
+      found: ids.length,
+      added,
+      message: `${ids.length} model${ids.length === 1 ? "" : "s"} listed, ${added} new`
+    });
+  };
+  const result = await withProviderLock(deps, providerId, run);
+  return result ?? { ok: false, supported: null, found: 0, added: 0, message: "a refresh of this provider is already running", skipped: true };
+}
+async function withProviderLock(deps, providerId, fn) {
+  if (deps.limits.kind === "redis") return deps.limits.withLock(`discover:${providerId}`, 6e4, fn);
+  return deps.db.transaction(async (q) => {
+    const { rows } = await q.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS got", [`discover:${providerId}`]);
+    if (!rows[0].got) return null;
+    return fn();
+  });
+}
+async function record(db, providerId, r) {
+  await db.query(
+    `UPDATE providers SET discovery_at = now(), discovery_ok = $2, discovery_message = $3,
+            discovery_supported = COALESCE($4, discovery_supported)
+      WHERE id = $1`,
+    [providerId, r.ok, r.message.slice(0, 300), r.supported]
+  );
+  return r;
+}
+async function scheduledDiscovery(deps) {
+  const { rows } = await deps.db.query(
+    `SELECT p.id, p.name FROM providers p
+      WHERE p.enabled AND (p.discovery_supported IS DISTINCT FROM false)
+        AND (p.auth_scheme = 'none' OR EXISTS (SELECT 1 FROM provider_secrets s WHERE s.provider_id = p.id))`
+  );
+  for (const p of rows) {
+    try {
+      const r = await discoverProvider(deps, p.id);
+      if (!r.skipped) log(r.ok ? "info" : "warn", "model discovery", { provider: p.name, ok: r.ok, found: r.found, added: r.added });
+    } catch (e) {
+      log("error", "model discovery failed", { provider: p.name, error: e instanceof Error ? e.name : "unknown" });
+    }
+  }
+}
+async function setDeviceAccess(db, deviceId, access, modelIds) {
+  await db.transaction(async (q) => {
+    await q.query("UPDATE devices SET model_access = $2 WHERE id = $1", [deviceId, access]);
+    await q.query("DELETE FROM device_models WHERE device_id = $1", [deviceId]);
+    if (access === "selected" && modelIds.length) {
+      await q.query("INSERT INTO device_models (device_id, model_id) SELECT $1, (jsonb_array_elements_text($2::jsonb))::uuid ON CONFLICT DO NOTHING", [deviceId, modelIds]);
+    }
+    await bumpCatalogue(q);
+  });
+}
+
+// src/modules/catalogue.ts
+var CAPABILITY_NAMES = ["streaming", "tools", "vision", "reasoning"];
+var CAPABILITY_SOURCES = ["unknown", "admin", "provider_reported", "test"];
+var REASONING_LEVELS = ["low", "medium", "high"];
+function unknownCapabilities() {
+  const unknown = { supported: null, source: "unknown" };
+  return { streaming: { ...unknown }, tools: { ...unknown }, vision: { ...unknown }, reasoning: { ...unknown } };
+}
+function normalizeCapabilities(input) {
+  const out = unknownCapabilities();
+  if (!input || typeof input !== "object") return out;
+  for (const name of CAPABILITY_NAMES) {
+    const raw = input[name];
+    if (!raw || typeof raw !== "object") continue;
+    const supported = raw.supported === true || raw.supported === false ? raw.supported : null;
+    const source = CAPABILITY_SOURCES.includes(raw.source) ? raw.source : "unknown";
+    const cap = { supported, source };
+    if (name === "reasoning" && Array.isArray(raw.levels)) {
+      cap.levels = raw.levels.filter((l) => REASONING_LEVELS.includes(l));
+    }
+    out[name] = cap;
+  }
+  return out;
+}
+async function catalogueVersion(db) {
+  const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'catalogue_version'");
+  return rows[0]?.v ?? 1;
+}
+async function bumpCatalogue(q) {
+  const { rows } = await q.query(
+    "UPDATE settings SET value = to_jsonb((value::text::int) + 1), updated_at = now() WHERE key = 'catalogue_version' RETURNING value::text::int AS v"
+  );
+  return rows[0].v;
+}
+async function readSettings(db) {
+  const { rows } = await db.query("SELECT key, value FROM settings");
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+}
+async function buildCatalogue(db) {
+  const settings = await readSettings(db);
+  const { rows } = await db.query(
+    `SELECT m.id, m.provider_id, m.display_name, m.description, m.context_window, m.is_default, m.capabilities, p.name AS provider_name
+       FROM models m JOIN providers p ON p.id = m.provider_id
+      WHERE m.enabled AND p.enabled
+      ORDER BY m.is_default DESC, m.display_name ASC`
+  );
+  return {
+    version: Number(settings.catalogue_version ?? 1),
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    models: rows.map((r) => ({
+      id: r.id,
+      providerId: r.provider_id,
+      displayName: r.display_name,
+      description: r.description,
+      providerName: r.provider_name,
+      contextWindow: r.context_window,
+      isDefault: r.is_default,
+      capabilities: normalizeCapabilities(r.capabilities)
+    })),
+    policy: {
+      allowDirectProvider: settings.allow_direct_provider === true,
+      maxOutputTokens: Number(settings.max_output_tokens ?? 8192)
+    }
+  };
+}
+var CATALOGUE_CACHE_SECONDS = 300;
+async function cachedCatalogue(ctx) {
+  const { db, limits } = ctx.deps;
+  if (limits.kind !== "redis") return buildCatalogue(db);
+  const version = await catalogueVersion(db);
+  const key = `catalogue:v${version}`;
+  const hit = await limits.cacheGet(key);
+  if (hit && hit.version === version) return hit;
+  const cat = await buildCatalogue(db);
+  if (cat.version === version) await limits.cacheSet(key, cat, CATALOGUE_CACHE_SECONDS);
+  return cat;
+}
+async function catalogueRoute(ctx) {
+  const device = await authenticateDevice(ctx);
+  const full = await cachedCatalogue(ctx);
+  const cat = await forDevice(ctx, full, device.deviceId, device.modelAccess);
+  const etag = `"${cat.version}"`;
+  if (ctx.req.headers["if-none-match"] === etag) {
+    ctx.res.writeHead(304, { etag, "cache-control": "no-store" });
+    ctx.res.end();
+    return;
+  }
+  sendJson(ctx.res, 200, cat, { etag, "cache-control": "no-store" });
+}
+async function deviceRoute(ctx) {
+  const d = await authenticateDevice(ctx);
+  sendJson(ctx.res, 200, { deviceId: d.deviceId, name: d.name, status: "active", catalogueVersion: await catalogueVersion(ctx.deps.db) });
+}
+async function forDevice(ctx, cat, deviceId, access) {
+  const allowed = await allowedModelIds(ctx.deps.db, deviceId, access);
+  const models = cat.models.filter((m) => isAllowed(allowed, m.id)).map(({ providerId: _p, ...m }) => m);
+  return { ...cat, models };
+}
+var HEALTH_CACHE_SECONDS = 30;
+async function catalogueStatusRoute(ctx) {
+  const device = await authenticateDevice(ctx);
+  const { db, limits } = ctx.deps;
+  const cat = await cachedCatalogue(ctx);
+  const allowed = await allowedModelIds(db, device.deviceId, device.modelAccess);
+  let health = await limits.cacheGet("provider-health");
+  if (!health) {
+    health = Object.fromEntries(await providerHealth(db));
+    await limits.cacheSet("provider-health", health, HEALTH_CACHE_SECONDS);
+  }
+  const models = cat.models.filter((m) => isAllowed(allowed, m.id)).map((m) => ({ id: m.id, ...health[m.providerId ?? ""] ?? { availability: "unknown", reason: "not checked recently" } }));
+  sendJson(ctx.res, 200, { version: cat.version, checkedAt: (/* @__PURE__ */ new Date()).toISOString(), models }, { "cache-control": "no-store" });
+}
+async function modelRoute(ctx) {
+  const device = await authenticateDevice(ctx);
+  const id = uuidParam(ctx.params.id);
+  const cat = await forDevice(ctx, await cachedCatalogue(ctx), device.deviceId, device.modelAccess);
+  const m = cat.models.find((x) => x.id === id);
+  if (!m) fail(404, "model_not_found", "this model is not available to this computer");
+  sendJson(ctx.res, 200, { ...m, catalogueVersion: cat.version });
+}
+async function deviceUsageRoute(ctx) {
+  const device = await authenticateDevice(ctx);
+  const days = Math.min(90, Math.max(1, Number(ctx.url.searchParams.get("days") ?? 30) || 30));
+  const { rows } = await ctx.deps.db.query(
+    `SELECT model_id, model_name,
+            count(*)::int AS requests,
+            count(*) FILTER (WHERE status = 'ok')::int AS ok,
+            count(*) FILTER (WHERE status = 'error')::int AS failed,
+            coalesce(sum(prompt_tokens), 0)::int AS prompt_tokens,
+            coalesce(sum(completion_tokens), 0)::int AS completion_tokens
+       FROM request_logs
+      WHERE device_id = $1 AND created_at > now() - make_interval(days => $2)
+      GROUP BY model_id, model_name ORDER BY requests DESC LIMIT 100`,
+    [device.deviceId, days]
+  );
+  sendJson(ctx.res, 200, {
+    days,
+    models: rows.map((r) => ({ modelId: r.model_id, modelName: r.model_name, requests: r.requests, ok: r.ok, failed: r.failed, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens }))
+  });
+}
+
+// src/modules/devices.ts
+var CODE_MINUTES = 15;
+var MAX_OUTSTANDING_CODES = 20;
+var ENROLL_PER_IP = 10;
+var ENROLL_WINDOW_SECONDS = 15 * 60;
+var DEVICE_TOUCH_SECONDS = 60;
+async function createEnrollmentCode(ctx) {
+  const s = await guardOwner(ctx, { write: true, sensitive: true });
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["label"]);
+  const label = str(body, "label", { max: 80, optional: true }) ?? "";
+  const { rows: outstanding } = await ctx.deps.db.query("SELECT count(*)::int AS n FROM enrollment_codes WHERE used_at IS NULL AND expires_at > now()");
+  if (outstanding[0].n >= MAX_OUTSTANDING_CODES) fail(409, "too_many_codes", "too many enrollment codes are waiting; let them expire or use one first");
+  const code = enrollmentCode();
+  const { rows } = await ctx.deps.db.query(
+    `INSERT INTO enrollment_codes (code_hash, label, created_by, expires_at)
+     VALUES ($1, $2, $3, now() + make_interval(mins => $4))
+     RETURNING expires_at`,
+    [sha256Hex(normalizeEnrollmentCode(code)), label, s.ownerId, CODE_MINUTES]
+  );
+  sendJson(ctx.res, 201, { code, label, expiresAt: new Date(rows[0].expires_at).toISOString() });
+}
+async function listEnrollmentCodes(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(
+    `SELECT id, label, created_at, expires_at, used_at, device_id,
+            (used_at IS NULL AND expires_at > now()) AS usable
+       FROM enrollment_codes ORDER BY created_at DESC LIMIT 100`
+  );
+  sendJson(ctx.res, 200, {
+    codes: rows.map((r) => ({
+      id: r.id,
+      label: r.label,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at,
+      usedAt: r.used_at,
+      deviceId: r.device_id,
+      status: r.used_at ? "used" : r.usable ? "waiting" : "expired"
+    }))
+  });
+}
+async function enrollDevice(ctx) {
+  const { db, config } = ctx.deps;
+  const ip = clientAddress(ctx.req, config.trustProxy);
+  const limit = await ctx.deps.limits.hit(`enroll:ip:${ip}`, ENROLL_PER_IP, ENROLL_WINDOW_SECONDS);
+  if (!limit.allowed) fail(429, "rate_limited", "too many enrollment attempts; try again later", { "retry-after": String(limit.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["code", "deviceName"]);
+  const code = str(body, "code", { min: 16, max: 40 });
+  const deviceName = str(body, "deviceName", { min: 1, max: 80 });
+  const invalid = () => fail(400, "invalid_enrollment_code", "the enrollment code is not valid, has expired, or was already used");
+  const token = randomToken(32);
+  const result = await db.transaction(async (q) => {
+    const { rows } = await q.query(
+      `SELECT id FROM enrollment_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() FOR UPDATE`,
+      [sha256Hex(normalizeEnrollmentCode(code))]
+    );
+    if (!rows[0]) return null;
+    const dev = await q.query(
+      `INSERT INTO devices (name, token_hash, created_by, last_seen_at)
+       SELECT $1, $2, created_by, now() FROM enrollment_codes WHERE id = $3
+       RETURNING id`,
+      [deviceName, sha256Hex(token), rows[0].id]
+    );
+    await q.query("UPDATE enrollment_codes SET used_at = now(), device_id = $2 WHERE id = $1", [rows[0].id, dev.rows[0].id]);
+    return dev.rows[0].id;
+  });
+  if (!result) invalid();
+  await ctx.deps.limits.clear(`enroll:ip:${ip}`);
+  sendJson(ctx.res, 201, { deviceId: result, token, catalogueVersion: await catalogueVersion(db) });
+}
+async function authenticateDevice(ctx) {
+  const header = ctx.req.headers.authorization ?? "";
+  const match2 = /^Bearer\s+([A-Za-z0-9_-]{20,128})$/.exec(header);
+  if (!match2) fail(401, "unauthenticated", "a device token is required");
+  const { rows } = await ctx.deps.db.query(
+    `SELECT id, name, status, model_access, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
+       FROM devices WHERE token_hash = $1`,
+    [sha256Hex(match2[1]), DEVICE_TOUCH_SECONDS]
+  );
+  const row = rows[0];
+  if (!row || row.status !== "active") fail(401, "device_revoked", "this device is not allowed to use the service; sign in to the desktop app again after the owner re-enrolls it");
+  if (row.touch) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now() WHERE id = $1", [row.id]);
+  return { deviceId: row.id, name: row.name, modelAccess: row.model_access };
+}
+async function listDevices(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(
+    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access,
+            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted
+       FROM devices d ORDER BY d.created_at DESC LIMIT 500`
+  );
+  sendJson(ctx.res, 200, {
+    devices: rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      status: r.status,
+      createdAt: r.created_at,
+      lastSeenAt: r.last_seen_at,
+      revokedAt: r.revoked_at,
+      modelAccess: r.model_access,
+      grantedModels: r.granted
+    }))
+  });
+}
+async function revokeDevice(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["confirmName"]);
+  const confirm = str(body, "confirmName", { max: 80, optional: true });
+  const { rows } = await ctx.deps.db.query("SELECT name, status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (confirm !== rows[0].name) fail(400, "confirmation_mismatch", "type the device name exactly to revoke it");
+  if (rows[0].status === "revoked") fail(409, "already_revoked", "this device is already revoked");
+  await ctx.deps.db.query("UPDATE devices SET status = 'revoked', revoked_at = now() WHERE id = $1", [id]);
+  sendJson(ctx.res, 200, { id, status: "revoked" });
+}
+async function getDeviceModels(ctx) {
+  await guardOwner(ctx, { write: false });
+  const id = uuidParam(ctx.params.id);
+  const { rows } = await ctx.deps.db.query("SELECT model_access FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  const granted = await ctx.deps.db.query("SELECT model_id FROM device_models WHERE device_id = $1 ORDER BY created_at", [id]);
+  sendJson(ctx.res, 200, { modelAccess: rows[0].model_access, modelIds: granted.rows.map((r) => r.model_id) });
+}
+async function putDeviceModels(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["modelAccess", "modelIds"]);
+  const access = body.modelAccess;
+  if (access !== "all" && access !== "selected") fail(400, "invalid_request", "modelAccess must be all or selected");
+  const raw = body.modelIds ?? [];
+  if (!Array.isArray(raw) || raw.length > 1e3) fail(400, "invalid_request", "modelIds must be a list of model ids");
+  const modelIds = [...new Set(raw.map((v) => uuidParam(typeof v === "string" ? v : "")))];
+  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (modelIds.length) {
+    const found = await ctx.deps.db.query("SELECT count(*)::int AS n FROM models WHERE id IN (SELECT (jsonb_array_elements_text($1::jsonb))::uuid)", [modelIds]);
+    if (found.rows[0].n !== modelIds.length) fail(400, "invalid_request", "one or more models do not exist");
+  }
+  await setDeviceAccess(ctx.deps.db, id, access, access === "selected" ? modelIds : []);
+  sendJson(ctx.res, 200, { modelAccess: access, modelIds: access === "selected" ? modelIds : [] });
+}
+
+// src/modules/models.ts
+function toModel(r) {
+  return {
+    id: r.id,
+    providerId: r.provider_id,
+    providerName: r.provider_name,
+    providerEnabled: r.provider_enabled,
+    upstreamModelId: r.upstream_model_id,
+    displayName: r.display_name,
+    description: r.description,
+    enabled: r.enabled,
+    isDefault: r.is_default,
+    contextWindow: r.context_window,
+    capabilities: normalizeCapabilities(r.capabilities),
+    fallbackModelId: r.fallback_model_id ?? null,
+    source: r.source ?? "manual",
+    lastListedAt: r.last_listed_at ?? null,
+    updatedAt: r.updated_at
+  };
+}
+var SELECT_MODEL = `
+  SELECT m.*, p.name AS provider_name, p.enabled AS provider_enabled
+    FROM models m JOIN providers p ON p.id = m.provider_id`;
+async function listModels(ctx) {
+  await guardOwner(ctx, { write: false });
+  const q = ctx.url.searchParams;
+  const where = [];
+  const params = [];
+  if (q.get("providerId")) {
+    params.push(uuidParam(q.get("providerId")));
+    where.push(`m.provider_id = $${params.length}`);
+  }
+  if (q.get("enabled") === "true" || q.get("enabled") === "false") {
+    params.push(q.get("enabled") === "true");
+    where.push(`m.enabled = $${params.length}`);
+  }
+  if (q.get("q")) {
+    params.push(`%${q.get("q").slice(0, 80).replace(/[%_\\]/g, "\\$&")}%`);
+    where.push(`(m.display_name ILIKE $${params.length} OR m.upstream_model_id ILIKE $${params.length})`);
+  }
+  const sql = `${SELECT_MODEL}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY p.name, m.display_name LIMIT 500`;
+  const { rows } = await ctx.deps.db.query(sql, params);
+  sendJson(ctx.res, 200, { models: rows.map(toModel) });
+}
+async function loadModel(db, id) {
+  const { rows } = await db.query(`${SELECT_MODEL} WHERE m.id = $1`, [id]);
+  if (!rows[0]) fail(404, "not_found", "model not found");
+  return rows[0];
+}
+function parseCapabilities(body, fallback) {
+  if (body.capabilities === void 0) return fallback;
+  const raw = requireObject(body.capabilities, "capabilities");
+  const allowed = ["streaming", "tools", "vision", "reasoning"];
+  for (const k of Object.keys(raw)) if (!allowed.includes(k)) fail(400, "invalid_request", `unknown capability "${k}"`);
+  for (const [k, v] of Object.entries(raw)) {
+    const c = requireObject(v, `capabilities.${k}`);
+    rejectUnknown(c, k === "reasoning" ? ["supported", "source", "levels"] : ["supported", "source"]);
+    if (c.supported !== void 0 && c.supported !== null && typeof c.supported !== "boolean") fail(400, "invalid_request", `capabilities.${k}.supported must be true, false or null`);
+    if (c.source !== void 0 && !["unknown", "admin", "provider_reported", "test"].includes(c.source)) fail(400, "invalid_request", `capabilities.${k}.source is not valid`);
+  }
+  return normalizeCapabilities({ ...fallback, ...raw });
+}
+async function createModel(ctx) {
+  await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["providerId", "upstreamModelId", "displayName", "description", "contextWindow", "capabilities", "enabled"]);
+  const providerId = uuidParam(str(body, "providerId", { min: 36, max: 36 }));
+  const upstreamModelId = str(body, "upstreamModelId", { min: 1, max: 200, trim: false });
+  const displayName = str(body, "displayName", { min: 1, max: 120 });
+  const description = str(body, "description", { max: 500, optional: true }) ?? "";
+  const contextWindow = int(body, "contextWindow", { min: 1, max: 1e7, optional: true }) ?? null;
+  const enabled = bool(body, "enabled", { def: false });
+  const capabilities = parseCapabilities(body, unknownCapabilities());
+  const { rows: p } = await ctx.deps.db.query("SELECT enabled FROM providers WHERE id = $1", [providerId]);
+  if (!p[0]) fail(404, "not_found", "provider not found");
+  if (enabled && !p[0].enabled) fail(409, "provider_disabled", "enable the provider before enabling its models");
+  const id = await ctx.deps.db.transaction(async (q) => {
+    const { rows } = await q.query(
+      `INSERT INTO models (provider_id, upstream_model_id, display_name, description, enabled, context_window, capabilities)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [providerId, upstreamModelId, displayName, description, enabled, contextWindow, capabilities]
+    );
+    if (enabled) await bumpCatalogue(q);
+    return rows[0].id;
+  }).catch((e) => {
+    if (e?.code === "23505") fail(409, "duplicate", "this provider already has that model");
+    throw e;
+  });
+  sendJson(ctx.res, 201, toModel(await loadModel(ctx.deps.db, id)));
+}
+async function updateModel(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["enabled", "displayName", "description", "contextWindow", "capabilities", "fallbackModelId"]);
+  const current = await loadModel(ctx.deps.db, id);
+  const enabled = bool(body, "enabled", { optional: true }) ?? current.enabled;
+  const displayName = str(body, "displayName", { min: 1, max: 120, optional: true }) ?? current.display_name;
+  const description = str(body, "description", { max: 500, optional: true }) ?? current.description;
+  const contextWindow = body.contextWindow === void 0 ? current.context_window : body.contextWindow === null ? null : int(body, "contextWindow", { min: 1, max: 1e7 });
+  const capabilities = parseCapabilities(body, normalizeCapabilities(current.capabilities));
+  let fallbackModelId = current.fallback_model_id ?? null;
+  if (body.fallbackModelId !== void 0) {
+    fallbackModelId = body.fallbackModelId === null ? null : uuidParam(typeof body.fallbackModelId === "string" ? body.fallbackModelId : "");
+    if (fallbackModelId === id) fail(400, "invalid_request", "a model cannot be its own fallback");
+    if (fallbackModelId) {
+      const fb = await ctx.deps.db.query("SELECT 1 FROM models WHERE id = $1", [fallbackModelId]);
+      if (!fb.rows[0]) fail(400, "invalid_request", "the fallback model does not exist");
+    }
+  }
+  if (enabled && !current.provider_enabled) fail(409, "provider_disabled", "enable the provider before enabling its models");
+  await ctx.deps.db.transaction(async (q) => {
+    await q.query(
+      `UPDATE models SET enabled = $2, display_name = $3, description = $4, context_window = $5, capabilities = $6,
+              fallback_model_id = $7, is_default = CASE WHEN $2 THEN is_default ELSE false END, updated_at = now()
+        WHERE id = $1`,
+      [id, enabled, displayName, description, contextWindow, capabilities, fallbackModelId]
+    );
+    await bumpCatalogue(q);
+  });
+  sendJson(ctx.res, 200, toModel(await loadModel(ctx.deps.db, id)));
+}
+async function setDefaultModel(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const current = await loadModel(ctx.deps.db, id);
+  if (!current.enabled || !current.provider_enabled) fail(409, "model_disabled", "only an enabled model with an enabled provider can be the default");
+  await ctx.deps.db.transaction(async (q) => {
+    await q.query("UPDATE models SET is_default = false WHERE is_default");
+    await q.query("UPDATE models SET is_default = true, updated_at = now() WHERE id = $1", [id]);
+    await bumpCatalogue(q);
+  });
+  sendJson(ctx.res, 200, toModel(await loadModel(ctx.deps.db, id)));
+}
+async function deleteModel(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["confirmName"]);
+  const current = await loadModel(ctx.deps.db, id);
+  if (str(body, "confirmName", { max: 120, optional: true }) !== current.display_name) fail(400, "confirmation_mismatch", "type the model name exactly to delete it");
+  await ctx.deps.db.transaction(async (q) => {
+    await q.query("DELETE FROM models WHERE id = $1", [id]);
+    await bumpCatalogue(q);
+  });
+  sendJson(ctx.res, 200, { deleted: true });
+}
+
+// src/modules/chat.ts
+var BODY_LIMIT = 4 * 1024 * 1024;
+var MAX_MESSAGES = 400;
+var MAX_TEXT_CHARS = 15e5;
+var MAX_TOOLS = 128;
+var UPSTREAM_BODY_LIMIT = 16 * 1024 * 1024;
+var TOP_LEVEL = ["model", "messages", "tools", "tool_choice", "temperature", "top_p", "max_tokens", "reasoning_effort", "stream", "stream_options"];
+var ROLES = ["system", "user", "assistant", "tool"];
+var oa = (code, message, status = 400, headers = {}) => new HttpError(status, code, message, headers);
+function parseChatRequest(body, maxOutputTokens) {
+  for (const k of Object.keys(body)) if (!TOP_LEVEL.includes(k)) throw oa("unsupported_parameter", `the parameter "${k}" is not supported`);
+  if (typeof body.model !== "string" || !UUID.test(body.model)) throw oa("invalid_request", "model must be a model id from the catalogue");
+  if (!Array.isArray(body.messages) || body.messages.length < 1 || body.messages.length > MAX_MESSAGES) {
+    throw oa("invalid_request", `messages must be a list of 1 to ${MAX_MESSAGES} items`);
+  }
+  let textChars = 0;
+  let hasImages = false;
+  const messages = body.messages.map((raw, i) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw oa("invalid_request", `messages[${i}] must be an object`);
+    const m = raw;
+    if (!ROLES.includes(m.role)) throw oa("invalid_request", `messages[${i}].role is not valid`);
+    const out = { role: m.role };
+    if (typeof m.content === "string") {
+      textChars += m.content.length;
+      out.content = m.content;
+    } else if (Array.isArray(m.content)) {
+      out.content = m.content.map((p) => {
+        if (p?.type === "text" && typeof p.text === "string") {
+          textChars += p.text.length;
+          return { type: "text", text: p.text };
+        }
+        if (p?.type === "image_url" && typeof p.image_url?.url === "string" && p.image_url.url.length <= 8e6) {
+          hasImages = true;
+          return { type: "image_url", image_url: { url: p.image_url.url, ...p.image_url.detail ? { detail: String(p.image_url.detail).slice(0, 10) } : {} } };
+        }
+        throw oa("invalid_request", `messages[${i}].content has an unsupported part`);
+      });
+    } else if (m.content === null && m.role === "assistant") {
+      out.content = null;
+    } else {
+      throw oa("invalid_request", `messages[${i}].content must be text or a list of parts`);
+    }
+    if (m.name !== void 0) {
+      if (typeof m.name !== "string" || m.name.length > 64) throw oa("invalid_request", `messages[${i}].name is not valid`);
+      out.name = m.name;
+    }
+    if (m.tool_call_id !== void 0) {
+      if (typeof m.tool_call_id !== "string" || m.tool_call_id.length > 200) throw oa("invalid_request", `messages[${i}].tool_call_id is not valid`);
+      out.tool_call_id = m.tool_call_id;
+    }
+    if (m.tool_calls !== void 0) {
+      if (!Array.isArray(m.tool_calls) || m.tool_calls.length > 64) throw oa("invalid_request", `messages[${i}].tool_calls is not valid`);
+      out.tool_calls = m.tool_calls.map((t) => {
+        if (typeof t?.id !== "string" || typeof t?.function?.name !== "string" || typeof t?.function?.arguments !== "string") {
+          throw oa("invalid_request", `messages[${i}].tool_calls has an invalid entry`);
+        }
+        textChars += t.function.arguments.length;
+        return { id: t.id.slice(0, 200), type: "function", function: { name: t.function.name.slice(0, 200), arguments: t.function.arguments } };
+      });
+    }
+    return out;
+  });
+  if (textChars > MAX_TEXT_CHARS) throw oa("invalid_request", "the conversation is too large for one request");
+  let tools;
+  if (body.tools !== void 0) {
+    if (!Array.isArray(body.tools) || body.tools.length > MAX_TOOLS) throw oa("invalid_request", `tools must be a list of at most ${MAX_TOOLS} functions`);
+    tools = body.tools.map((t) => {
+      if (t?.type !== "function" || typeof t.function?.name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(t.function.name)) {
+        throw oa("invalid_request", "each tool must be a function with a valid name");
+      }
+      return { type: "function", function: { name: t.function.name, description: typeof t.function.description === "string" ? t.function.description.slice(0, 4e3) : void 0, parameters: t.function.parameters ?? { type: "object", properties: {} } } };
+    });
+  }
+  let toolChoice;
+  if (body.tool_choice !== void 0) {
+    if (["auto", "none", "required"].includes(body.tool_choice)) toolChoice = body.tool_choice;
+    else if (body.tool_choice?.type === "function" && typeof body.tool_choice.function?.name === "string") toolChoice = { type: "function", function: { name: body.tool_choice.function.name } };
+    else throw oa("invalid_request", "tool_choice is not valid");
+  }
+  const num = (k, min, max) => {
+    const v = body[k];
+    if (v === void 0 || v === null) return void 0;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) throw oa("invalid_request", `${k} must be a number from ${min} to ${max}`);
+    return v;
+  };
+  const temperature = num("temperature", 0, 2);
+  const topP = num("top_p", 0, 1);
+  let maxTokens;
+  if (body.max_tokens !== void 0 && body.max_tokens !== null) {
+    maxTokens = int({ max_tokens: body.max_tokens }, "max_tokens", { min: 1, max: maxOutputTokens });
+  }
+  let reasoning;
+  if (body.reasoning_effort !== void 0 && body.reasoning_effort !== null) {
+    if (!REASONING_LEVELS.includes(body.reasoning_effort)) throw oa("invalid_request", "reasoning_effort must be low, medium or high");
+    reasoning = body.reasoning_effort;
+  }
+  const stream = body.stream === void 0 ? false : body.stream === true;
+  if (body.stream !== void 0 && typeof body.stream !== "boolean") throw oa("invalid_request", "stream must be true or false");
+  let includeUsage = false;
+  if (body.stream_options !== void 0) {
+    if (!stream) throw oa("invalid_request", "stream_options requires stream: true");
+    const so = body.stream_options;
+    if (!so || typeof so !== "object" || Object.keys(so).some((k) => k !== "include_usage") || so.include_usage !== void 0 && typeof so.include_usage !== "boolean") {
+      throw oa("invalid_request", "stream_options may only contain include_usage");
+    }
+    includeUsage = so.include_usage === true;
+  }
+  return {
+    model: body.model,
+    messages,
+    tools,
+    tool_choice: toolChoice,
+    temperature,
+    top_p: topP,
+    max_tokens: maxTokens,
+    reasoning_effort: reasoning,
+    stream,
+    include_usage: includeUsage,
+    hasImages
+  };
+}
+function buildUpstreamBody(req, upstreamModelId, reasoningLevelsAllowed) {
+  const out = { model: upstreamModelId, messages: req.messages, stream: req.stream };
+  if (req.stream && req.include_usage) out.stream_options = { include_usage: true };
+  if (req.tools) out.tools = req.tools;
+  if (req.tool_choice !== void 0) out.tool_choice = req.tool_choice;
+  if (req.temperature !== void 0) out.temperature = req.temperature;
+  if (req.top_p !== void 0) out.top_p = req.top_p;
+  if (req.max_tokens !== void 0) out.max_tokens = req.max_tokens;
+  if (req.reasoning_effort && reasoningLevelsAllowed) out.reasoning_effort = req.reasoning_effort;
+  return out;
+}
+var LEASE_SECONDS = 900;
+var IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,64}$/;
+function idempotencyKey(req) {
+  const raw = req.headers["idempotency-key"];
+  if (raw === void 0) return null;
+  if (typeof raw !== "string" || !IDEMPOTENCY_KEY.test(raw)) {
+    fail(400, "invalid_request", "Idempotency-Key must be 8 to 64 letters, digits, dots, colons, underscores or hyphens");
+  }
+  return raw;
+}
+async function policyNumber(deps, key, fallback) {
+  const { rows } = await deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = $1", [key]);
+  return rows[0]?.v ?? fallback;
+}
+async function chatCompletions(ctx) {
+  const { res, deps } = ctx;
+  let deviceId = null;
+  try {
+    const device = await authenticateDevice(ctx);
+    deviceId = device.deviceId;
+    const clientRequestId = idempotencyKey(ctx.req);
+    const perMinute = await policyNumber(deps, "rate_limit_per_minute", 60);
+    const rl = await deps.limits.hit(`chat:dev:${device.deviceId}`, perMinute, 60);
+    if (!rl.allowed) fail(429, "rate_limited", "too many requests from this device; wait and try again", { "retry-after": String(rl.retryAfterSeconds) });
+    const maxConcurrent = await policyNumber(deps, "max_concurrent_per_device", 2);
+    const slot = await acquireSlot(deps.db, {
+      deviceId: device.deviceId,
+      requestId: ctx.requestId,
+      clientRequestId,
+      maxConcurrent,
+      leaseSeconds: LEASE_SECONDS
+    });
+    if (slot === "duplicate") fail(409, "duplicate_request", "this request was already received; send a new Idempotency-Key for a new request");
+    if (slot === "busy") fail(429, "too_many_requests", "this device already has requests running; wait for one to finish");
+    try {
+      await handle(ctx, device, clientRequestId);
+    } finally {
+      await releaseSlot(deps.db, ctx.requestId).catch((e) => log("error", "could not release request slot", { requestId: ctx.requestId, error: errText(e) }));
+    }
+  } catch (e) {
+    if (res.headersSent) {
+      if (!res.writableEnded) res.end();
+      if (!(e instanceof HttpError)) log("error", "chat failed after the stream started", { error: errText(e), deviceId });
+      return;
+    }
+    if (e instanceof HttpError) {
+      sendOpenAiError(res, e.status, e.code, e.message, e.headers);
+      return;
+    }
+    if (e instanceof UpstreamError) {
+      sendOpenAiError(res, 502, "upstream_error", "the provider failed to answer");
+      return;
+    }
+    log("error", "chat route failed", { error: errText(e), deviceId });
+    sendOpenAiError(res, 500, "internal_error", "the request could not be completed");
+  }
+}
+function errText(e) {
+  return e instanceof Error ? e.name + ": " + e.message.slice(0, 300) : "unknown error";
+}
+async function handle(ctx, device, clientRequestId) {
+  const { deps, req } = ctx;
+  const deviceId = device.deviceId;
+  const body = await readJson(req, BODY_LIMIT);
+  const policy = await deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'max_output_tokens'");
+  const parsed = parseChatRequest(body, policy.rows[0]?.v ?? 8192);
+  const allowed = await allowedModelIds(deps.db, deviceId, device.modelAccess);
+  const m = await loadRoute(deps, parsed.model);
+  if (!m || !isAllowed(allowed, m.id)) throw oa("model_not_found", "this model is not in the catalogue for this computer; refresh the model list", 404);
+  if (!m.model_enabled || !m.provider_enabled) throw oa("model_disabled", "this model is currently disabled; choose another model", 403);
+  checkCompatible(m, parsed, true);
+  const chain = [m];
+  if (m.fallback_model_id) {
+    const fb = await loadRoute(deps, m.fallback_model_id);
+    if (fb && fb.model_enabled && fb.provider_enabled && isAllowed(allowed, fb.id) && checkCompatible(fb, parsed, false)) chain.push(fb);
+  }
+  for (let i = 0; i < chain.length; i++) {
+    const done = await attempt(ctx, deviceId, clientRequestId, parsed, chain[i], { requested: m, canFallBack: i < chain.length - 1 });
+    if (done) return;
+  }
+}
+async function loadRoute(deps, modelId) {
+  const { rows } = await deps.db.query(
+    `SELECT m.id, m.upstream_model_id, m.display_name, m.enabled AS model_enabled, m.capabilities, m.fallback_model_id,
+            p.id AS provider_id, p.name AS provider_name, p.enabled AS provider_enabled, p.base_url, p.auth_scheme, p.timeout_ms, p.max_retries
+       FROM models m JOIN providers p ON p.id = m.provider_id WHERE m.id = $1`,
+    [modelId]
+  );
+  return rows[0] ?? null;
+}
+function checkCompatible(m, parsed, raise) {
+  const caps = normalizeCapabilities(m.capabilities);
+  const no = (msg) => {
+    if (raise) throw oa("unsupported_parameter", msg);
+    return false;
+  };
+  const ok = (c) => raise ? c.supported !== false : c.supported === true;
+  if (parsed.tools && !ok(caps.tools)) return no("this model does not support tools");
+  if (parsed.hasImages && !ok(caps.vision)) return no("this model does not accept images");
+  if (parsed.reasoning_effort) {
+    const levels = caps.reasoning.levels ?? [];
+    if (caps.reasoning.supported !== true || levels.length && !levels.includes(parsed.reasoning_effort)) return no("this model does not support that reasoning level");
+  }
+  return true;
+}
+function shouldFallBack(e) {
+  return e instanceof UpstreamError && ["auth", "rate_limited", "timeout", "unreachable", "server"].includes(e.kind);
+}
+async function attempt(ctx, deviceId, clientRequestId, parsed, m, route) {
+  const { deps, res } = ctx;
+  const isFallback = m.id !== route.requested.id;
+  let key = null;
+  if (m.auth_scheme === "bearer") {
+    key = await providerApiKey(deps, m.provider_id);
+    if (!key) {
+      if (route.canFallBack) {
+        log("warn", "model has no provider key; using its fallback", { requestId: ctx.requestId, model: m.id });
+        return false;
+      }
+      throw oa("upstream_auth_failed", "the provider has no API key configured; the owner must add it", 502);
+    }
+  }
+  const upstreamBody = buildUpstreamBody(parsed, m.upstream_model_id, true);
+  const url = `${m.base_url}/chat/completions`;
+  const started = Date.now();
+  const controller = new AbortController();
+  let finished = false;
+  let movedOn = false;
+  let outcome = {
+    status: "error",
+    http: 500,
+    code: "internal_error",
+    ttft: null,
+    usage: { p: null, c: null }
+  };
+  const onClose = () => {
+    if (!finished) controller.abort();
+  };
+  res.on("close", onClose);
+  const routingHeaders = isFallback ? { "x-devora-model": m.id, "x-devora-fallback-from": route.requested.id } : { "x-devora-model": m.id };
+  try {
+    const upstream = await callUpstream(deps, url, upstreamBody, key, m.timeout_ms, m.max_retries > 0 ? 1 : 0, parsed.stream, controller);
+    if (!parsed.stream) {
+      const text = await readLimited(upstream, UPSTREAM_BODY_LIMIT);
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new UpstreamError("bad_response", "malformed response");
+      }
+      if (!json || !Array.isArray(json.choices)) throw new UpstreamError("bad_response", "malformed response");
+      json.model = m.id;
+      const usage3 = usageOf(json.usage);
+      outcome = { status: "ok", http: 200, code: null, ttft: Date.now() - started, usage: usage3 };
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...routingHeaders });
+      res.end(JSON.stringify(json));
+    } else {
+      for (const [k, v] of Object.entries(routingHeaders)) res.setHeader(k, v);
+      outcome = await pipeStream(upstream, res, started, controller);
+    }
+  } catch (e) {
+    if (controller.signal.aborted && !timeoutFlag.get(controller) && !res.headersSent) {
+      outcome = { status: "cancelled", http: 499, code: "client_disconnected", ttft: null, usage: { p: null, c: null } };
+    } else {
+      const mapped = mapUpstreamError(e);
+      outcome = { status: "error", http: mapped.status, code: mapped.code, ttft: null, usage: { p: null, c: null } };
+      if (!res.headersSent && route.canFallBack && shouldFallBack(e)) {
+        movedOn = true;
+        log("warn", "upstream failed; using the configured fallback", { requestId: ctx.requestId, model: m.id, code: mapped.code });
+      } else if (!res.headersSent) sendOpenAiError(res, mapped.status, mapped.code, mapped.message, mapped.headers);
+      else if (!res.writableEnded) res.end();
+    }
+  } finally {
+    finished = true;
+    res.off("close", onClose);
+    await writeLog(deps, {
+      requestId: ctx.requestId,
+      // The idempotency key belongs to the request, so only the attempt that answers carries it (the column is unique).
+      clientRequestId: movedOn ? null : clientRequestId,
+      deviceId,
+      modelId: m.id,
+      modelName: m.display_name,
+      providerId: m.provider_id,
+      providerName: m.provider_name,
+      stream: parsed.stream,
+      latencyMs: Date.now() - started,
+      ...outcome
+    });
+  }
+  return !movedOn;
+}
+function usageOf(u) {
+  return {
+    p: Number.isInteger(u?.prompt_tokens) ? u.prompt_tokens : null,
+    c: Number.isInteger(u?.completion_tokens) ? u.completion_tokens : null
+  };
+}
+function mapUpstreamError(e) {
+  if (e instanceof HttpError) return { status: e.status, code: e.code, message: e.message, headers: e.headers };
+  if (e instanceof UpstreamError) {
+    switch (e.kind) {
+      case "auth":
+        return { status: 502, code: "upstream_auth_failed", message: "the provider rejected the stored API key; the owner must update it" };
+      case "rate_limited":
+        return { status: 429, code: "upstream_rate_limited", message: "the provider is rate limiting requests; try again shortly", headers: { "retry-after": "20" } };
+      case "timeout":
+        return { status: 504, code: "upstream_timeout", message: "the provider did not answer in time" };
+      case "unreachable":
+        return { status: 502, code: "upstream_unreachable", message: "the provider could not be reached" };
+      case "rejected":
+        return { status: 400, code: "upstream_rejected", message: "the provider rejected this request; try a shorter conversation or another model" };
+      default:
+        return { status: 502, code: "upstream_error", message: "the provider failed to answer" };
+    }
+  }
+  return { status: 500, code: "internal_error", message: "the request could not be completed" };
+}
+async function callUpstream(deps, url, body, key, timeoutMs, retries, stream, controller) {
+  const headers = {
+    "content-type": "application/json",
+    accept: stream ? "text/event-stream" : "application/json"
+  };
+  if (key) headers.authorization = `Bearer ${key}`;
+  const payload = JSON.stringify(body);
+  let attempt2 = 0;
+  for (; ; ) {
+    const timer = setTimeout(() => {
+      timeoutFlag.set(controller, true);
+      controller.abort();
+    }, timeoutMs);
+    try {
+      const res = await deps.fetch(url, { method: "POST", headers, body: payload, signal: controller.signal });
+      clearTimeout(timer);
+      if (res.status === 401 || res.status === 403) {
+        await res.body?.cancel().catch(() => void 0);
+        throw new UpstreamError("auth", "auth", res.status);
+      }
+      if (res.status === 429) {
+        await res.body?.cancel().catch(() => void 0);
+        throw new UpstreamError("rate_limited", "rate limited", 429);
+      }
+      if (res.status >= 500) {
+        await res.body?.cancel().catch(() => void 0);
+        throw new UpstreamError("server", "server error", res.status);
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => void 0);
+        throw new UpstreamError("rejected", "rejected", res.status);
+      }
+      return res;
+    } catch (e) {
+      clearTimeout(timer);
+      if (e instanceof UpstreamError) throw e;
+      if (controller.signal.aborted) {
+        if (timeoutFlag.get(controller)) throw new UpstreamError("timeout", "timeout");
+        throw e;
+      }
+      if (attempt2 < retries) {
+        attempt2++;
+        continue;
+      }
+      throw new UpstreamError("unreachable", "unreachable");
+    }
+  }
+}
+var timeoutFlag = /* @__PURE__ */ new WeakMap();
+async function readLimited(res, limit) {
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks = [];
+  let size = 0;
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => void 0);
+      throw new UpstreamError("bad_response", "response too large");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function pipeStream(upstream, res, started, controller) {
+  const reader = upstream.body?.getReader();
+  if (!reader) throw new UpstreamError("bad_response", "no stream");
+  const idleMs = 12e4;
+  let idle;
+  const armIdle = () => {
+    clearTimeout(idle);
+    idle = setTimeout(() => {
+      timeoutFlag.set(controller, true);
+      controller.abort();
+    }, idleMs);
+  };
+  armIdle();
+  let ttft = null;
+  let usage3 = { p: null, c: null };
+  let tail = "";
+  let started200 = false;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      armIdle();
+      if (ttft === null) ttft = Date.now() - started;
+      if (!started200) {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" });
+        started200 = true;
+      }
+      if (!res.writableEnded && !res.destroyed) res.write(value);
+      tail += Buffer.from(value).toString("utf8");
+      let nl;
+      while ((nl = tail.indexOf("\n")) >= 0) {
+        const line = tail.slice(0, nl).trim();
+        tail = tail.slice(nl + 1);
+        if (line.startsWith("data:") && line.includes('"usage"')) {
+          try {
+            const u = usageOf(JSON.parse(line.slice(5)).usage);
+            if (u.p !== null || u.c !== null) usage3 = u;
+          } catch {
+          }
+        }
+      }
+      if (tail.length > 262144) tail = tail.slice(-65536);
+    }
+    clearTimeout(idle);
+    if (!started200) {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+    }
+    res.end();
+    return { status: "ok", http: 200, code: null, ttft, usage: usage3 };
+  } catch (e) {
+    clearTimeout(idle);
+    await reader.cancel().catch(() => void 0);
+    if (controller.signal.aborted && !timeoutFlag.get(controller)) {
+      if (!res.writableEnded) res.end();
+      return { status: "cancelled", http: 499, code: "client_disconnected", ttft, usage: usage3 };
+    }
+    const timed = timeoutFlag.get(controller) === true;
+    if (started200) {
+      const err = timed ? { code: "upstream_timeout", message: "the provider stopped sending data" } : { code: "upstream_error", message: "the provider stream was interrupted" };
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { message: err.message, type: "server_error", code: err.code } })}
+
+`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      return { status: "error", http: 200, code: err.code, ttft, usage: usage3 };
+    }
+    throw timed ? new UpstreamError("timeout", "timeout") : new UpstreamError("unreachable", "interrupted");
+  }
+}
+async function writeLog(deps, r) {
+  const reported = r.usage.p !== null || r.usage.c !== null;
+  const params = [
+    r.deviceId,
+    r.modelId,
+    r.modelName,
+    r.providerId,
+    r.providerName,
+    r.status,
+    r.http,
+    r.code,
+    r.stream,
+    Math.max(0, Math.round(r.latencyMs)),
+    r.ttft,
+    r.usage.p,
+    r.usage.c,
+    reported ? "provider_reported" : "none",
+    r.requestId,
+    r.clientRequestId
+  ];
+  const sql = `INSERT INTO request_logs (device_id, model_id, model_name, provider_id, provider_name, status, http_status, error_code, stream, latency_ms, ttft_ms, prompt_tokens, completion_tokens, usage_source, request_id, client_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       ON CONFLICT DO NOTHING`;
+  for (let attempt2 = 1; attempt2 <= 3; attempt2++) {
+    try {
+      await deps.db.query(sql, params);
+      return;
+    } catch (e) {
+      if (attempt2 === 3) {
+        log("error", "could not write request log", { requestId: r.requestId, attempts: attempt2, error: errText(e) });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150 * attempt2));
+    }
+  }
+}
+
+// src/modules/admin-data.ts
+async function overview(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(`
+    SELECT
+      (SELECT count(*)::int FROM providers WHERE enabled) AS providers_enabled,
+      (SELECT count(*)::int FROM providers) AS providers_total,
+      (SELECT count(*)::int FROM models WHERE enabled) AS models_enabled,
+      (SELECT count(*)::int FROM devices WHERE status = 'active') AS devices_active,
+      (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours') AS requests_24h,
+      (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours' AND status <> 'ok') AS failed_24h,
+      (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p50_ms,
+      (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms`);
+  const providers = await ctx.deps.db.query("SELECT name, enabled, last_test_ok, last_test_at, last_test_message FROM providers ORDER BY name");
+  sendJson(ctx.res, 200, {
+    ...toCamel(rows[0]),
+    providers: providers.rows.map((p) => ({
+      name: p.name,
+      enabled: p.enabled,
+      lastTestOk: p.last_test_ok,
+      lastTestAt: p.last_test_at,
+      lastTestMessage: p.last_test_message
+    }))
+  });
+}
+function toCamel(r) {
+  return Object.fromEntries(Object.entries(r).map(([k, v]) => [k.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase()), v]));
+}
+async function usage(ctx) {
+  await guardOwner(ctx, { write: false });
+  const window = ctx.url.searchParams.get("window") ?? "24h";
+  if (window !== "24h" && window !== "7d") fail(400, "invalid_request", "window must be 24h or 7d");
+  const interval = window === "24h" ? "24 hours" : "7 days";
+  const bucket = window === "24h" ? "hour" : "day";
+  const q = ctx.deps.db;
+  const totals = await q.query(
+    `SELECT count(*)::int AS requests,
+            count(*) FILTER (WHERE status = 'ok')::int AS ok,
+            count(*) FILTER (WHERE status = 'error')::int AS errors,
+            count(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+            coalesce(sum(prompt_tokens) FILTER (WHERE usage_source = 'provider_reported'), 0)::bigint AS prompt_tokens,
+            coalesce(sum(completion_tokens) FILTER (WHERE usage_source = 'provider_reported'), 0)::bigint AS completion_tokens,
+            count(*) FILTER (WHERE usage_source = 'none')::int AS without_usage
+       FROM request_logs WHERE created_at > now() - interval '${interval}'`
+  );
+  const byModel = await q.query(
+    `SELECT model_name, count(*)::int AS requests, count(*) FILTER (WHERE status <> 'ok')::int AS failed
+       FROM request_logs WHERE created_at > now() - interval '${interval}'
+      GROUP BY model_name ORDER BY requests DESC LIMIT 50`
+  );
+  const byError = await q.query(
+    `SELECT error_code AS code, count(*)::int AS count FROM request_logs
+      WHERE created_at > now() - interval '${interval}' AND error_code IS NOT NULL
+      GROUP BY error_code ORDER BY count DESC LIMIT 50`
+  );
+  const series = await q.query(
+    `SELECT date_trunc('${bucket}', created_at) AS bucket, count(*)::int AS requests, count(*) FILTER (WHERE status <> 'ok')::int AS failed
+       FROM request_logs WHERE created_at > now() - interval '${interval}'
+      GROUP BY 1 ORDER BY 1`
+  );
+  sendJson(ctx.res, 200, {
+    window,
+    totals: toCamel(totals.rows[0]),
+    byModel: byModel.rows.map((r) => ({ modelName: r.model_name, requests: r.requests, failed: r.failed })),
+    errorCodes: byError.rows,
+    series: series.rows.map((r) => ({ at: r.bucket, requests: r.requests, failed: r.failed })),
+    note: "Token counts include only responses where the provider reported usage. Other requests are counted in withoutUsage."
+  });
+}
+async function logs(ctx) {
+  await guardOwner(ctx, { write: false });
+  const q = ctx.url.searchParams;
+  const limit = Math.min(200, Math.max(1, Number(q.get("limit") ?? 50) || 50));
+  const where = [];
+  const params = [];
+  if (q.get("status") && ["ok", "error", "cancelled"].includes(q.get("status"))) {
+    params.push(q.get("status"));
+    where.push(`r.status = $${params.length}`);
+  }
+  if (q.get("model")) {
+    params.push(q.get("model").slice(0, 120));
+    where.push(`r.model_name = $${params.length}`);
+  }
+  if (q.get("cursor")) {
+    const c = Number(q.get("cursor"));
+    if (!Number.isInteger(c) || c < 1) fail(400, "invalid_request", "cursor is not valid");
+    params.push(c);
+    where.push(`r.id < $${params.length}`);
+  }
+  params.push(limit + 1);
+  const sql = `SELECT r.id, r.created_at, d.name AS device_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
+                      r.stream, r.latency_ms, r.ttft_ms, r.prompt_tokens, r.completion_tokens, r.usage_source
+                 FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id
+                ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+                ORDER BY r.id DESC LIMIT $${params.length}`;
+  const { rows } = await ctx.deps.db.query(sql, params);
+  const page = rows.slice(0, limit);
+  sendJson(ctx.res, 200, {
+    logs: page.map((r) => ({
+      id: Number(r.id),
+      createdAt: r.created_at,
+      deviceName: r.device_name ?? null,
+      modelName: r.model_name,
+      providerName: r.provider_name,
+      status: r.status,
+      httpStatus: r.http_status,
+      errorCode: r.error_code,
+      stream: r.stream,
+      latencyMs: r.latency_ms,
+      ttftMs: r.ttft_ms,
+      promptTokens: r.prompt_tokens,
+      completionTokens: r.completion_tokens,
+      usageSource: r.usage_source
+    })),
+    nextCursor: rows.length > limit ? String(page[page.length - 1].id) : null
+  });
+}
+async function getSettings(ctx) {
+  await guardOwner(ctx, { write: false });
+  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+}
+async function currentSettings(db) {
+  const s = await readSettings(db);
+  return {
+    rateLimitPerMinute: Number(s.rate_limit_per_minute ?? 60),
+    maxConcurrentPerDevice: Number(s.max_concurrent_per_device ?? 2),
+    maxOutputTokens: Number(s.max_output_tokens ?? 8192),
+    allowDirectProvider: s.allow_direct_provider === true
+  };
+}
+var SETTING_KEYS = {
+  rateLimitPerMinute: "rate_limit_per_minute",
+  maxConcurrentPerDevice: "max_concurrent_per_device",
+  maxOutputTokens: "max_output_tokens",
+  allowDirectProvider: "allow_direct_provider"
+};
+async function patchSettings(ctx) {
+  const session = await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, Object.keys(SETTING_KEYS));
+  const changes = [];
+  const rate = int(body, "rateLimitPerMinute", { min: 1, max: 600, optional: true });
+  if (rate !== void 0) changes.push(["rate_limit_per_minute", rate]);
+  const conc = int(body, "maxConcurrentPerDevice", { min: 1, max: 16, optional: true });
+  if (conc !== void 0) changes.push(["max_concurrent_per_device", conc]);
+  const maxOut = int(body, "maxOutputTokens", { min: 1, max: 32768, optional: true });
+  if (maxOut !== void 0) changes.push(["max_output_tokens", maxOut]);
+  const direct = bool(body, "allowDirectProvider", { optional: true });
+  if (direct !== void 0) {
+    requireReauth(session);
+    changes.push(["allow_direct_provider", direct]);
+  }
+  if (changes.length === 0) fail(400, "invalid_request", "no settings were given");
+  await ctx.deps.db.transaction(async (q) => {
+    for (const [k, v] of changes) {
+      await q.query("UPDATE settings SET value = $2, updated_at = now() WHERE key = $1", [k, JSON.stringify(v)]);
+    }
+    if (changes.some(([k]) => k === "max_output_tokens" || k === "allow_direct_provider")) await bumpCatalogue(q);
+  });
+  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+}
+async function pruneLogs(db, days) {
+  const { rowCount } = await db.query("DELETE FROM request_logs WHERE created_at < now() - make_interval(days => $1)", [days]);
+  return rowCount;
+}
+
+// src/modules/health.ts
+var STALE_TEST_HOURS = 24 * 7;
+async function adminHealth(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { db, config } = ctx.deps;
+  const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const dbStart = Date.now();
+  let database;
+  try {
+    await db.query("SELECT 1");
+    const latencyMs = Date.now() - dbStart;
+    const s = await migrationStatus(db);
+    database = { ok: s.pending.length === 0, latencyMs, schemaVersion: s.currentVersion, pendingMigrations: s.pending.length, reason: s.pending.length ? "migrations are pending" : null };
+  } catch {
+    database = { ok: false, latencyMs: null, schemaVersion: null, pendingMigrations: null, reason: "the database is unreachable" };
+  }
+  const providers = database.ok ? (await db.query(
+    `SELECT count(*) FILTER (WHERE enabled)::int AS enabled,
+                  count(*) FILTER (WHERE enabled AND last_test_ok IS NULL)::int AS untested,
+                  count(*) FILTER (WHERE enabled AND last_test_ok IS FALSE)::int AS failing,
+                  count(*) FILTER (WHERE enabled AND last_test_at < now() - make_interval(hours => $1))::int AS stale
+             FROM providers`,
+    [STALE_TEST_HOURS]
+  )).rows[0] : null;
+  const activeLeases = database.ok ? await activeLeaseCount(db) : null;
+  let redis;
+  if (!ctx.deps.redis) redis = { configured: false, ok: null, latencyMs: null, target: null, reason: null };
+  else {
+    try {
+      const latencyMs = await ctx.deps.redis.ping();
+      redis = { configured: true, ok: true, latencyMs, target: ctx.deps.redis.target, reason: null };
+    } catch (e) {
+      redis = { configured: true, ok: false, latencyMs: null, target: ctx.deps.redis.target, reason: e instanceof Error ? e.message : "unavailable" };
+    }
+  }
+  const limitsUp = ctx.deps.limits.kind === "redis" ? redis.ok === true : database.ok;
+  const providerProblems = providers ? providers.failing + providers.untested : 0;
+  const status = !database.ok || redis.ok === false ? "down" : providerProblems > 0 || (providers?.stale ?? 0) > 0 ? "degraded" : "ok";
+  sendJson(ctx.res, 200, {
+    status,
+    checkedAt,
+    api: { status: "ok", uptimeSeconds: Math.round(process.uptime()), environment: config.env },
+    database,
+    redis,
+    providers: providers ? { enabled: providers.enabled, untested: providers.untested, failing: providers.failing, staleAfterHours: STALE_TEST_HOURS, stale: providers.stale } : null,
+    activity: { activeRequests: activeLeases, rateLimitStore: limitsUp ? ctx.deps.limits.kind : "unavailable" },
+    configuration: {
+      cookieSecure: config.cookieSecure,
+      trustProxy: config.trustProxy,
+      adminOriginConfigured: config.adminOrigin !== null,
+      publicApiOriginConfigured: config.publicApiOrigin !== null,
+      secretKeyringConfigured: config.keyring.size > 0,
+      databaseTls: config.database.ssl === "require",
+      redisTls: config.redis ? config.redis.tls : null
+    }
+  });
+}
+
+// src/app.ts
+var R = (method, path2, handler) => ({ method, parts: path2.split("/").filter(Boolean), handler });
+var routes = [
+  R("GET", "/healthz", async (ctx) => sendJson(ctx.res, 200, { status: "ok" })),
+  R("GET", "/readyz", readiness),
+  R("POST", "/v1/devices/enroll", enrollDevice),
+  R("GET", "/v1/device", deviceRoute),
+  R("GET", "/v1/catalogue", catalogueRoute),
+  R("GET", "/v1/catalogue/status", catalogueStatusRoute),
+  R("GET", "/v1/models/:id", modelRoute),
+  R("GET", "/v1/usage", deviceUsageRoute),
+  R("POST", "/v1/chat/completions", chatCompletions),
+  R("POST", "/admin/api/auth/login", login),
+  R("GET", "/admin/api/auth/session", sessionInfo),
+  R("POST", "/admin/api/auth/logout", logout),
+  R("POST", "/admin/api/auth/reauth", reauth),
+  R("GET", "/admin/api/overview", overview),
+  R("GET", "/admin/api/health", adminHealth),
+  R("GET", "/admin/api/providers", listProviders),
+  R("POST", "/admin/api/providers", createProvider),
+  R("PATCH", "/admin/api/providers/:id", updateProvider),
+  R("DELETE", "/admin/api/providers/:id", deleteProvider),
+  R("PUT", "/admin/api/providers/:id/api-key", setProviderKey),
+  R("DELETE", "/admin/api/providers/:id/api-key", clearProviderKey),
+  R("POST", "/admin/api/providers/:id/test", testProvider),
+  R("POST", "/admin/api/providers/:id/discover", discoverModels),
+  R("GET", "/admin/api/models", listModels),
+  R("POST", "/admin/api/models", createModel),
+  R("PATCH", "/admin/api/models/:id", updateModel),
+  R("POST", "/admin/api/models/:id/default", setDefaultModel),
+  R("DELETE", "/admin/api/models/:id", deleteModel),
+  R("GET", "/admin/api/devices", listDevices),
+  R("POST", "/admin/api/devices/:id/revoke", revokeDevice),
+  R("GET", "/admin/api/devices/:id/models", getDeviceModels),
+  R("PUT", "/admin/api/devices/:id/models", putDeviceModels),
+  R("GET", "/admin/api/enrollment-codes", listEnrollmentCodes),
+  R("POST", "/admin/api/enrollment-codes", createEnrollmentCode),
+  R("GET", "/admin/api/usage", usage),
+  R("GET", "/admin/api/logs", logs),
+  R("GET", "/admin/api/settings", getSettings),
+  R("PATCH", "/admin/api/settings", patchSettings)
+];
+function match(route, pathname) {
+  const segs = pathname.split("/").filter(Boolean);
+  if (segs.length !== route.parts.length) return null;
+  const params = {};
+  for (let i = 0; i < segs.length; i++) {
+    const p = route.parts[i];
+    if (p.startsWith(":")) {
+      try {
+        params[p.slice(1)] = decodeURIComponent(segs[i]);
+      } catch {
+        return null;
+      }
+    } else if (p !== segs[i]) return null;
+  }
+  return params;
+}
+async function readiness(ctx) {
+  let schemaVersion;
+  try {
+    await ctx.deps.db.query("SELECT 1");
+    const s = await migrationStatus(ctx.deps.db);
+    if (s.pending.length) {
+      sendJson(ctx.res, 503, { status: "not_ready", reason: "database migrations are pending" });
+      return;
+    }
+    schemaVersion = s.currentVersion;
+  } catch {
+    sendJson(ctx.res, 503, { status: "not_ready", reason: "database is unavailable" });
+    return;
+  }
+  if (ctx.deps.redis) {
+    try {
+      await ctx.deps.redis.ping();
+    } catch {
+      sendJson(ctx.res, 503, { status: "not_ready", reason: "redis is unavailable" });
+      return;
+    }
+  }
+  sendJson(ctx.res, 200, { status: "ready", schemaVersion });
+}
+function applySecurityHeaders(req, res, deps) {
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("x-frame-options", "DENY");
+  if (deps.config.cookieSecure) res.setHeader("strict-transport-security", "max-age=31536000");
+  const path2 = (req.url ?? "").split("?")[0];
+  if (path2.startsWith("/admin/api") || path2.startsWith("/v1")) res.setHeader("cache-control", "no-store");
+}
+function applyCors(req, res, deps) {
+  const origin2 = req.headers.origin;
+  if (!origin2) return true;
+  res.setHeader("vary", "Origin");
+  if (!deps.config.adminOrigin || origin2 !== deps.config.adminOrigin) return false;
+  res.setHeader("access-control-allow-origin", origin2);
+  res.setHeader("access-control-allow-credentials", "true");
+  if (req.method === "OPTIONS") {
+    res.setHeader("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE");
+    res.setHeader("access-control-allow-headers", "content-type, x-csrf-token");
+    res.setHeader("access-control-max-age", "600");
+  }
+  return true;
+}
+function createHandler(input) {
+  const deps = { ...input, limits: input.limits ?? new DatabaseLimitStore(input.db), redis: input.redis ?? null };
+  return async (req, res) => {
+    const requestId = crypto5.randomUUID();
+    const started = Date.now();
+    let routeName = "unmatched";
+    res.setHeader("x-request-id", requestId);
+    applySecurityHeaders(req, res, deps);
+    const corsOk = applyCors(req, res, deps);
+    res.on("finish", () => {
+      log("info", "request", { requestId, method: req.method ?? "UNKNOWN", route: routeName, status: res.statusCode, latencyMs: Date.now() - started });
+    });
+    try {
+      const url = new URL(req.url ?? "/", "http://internal");
+      if (req.method === "OPTIONS") {
+        if (!corsOk) sendError(res, new HttpError(403, "forbidden", "origin not allowed"));
+        else {
+          res.writeHead(204);
+          res.end();
+        }
+        return;
+      }
+      let matched = null;
+      let pathExists = false;
+      for (const route of routes) {
+        const params = match(route, url.pathname);
+        if (!params) continue;
+        pathExists = true;
+        if (route.method === req.method) {
+          matched = { route, params };
+          break;
+        }
+      }
+      if (!matched) {
+        if (pathExists) throw new HttpError(405, "method_not_allowed", "method not allowed");
+        throw new HttpError(404, "not_found", "not found");
+      }
+      routeName = `${req.method} /${matched.route.parts.join("/")}`;
+      if (req.url && req.url.length > 4096) throw new HttpError(414, "uri_too_long", "the address is too long");
+      const ip = clientAddress(req, deps.config.trustProxy);
+      await matched.route.handler({ req, res, url, params: matched.params, ip, requestId, deps });
+    } catch (e) {
+      if (res.headersSent) {
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (e instanceof HttpError) {
+        sendError(res, e);
+        return;
+      }
+      if (e instanceof RedisUnavailableError) {
+        log("error", "redis unavailable", { requestId, method: req.method, route: routeName, reason: e.code });
+        sendError(res, new HttpError(503, "service_unavailable", "a required service is temporarily unavailable; try again shortly", { "retry-after": "5" }));
+        return;
+      }
+      log("error", "request failed", { requestId, method: req.method, route: routeName, error: e instanceof Error ? e.name : "unknown" });
+      sendError(res, new HttpError(500, "internal_error", "something went wrong; try again"));
+    }
+  };
+}
+function createServer(deps) {
+  const server = http.createServer(createHandler(deps));
+  server.requestTimeout = 3e5;
+  server.headersTimeout = 3e4;
+  server.keepAliveTimeout = 65e3;
+  return server;
+}
+
+// src/config.ts
+import fs3 from "node:fs";
+function bool2(v, fallback) {
+  if (v === void 0 || v === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(v.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(v.toLowerCase())) return false;
+  throw new Error(`expected true or false, got "${v}"`);
+}
+function int2(v, fallback, min, max, name) {
+  if (v === void 0 || v === "") return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  return n;
+}
+function origin(v, name) {
+  if (!v) return null;
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new Error(`${name} must be a URL such as https://admin.YOUR_DOMAIN`);
+  }
+  if (u.pathname !== "/" || u.search || u.hash) throw new Error(`${name} must be an origin without a path`);
+  return u.origin;
+}
+function parseDatabase(env, production) {
+  const sslDefault = production ? "require" : "disable";
+  let cfg;
+  if (env.DATABASE_URL) {
+    const u = new URL(env.DATABASE_URL);
+    if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new Error("DATABASE_URL must start with postgres://");
+    cfg = {
+      host: decodeURIComponent(u.hostname),
+      port: u.port ? Number(u.port) : 5432,
+      user: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password),
+      database: decodeURIComponent(u.pathname.replace(/^\//, "")),
+      ssl: sslDefault
+    };
+    const mode = u.searchParams.get("sslmode");
+    if (mode) {
+      if (mode === "disable") cfg.ssl = "disable";
+      else if (["require", "verify-ca", "verify-full"].includes(mode)) cfg.ssl = "require";
+      else throw new Error(`sslmode=${mode} is not supported; use disable or require`);
+    }
+  } else {
+    cfg = {
+      host: env.DATABASE_HOST ?? "",
+      port: Number(env.DATABASE_PORT ?? 5432),
+      user: env.DATABASE_USER ?? "",
+      password: env.DATABASE_PASSWORD ?? "",
+      database: env.DATABASE_NAME ?? "",
+      ssl: sslDefault
+    };
+  }
+  if (env.DATABASE_SSL) {
+    if (env.DATABASE_SSL !== "disable" && env.DATABASE_SSL !== "require") throw new Error("DATABASE_SSL must be disable or require");
+    cfg.ssl = env.DATABASE_SSL;
+  }
+  if (!cfg.host || !cfg.user || !cfg.database) throw new Error("set DATABASE_URL, or DATABASE_HOST, DATABASE_USER, DATABASE_NAME and DATABASE_PASSWORD");
+  if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) throw new Error("database port is invalid");
+  if (env.DATABASE_CA_FILE) {
+    if (!fs3.existsSync(env.DATABASE_CA_FILE)) throw new Error("DATABASE_CA_FILE does not exist");
+    cfg.caFile = env.DATABASE_CA_FILE;
+  }
+  if (production && cfg.ssl === "disable" && !env.DATABASE_ALLOW_PLAINTEXT_NETWORK) {
+    throw new Error("production requires DATABASE_SSL=require, or DATABASE_ALLOW_PLAINTEXT_NETWORK=true when the database is on a private network only");
+  }
+  return cfg;
+}
+function redisPrefix(v) {
+  if (v === void 0 || v === "") return "devora";
+  if (!/^[A-Za-z0-9_.-]{1,40}$/.test(v)) throw new Error("REDIS_KEY_PREFIX may contain only letters, digits, _ . - (up to 40)");
+  return v;
+}
+function loadConfig(env = process.env) {
+  const production = (env.DEVORA_ENV ?? "development") === "production";
+  if (env.DEVORA_ENV && !["development", "production"].includes(env.DEVORA_ENV)) throw new Error("DEVORA_ENV must be development or production");
+  const cookieSecure = bool2(env.COOKIE_SECURE, production);
+  if (production && !cookieSecure) throw new Error("COOKIE_SECURE must be true in production");
+  const keyring = parseKeyring(env.DEVORA_SECRET_KEYS ?? "", env.DEVORA_SECRET_ACTIVE_KEY ?? "");
+  if (production && keyring.size === 0) throw new Error("DEVORA_SECRET_KEYS is required in production");
+  return {
+    env: production ? "production" : "development",
+    host: env.HOST || "0.0.0.0",
+    port: int2(env.PORT, 8080, 1, 65535, "PORT"),
+    database: parseDatabase(env, production),
+    poolSize: int2(env.DATABASE_POOL_SIZE, 10, 1, 50, "DATABASE_POOL_SIZE"),
+    adminOrigin: origin(env.ADMIN_ORIGIN, "ADMIN_ORIGIN"),
+    cookieSecure,
+    trustProxy: bool2(env.TRUST_PROXY, false),
+    keyring,
+    logRetentionDays: int2(env.DEVORA_LOG_RETENTION_DAYS, 30, 1, 3650, "DEVORA_LOG_RETENTION_DAYS"),
+    publicApiOrigin: origin(env.PUBLIC_API_ORIGIN, "PUBLIC_API_ORIGIN"),
+    redis: env.REDIS_URL ? parseRedisUrl(env.REDIS_URL, env) : null,
+    redisKeyPrefix: redisPrefix(env.REDIS_KEY_PREFIX),
+    discoveryIntervalHours: int2(env.DEVORA_DISCOVERY_INTERVAL_HOURS, 12, 0, 168, "DEVORA_DISCOVERY_INTERVAL_HOURS")
+  };
+}
+
+// src/db/pg-wire.ts
+import crypto6 from "node:crypto";
+import net2 from "node:net";
+import tls2 from "node:tls";
+import fs4 from "node:fs";
+var PgError = class extends Error {
+  code;
+  detail;
+  constructor(message, code = "", detail) {
+    super(message);
+    this.name = "PgError";
+    this.code = code;
+    this.detail = detail;
+  }
+};
+var OID = { bool: 16, bytea: 17, int8: 20, int2: 21, int4: 23, json: 114, float4: 700, float8: 701, numeric: 1700, timestamp: 1114, timestamptz: 1184, jsonb: 3802 };
+function decodeValue(oid, text) {
+  if (text === null) return null;
+  switch (oid) {
+    case OID.bool:
+      return text === "t";
+    case OID.int2:
+    case OID.int4:
+    case OID.int8:
+    case OID.float4:
+    case OID.float8:
+    case OID.numeric:
+      return Number(text);
+    case OID.json:
+    case OID.jsonb:
+      return JSON.parse(text);
+    case OID.bytea:
+      return text.startsWith("\\x") ? Buffer.from(text.slice(2), "hex") : Buffer.from(text);
+    case OID.timestamp:
+    case OID.timestamptz:
+      return parseTimestamp(text);
+    default:
+      return text;
+  }
+}
+function parseTimestamp(text) {
+  let t = text.replace(" ", "T");
+  t = t.replace(/(\.\d{3})\d+/, "$1");
+  if (/[+-]\d{2}$/.test(t)) t += ":00";
+  else if (!/(Z|[+-]\d{2}:\d{2})$/.test(t)) t += "Z";
+  return new Date(t);
+}
+function encodeParam(v) {
+  if (v === null || v === void 0) return null;
+  if (typeof v === "boolean") return Buffer.from(v ? "true" : "false", "utf8");
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) throw new PgError("non-finite number parameter");
+    return Buffer.from(String(v), "utf8");
+  }
+  if (Buffer.isBuffer(v)) return Buffer.from(`\\x${v.toString("hex")}`, "utf8");
+  if (v instanceof Date) return Buffer.from(v.toISOString(), "utf8");
+  if (typeof v === "object") return Buffer.from(JSON.stringify(v), "utf8");
+  return Buffer.from(String(v), "utf8");
+}
+function cstr(s) {
+  return Buffer.concat([Buffer.from(s, "utf8"), Buffer.of(0)]);
+}
+function int16(n) {
+  const b = Buffer.alloc(2);
+  b.writeInt16BE(n, 0);
+  return b;
+}
+function int32(n) {
+  const b = Buffer.alloc(4);
+  b.writeInt32BE(n, 0);
+  return b;
+}
+function frame(type, body) {
+  return Buffer.concat([Buffer.from(type, "ascii"), int32(body.length + 4), body]);
+}
+function parseError(body) {
+  const fields = {};
+  let i = 0;
+  while (i < body.length && body[i] !== 0) {
+    const code = String.fromCharCode(body[i]);
+    const end = body.indexOf(0, i + 1);
+    fields[code] = body.toString("utf8", i + 1, end);
+    i = end + 1;
+  }
+  return new PgError(fields.M ?? "database error", fields.C ?? "", fields.D);
+}
+function hmac(key, data) {
+  return crypto6.createHmac("sha256", key).update(data).digest();
+}
+var PgConnection = class _PgConnection {
+  socket;
+  buf = Buffer.alloc(0);
+  inbox = [];
+  waiters = [];
+  failure = null;
+  busy = false;
+  /** True once the socket failed; the pool then discards the connection. */
+  broken = false;
+  static async connect(cfg) {
+    const conn = new _PgConnection();
+    await conn.open(cfg);
+    return conn;
+  }
+  async open(cfg) {
+    const raw = await new Promise((resolve, reject) => {
+      const s = net2.connect({ host: cfg.host, port: cfg.port });
+      const timer = setTimeout(() => {
+        s.destroy();
+        reject(new PgError(`connection to database timed out after ${cfg.connectTimeoutMs ?? 1e4} ms`));
+      }, cfg.connectTimeoutMs ?? 1e4);
+      s.once("connect", () => {
+        clearTimeout(timer);
+        resolve(s);
+      });
+      s.once("error", (e) => {
+        clearTimeout(timer);
+        reject(new PgError(`cannot reach the database: ${e.message}`));
+      });
+    });
+    let sock = raw;
+    if (cfg.ssl === "require") {
+      raw.write(Buffer.concat([int32(8), int32(80877103)]));
+      const answer = await new Promise((resolve, reject) => {
+        raw.once("data", (d) => resolve(d.toString("ascii", 0, 1)));
+        raw.once("error", reject);
+      });
+      if (answer !== "S") throw new PgError("the database does not offer TLS, but DATABASE_SSL=require");
+      sock = await new Promise((resolve, reject) => {
+        const t = tls2.connect({
+          socket: raw,
+          servername: cfg.host,
+          rejectUnauthorized: true,
+          ca: cfg.caFile ? fs4.readFileSync(cfg.caFile) : void 0
+        });
+        t.once("secureConnect", () => resolve(t));
+        t.once("error", (e) => reject(new PgError(`TLS to the database failed: ${e.message}`)));
+      });
+    }
+    this.socket = sock;
+    this.attach();
+    const params = {
+      user: cfg.user,
+      database: cfg.database,
+      application_name: "devora-server",
+      timezone: "UTC",
+      statement_timeout: String(cfg.statementTimeoutMs ?? 3e4),
+      client_encoding: "UTF8"
+    };
+    const kv = Buffer.concat(Object.entries(params).flatMap(([k, v]) => [cstr(k), cstr(v)]));
+    const body = Buffer.concat([int32(196608), kv, Buffer.of(0)]);
+    this.socket.write(Buffer.concat([int32(body.length + 4), body]));
+    for (; ; ) {
+      const m = await this.next();
+      if (m.type === "R") {
+        const code = m.body.readInt32BE(0);
+        if (code === 0) continue;
+        if (code === 10) {
+          const mechs = m.body.toString("utf8", 4).split("\0").filter(Boolean);
+          if (!mechs.includes("SCRAM-SHA-256")) throw new PgError("the database requires an authentication method this server does not support");
+          await this.scram(cfg.password);
+          continue;
+        }
+        throw new PgError(`unsupported authentication method (${code}); the server requires SCRAM-SHA-256`);
+      }
+      if (m.type === "E") throw parseError(m.body);
+      if (m.type === "Z") break;
+    }
+  }
+  attach() {
+    this.socket.on("data", (d) => {
+      this.buf = this.buf.length ? Buffer.concat([this.buf, d]) : d;
+      while (this.buf.length >= 5) {
+        const len = this.buf.readInt32BE(1);
+        if (this.buf.length < len + 1) break;
+        const msg = { type: String.fromCharCode(this.buf[0]), body: this.buf.subarray(5, len + 1) };
+        this.buf = this.buf.subarray(len + 1);
+        const w = this.waiters.shift();
+        if (w) w.resolve(msg);
+        else this.inbox.push(msg);
+      }
+    });
+    const fail2 = (e) => {
+      this.broken = true;
+      this.failure = this.failure ?? e;
+      for (const w of this.waiters.splice(0)) w.reject(this.failure);
+    };
+    this.socket.on("error", (e) => fail2(new PgError(`database connection failed: ${e.message}`)));
+    this.socket.on("close", () => fail2(new PgError("database connection closed")));
+  }
+  next() {
+    const m = this.inbox.shift();
+    if (m) return Promise.resolve(m);
+    if (this.failure) return Promise.reject(this.failure);
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+  }
+  async scram(password) {
+    const nonce = crypto6.randomBytes(18).toString("base64");
+    const clientFirstBare = `n=,r=${nonce}`;
+    const initial = Buffer.from(`n,,${clientFirstBare}`, "utf8");
+    this.socket.write(frame("p", Buffer.concat([cstr("SCRAM-SHA-256"), int32(initial.length), initial])));
+    const first = await this.next();
+    if (first.type === "E") throw parseError(first.body);
+    if (first.type !== "R" || first.body.readInt32BE(0) !== 11) throw new PgError("unexpected reply during authentication");
+    const serverFirst = first.body.toString("utf8", 4);
+    const attrs = Object.fromEntries(serverFirst.split(",").map((p) => [p[0], p.slice(2)]));
+    if (!attrs.r?.startsWith(nonce) || !attrs.s || !attrs.i) throw new PgError("invalid SCRAM challenge from the database");
+    const iterations = Number(attrs.i);
+    if (!Number.isInteger(iterations) || iterations < 4096 || iterations > 1e6) throw new PgError("unacceptable SCRAM iteration count");
+    const salted = await new Promise(
+      (resolve, reject) => crypto6.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
+    );
+    const clientKey = hmac(salted, "Client Key");
+    const storedKey = crypto6.createHash("sha256").update(clientKey).digest();
+    const clientFinalNoProof = `c=biws,r=${attrs.r}`;
+    const authMessage = `${clientFirstBare},${serverFirst},${clientFinalNoProof}`;
+    const signature = hmac(storedKey, authMessage);
+    const proof = Buffer.alloc(clientKey.length);
+    for (let i = 0; i < proof.length; i++) proof[i] = clientKey[i] ^ signature[i];
+    const clientFinal = Buffer.from(`${clientFinalNoProof},p=${proof.toString("base64")}`, "utf8");
+    this.socket.write(frame("p", clientFinal));
+    const last = await this.next();
+    if (last.type === "E") throw parseError(last.body);
+    if (last.type !== "R" || last.body.readInt32BE(0) !== 12) throw new PgError("password authentication failed");
+    const serverKey = hmac(salted, "Server Key");
+    const expected = hmac(serverKey, authMessage).toString("base64");
+    const got = last.body.toString("utf8", 4).replace(/^v=/, "");
+    if (got !== expected) throw new PgError("the database failed to prove its identity (SCRAM)");
+  }
+  async begin() {
+    if (this.busy) throw new PgError("connection is already running a query");
+    this.busy = true;
+  }
+  /** Runs one parameterized statement with the extended protocol. Parameters are text values; SQL never contains them. */
+  async query(sql, params = []) {
+    await this.begin();
+    try {
+      const values = params.map(encodeParam);
+      const bind = [
+        cstr(""),
+        cstr(""),
+        int16(0),
+        int16(values.length),
+        ...values.flatMap((v) => v === null ? [int32(-1)] : [int32(v.length), v]),
+        int16(0)
+      ];
+      this.socket.write(
+        Buffer.concat([
+          frame("P", Buffer.concat([cstr(""), cstr(sql), int16(0)])),
+          frame("B", Buffer.concat(bind)),
+          frame("D", Buffer.concat([Buffer.from("P", "ascii"), cstr("")])),
+          frame("E", Buffer.concat([cstr(""), int32(0)])),
+          frame("S", Buffer.alloc(0))
+        ])
+      );
+      return await this.readResult();
+    } finally {
+      this.busy = false;
+    }
+  }
+  /** Runs one or more statements with the simple protocol (no parameters). Used for migrations and transaction control. */
+  async exec(sql) {
+    await this.begin();
+    try {
+      this.socket.write(frame("Q", cstr(sql)));
+      await this.readResult();
+    } finally {
+      this.busy = false;
+    }
+  }
+  async readResult() {
+    let cols = [];
+    const rows = [];
+    let rowCount = 0;
+    let error = null;
+    for (; ; ) {
+      const m = await this.next();
+      switch (m.type) {
+        case "T": {
+          const n = m.body.readInt16BE(0);
+          cols = [];
+          let p = 2;
+          for (let i = 0; i < n; i++) {
+            const end = m.body.indexOf(0, p);
+            const name = m.body.toString("utf8", p, end);
+            p = end + 1;
+            const oid = m.body.readInt32BE(p + 6);
+            p += 18;
+            cols.push({ name, oid });
+          }
+          break;
+        }
+        case "D": {
+          const n = m.body.readInt16BE(0);
+          const row = {};
+          let p = 2;
+          for (let i = 0; i < n; i++) {
+            const len = m.body.readInt32BE(p);
+            p += 4;
+            const text = len === -1 ? null : m.body.toString("utf8", p, p + len);
+            if (len !== -1) p += len;
+            const col = cols[i];
+            row[col.name] = decodeValue(col.oid, text);
+          }
+          rows.push(row);
+          break;
+        }
+        case "C": {
+          const tag = m.body.toString("utf8", 0, m.body.indexOf(0));
+          const n = Number(tag.split(" ").pop());
+          if (Number.isFinite(n)) rowCount = n;
+          break;
+        }
+        case "E":
+          error = parseError(m.body);
+          break;
+        case "Z":
+          if (error) throw error;
+          return { rows, rowCount: rowCount || rows.length };
+        default:
+          break;
+      }
+    }
+  }
+  close() {
+    try {
+      this.socket.end(frame("X", Buffer.alloc(0)));
+    } catch {
+    }
+    this.socket.destroy();
+  }
+};
+var Db = class {
+  constructor(cfg, max = 10) {
+    this.cfg = cfg;
+    this.max = max;
+  }
+  cfg;
+  max;
+  idle = [];
+  total = 0;
+  waiters = [];
+  closed = false;
+  async acquire() {
+    if (this.closed) throw new PgError("database pool is closed");
+    const c = this.idle.pop();
+    if (c) return c;
+    if (this.total < this.max) {
+      this.total++;
+      try {
+        return await PgConnection.connect(this.cfg);
+      } catch (e) {
+        this.total--;
+        throw e;
+      }
+    }
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+  release(c) {
+    if (c.broken) {
+      this.total--;
+      c.close();
+      const w2 = this.waiters.shift();
+      if (w2) void this.acquire().then(w2);
+      return;
+    }
+    const w = this.waiters.shift();
+    if (w) w(c);
+    else this.idle.push(c);
+  }
+  async query(sql, params = []) {
+    const c = await this.acquire();
+    try {
+      return await c.query(sql, params);
+    } finally {
+      this.release(c);
+    }
+  }
+  async transaction(fn) {
+    const c = await this.acquire();
+    try {
+      await c.exec("BEGIN");
+      try {
+        const out = await fn(c);
+        await c.exec("COMMIT");
+        return out;
+      } catch (e) {
+        if (!c.broken) await c.exec("ROLLBACK").catch(() => void 0);
+        throw e;
+      }
+    } finally {
+      this.release(c);
+    }
+  }
+  /** Runs a callback with a dedicated connection and no transaction (used by the migration runner for advisory locks). */
+  async withConnection(fn) {
+    const c = await this.acquire();
+    try {
+      return await fn(c);
+    } finally {
+      this.release(c);
+    }
+  }
+  async close() {
+    this.closed = true;
+    for (const c of this.idle.splice(0)) {
+      c.close();
+      this.total--;
+    }
+  }
+};
+
+// src/cli.ts
+var HOUR = 36e5;
+function usage2() {
+  process.stderr.write(
+    [
+      "usage:",
+      "  serve                         start the API (refuses to start if migrations are pending)",
+      "  migrate status                list applied and pending migrations",
+      "  migrate up                    apply pending migrations",
+      "  migrate down [--steps N]      revert the latest N migrations (default 1)",
+      "  create-owner                  create the single owner (email and password from the environment)",
+      "  create-database               create the configured database if it does not exist yet",
+      "  redis-check                   test REDIS_URL: connection, password, round trip",
+      "  healthcheck                   query the local /readyz (used by the container health check)",
+      ""
+    ].join("\n")
+  );
+  process.exit(2);
+}
+async function serve() {
+  const config = loadConfig();
+  const db = new Db(config.database, config.poolSize);
+  const status = await migrationStatus(db);
+  if (status.pending.length) {
+    log("error", 'database migrations are pending; run "migrate up" before starting the server', { pending: status.pending.map((p) => p.name) });
+    await db.close();
+    process.exit(1);
+  }
+  const owners = await db.query("SELECT count(*)::int AS n FROM owners");
+  if (owners.rows[0].n === 0) log("warn", "no owner exists yet; run create-owner before using the admin website");
+  let redis = null;
+  let limits = new DatabaseLimitStore(db);
+  if (config.redis) {
+    redis = new Redis(config.redis, (level, msg, fields) => log(level, msg, fields));
+    try {
+      await redis.ping();
+    } catch (e) {
+      log("error", "redis is configured but unavailable; fix REDIS_URL or the Redis service", { target: redis.target, reason: e instanceof Error ? e.message : "unknown" });
+      await redis.close();
+      await db.close();
+      process.exit(1);
+    }
+    limits = new RedisLimitStore(redis, config.redisKeyPrefix);
+  }
+  log("info", "runtime state store", { store: limits.kind, redis: redis?.target ?? null });
+  const server = createServer({ db, config, limits, redis, fetch: globalThis.fetch });
+  await new Promise((resolve) => server.listen(config.port, config.host, resolve));
+  log("info", "devora backend listening", { port: config.port, env: config.env, schemaVersion: status.currentVersion });
+  const prune = async () => {
+    try {
+      const n = await limits.withLock("prune-logs", 10 * 6e4, () => pruneLogs(db, config.logRetentionDays));
+      if (n) log("info", "pruned old request logs", { deleted: n, retentionDays: config.logRetentionDays });
+    } catch (e) {
+      log("error", "log pruning failed", { error: e instanceof Error ? e.name : "unknown" });
+    }
+  };
+  void prune();
+  const timer = setInterval(prune, 6 * HOUR);
+  timer.unref();
+  const pruneCounters = async () => {
+    try {
+      await limits.withLock("prune-rates", 10 * 6e4, () => pruneRates(db));
+    } catch (e) {
+      log("error", "rate counter pruning failed", { error: e instanceof Error ? e.name : "unknown" });
+    }
+  };
+  const countersTimer = setInterval(pruneCounters, HOUR);
+  countersTimer.unref();
+  const deps = { db, config, limits, redis, fetch: globalThis.fetch };
+  const discover = () => scheduledDiscovery(deps).catch((e) => log("error", "scheduled discovery failed", { error: e instanceof Error ? e.name : "unknown" }));
+  let discoveryTimer = null;
+  let firstDiscovery = null;
+  if (config.discoveryIntervalHours > 0) {
+    firstDiscovery = setTimeout(discover, 6e4);
+    firstDiscovery.unref();
+    discoveryTimer = setInterval(discover, config.discoveryIntervalHours * HOUR);
+    discoveryTimer.unref();
+  }
+  const stop = async (signal) => {
+    log("info", "shutting down", { signal });
+    clearInterval(timer);
+    clearInterval(countersTimer);
+    if (discoveryTimer) clearInterval(discoveryTimer);
+    if (firstDiscovery) clearTimeout(firstDiscovery);
+    const closed = new Promise((r) => server.close(() => r()));
+    const deadline = new Promise((r) => setTimeout(r, 2e4).unref());
+    await Promise.race([closed, deadline]);
+    server.closeAllConnections?.();
+    await redis?.close();
+    await db.close();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void stop("SIGTERM"));
+  process.on("SIGINT", () => void stop("SIGINT"));
+}
+async function migrate(args) {
+  const config = loadConfig();
+  const db = new Db(config.database, 2);
+  try {
+    const [sub, ...rest] = args;
+    if (sub === "status") {
+      const s = await migrationStatus(db);
+      process.stdout.write(JSON.stringify(s, null, 2) + "\n");
+    } else if (sub === "up") {
+      const done = await migrateUp(db, loadMigrations());
+      process.stdout.write(done.length ? `applied: ${done.join(", ")}
+` : "database is up to date\n");
+    } else if (sub === "down") {
+      const i = rest.indexOf("--steps");
+      const steps = i >= 0 ? Number(rest[i + 1]) : 1;
+      const done = await migrateDown(db, steps, loadMigrations());
+      process.stdout.write(done.length ? `reverted: ${done.join(", ")}
+` : "nothing to revert\n");
+    } else {
+      usage2();
+    }
+  } finally {
+    await db.close();
+  }
+}
+async function createOwner() {
+  const config = loadConfig();
+  const email = (process.env.DEVORA_OWNER_EMAIL ?? "").trim().toLowerCase();
+  const password = process.env.DEVORA_OWNER_PASSWORD ?? "";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new Error("set DEVORA_OWNER_EMAIL to a valid email address");
+  if (password.length < 12 || password.length > 256) throw new Error("set DEVORA_OWNER_PASSWORD (12 to 256 characters)");
+  const db = new Db(config.database, 2);
+  try {
+    const { rows } = await db.query("SELECT count(*)::int AS n FROM owners");
+    if (rows[0].n > 0) throw new Error("an owner already exists; this server supports one owner");
+    await db.query("INSERT INTO owners (email, password_hash) VALUES ($1, $2)", [email, await hashPassword(password)]);
+    process.stdout.write(`owner created: ${email}
+`);
+  } finally {
+    await db.close();
+  }
+}
+async function createDatabase() {
+  const config = loadConfig();
+  const name = config.database.database;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(name)) throw new Error("DATABASE_NAME may contain only letters, digits and underscores");
+  const db = new Db({ ...config.database, database: "postgres" }, 1);
+  try {
+    const { rows } = await db.query("SELECT 1 FROM pg_database WHERE datname = $1", [name]);
+    if (rows.length) {
+      process.stdout.write(`database "${name}" already exists
+`);
+      return;
+    }
+    await db.query(`CREATE DATABASE "${name}"`);
+    process.stdout.write(`database "${name}" created
+`);
+  } finally {
+    await db.close();
+  }
+}
+async function redisCheck() {
+  const config = loadConfig();
+  if (!config.redis) throw new Error("REDIS_URL is not set");
+  const redis = new Redis(config.redis);
+  try {
+    const ms = await redis.ping();
+    const info = String(await redis.command("INFO", "server"));
+    const version = /redis_version:([^\r\n]+)/.exec(info)?.[1] ?? "unknown";
+    process.stdout.write(
+      `redis ok: ${redis.target}, version ${version}, round trip ${ms} ms, ${config.redis.password ? "password accepted" : "no password configured and none required"}, ${config.redis.tls ? "TLS" : "no TLS"}
+`
+    );
+  } finally {
+    await redis.close();
+  }
+}
+function healthcheck() {
+  const port = Number(process.env.PORT ?? 8080);
+  return new Promise((resolve, reject) => {
+    const req = http2.get({ host: "127.0.0.1", port, path: "/readyz", timeout: 4e3 }, (res) => {
+      res.resume();
+      if (res.statusCode === 200) resolve();
+      else reject(new Error(`readyz returned ${res.statusCode}`));
+    });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", reject);
+  });
+}
+async function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  switch (cmd) {
+    case "serve":
+      return serve();
+    case "migrate":
+      return migrate(args);
+    case "create-owner":
+      return createOwner();
+    case "create-database":
+      return createDatabase();
+    case "redis-check":
+      return redisCheck();
+    case "healthcheck":
+      return healthcheck();
+    default:
+      return usage2();
+  }
+}
+main().catch((e) => {
+  process.stderr.write(`error: ${e instanceof Error ? e.message : String(e)}
+`);
+  process.exit(1);
+});
+//# sourceMappingURL=cli.mjs.map

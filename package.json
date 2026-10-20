@@ -1,0 +1,27 @@
+{
+  "name": "devora-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Devora central platform backend. No third-party runtime dependencies.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "db:create": "node --env-file-if-exists=.env dist/cli.mjs create-database",
+    "migrate": "node --env-file-if-exists=.env dist/cli.mjs migrate up",
+    "migrate:status": "node --env-file-if-exists=.env dist/cli.mjs migrate status",
+    "create-owner": "node --env-file-if-exists=.env dist/cli.mjs create-owner",
+    "redis:check": "node --env-file-if-exists=.env dist/cli.mjs redis-check",
+    "setup": "npm run build && npm run db:create && npm run migrate",
+    "start": "node --env-file-if-exists=.env dist/cli.mjs serve",
+    "dev": "npm run build && node --env-file-if-exists=.env dist/cli.mjs serve"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "typescript": "~5.9.2"
+  }
+}

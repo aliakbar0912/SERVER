@@ -1,0 +1,639 @@
+TAP version 13
+# {"time":"2026-10-19T21:49:40.070Z","level":"info","msg":"request","requestId":"fb899619-b62d-4f30-bf59-cd10e1e7ef44","method":"GET","route":"GET /healthz","status":200,"latencyMs":4}
+# {"time":"2026-10-19T21:49:41.809Z","level":"info","msg":"request","requestId":"11a99115-8d7b-4f97-866e-f4daae52cd5a","method":"GET","route":"GET /readyz","status":200,"latencyMs":1729}
+# Subtest: health and schema
+    # Subtest: liveness and readiness report the schema version
+    ok 1 - liveness and readiness report the schema version
+      ---
+      duration_ms: 1756.7211
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:41.816Z","level":"info","msg":"request","requestId":"d658b0b2-8e3e-4141-b107-92de515c8026","method":"GET","route":"unmatched","status":404,"latencyMs":1}
+# {"time":"2026-10-19T21:49:41.820Z","level":"info","msg":"request","requestId":"3c8480f3-4b7a-4fa1-81d4-d313760c6f76","method":"GET","route":"unmatched","status":405,"latencyMs":0}
+    # Subtest: unknown routes and wrong methods get JSON errors
+    ok 2 - unknown routes and wrong methods get JSON errors
+      ---
+      duration_ms: 9.415
+      type: 'test'
+      ...
+    1..2
+ok 1 - health and schema
+  ---
+  duration_ms: 9543.3826
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:49:42.933Z","level":"info","msg":"request","requestId":"cfeeae5d-ee21-462a-b1ed-804df7830441","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1102}
+# {"time":"2026-10-19T21:49:43.758Z","level":"info","msg":"request","requestId":"d4191e9b-e7f5-4780-bcfc-82eac6853d1c","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":822}
+# Subtest: owner authentication
+    # Subtest: wrong password and unknown email give the same answer
+    ok 1 - wrong password and unknown email give the same answer
+      ---
+      duration_ms: 1936.8219
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:45.227Z","level":"info","msg":"request","requestId":"c74c25aa-7bc7-455a-ae00-4778825e528c","method":"POST","route":"POST /admin/api/auth/login","status":200,"latencyMs":1467}
+    # Subtest: a correct login sets an HttpOnly, SameSite=Strict session cookie and returns a CSRF token
+    ok 2 - a correct login sets an HttpOnly, SameSite=Strict session cookie and returns a CSRF token
+      ---
+      duration_ms: 1469.9902
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:45.922Z","level":"info","msg":"request","requestId":"24eaf332-e621-4afb-a779-0059a242371a","method":"GET","route":"GET /admin/api/auth/session","status":200,"latencyMs":692}
+    # Subtest: the session endpoint returns the CSRF token again after a reload
+    ok 3 - the session endpoint returns the CSRF token again after a reload
+      ---
+      duration_ms: 694.3642
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:45.926Z","level":"info","msg":"request","requestId":"1d6fa727-d571-4bb1-ab36-31798c3fc5ab","method":"GET","route":"GET /admin/api/providers","status":401,"latencyMs":1}
+# {"time":"2026-10-19T21:49:45.929Z","level":"info","msg":"request","requestId":"21bce00e-7ac1-4f22-830c-b335893cdddb","method":"GET","route":"GET /admin/api/providers","status":401,"latencyMs":1}
+    # Subtest: admin reads without a session are refused
+    ok 4 - admin reads without a session are refused
+      ---
+      duration_ms: 6.2724
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:46.622Z","level":"info","msg":"request","requestId":"8bb709bd-aafa-44c7-a56e-8078db25ea0c","method":"POST","route":"POST /admin/api/providers","status":403,"latencyMs":691}
+    # Subtest: state-changing requests need the CSRF header
+    ok 5 - state-changing requests need the CSRF header
+      ---
+      duration_ms: 693.9681
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:46.625Z","level":"info","msg":"request","requestId":"e613fc68-1d66-400b-94c2-3482ac34f7f0","method":"OPTIONS","route":"unmatched","status":204,"latencyMs":0}
+# {"time":"2026-10-19T21:49:48.010Z","level":"info","msg":"request","requestId":"4c5ac767-d44a-4559-bc0c-8670f688d41d","method":"GET","route":"GET /admin/api/overview","status":200,"latencyMs":1383}
+    # Subtest: CORS allows only the admin origin, with credentials
+    ok 6 - CORS allows only the admin origin, with credentials
+      ---
+      duration_ms: 1387.0478
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:48.013Z","level":"info","msg":"request","requestId":"c57d53f2-f1e9-4960-bc52-e03a31c44286","method":"GET","route":"GET /healthz","status":200,"latencyMs":0}
+    # Subtest: security headers are set on API responses
+    ok 7 - security headers are set on API responses
+      ---
+      duration_ms: 2.8171
+      type: 'test'
+      ...
+    1..7
+ok 2 - owner authentication
+  ---
+  duration_ms: 6192.4919
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:49:48.711Z","level":"info","msg":"request","requestId":"79ae6f0c-7ef1-472a-905d-3fd0506a3de5","method":"POST","route":"POST /admin/api/providers","status":400,"latencyMs":691}
+# Subtest: providers and models
+    # Subtest: a provider with plain HTTP to a remote host is refused
+    ok 1 - a provider with plain HTTP to a remote host is refused
+      ---
+      duration_ms: 697.6113
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:49.405Z","level":"info","msg":"request","requestId":"663939b2-98b1-440e-9e39-7768c872d8ec","method":"POST","route":"POST /admin/api/providers","status":400,"latencyMs":692}
+# {"time":"2026-10-19T21:49:50.100Z","level":"info","msg":"request","requestId":"bca9aa0f-6103-438b-a582-4807266282ef","method":"POST","route":"POST /admin/api/providers","status":400,"latencyMs":693}
+    # Subtest: cloud metadata addresses and credentials in URLs are refused
+    ok 2 - cloud metadata addresses and credentials in URLs are refused
+      ---
+      duration_ms: 1389.9319
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:52.522Z","level":"info","msg":"request","requestId":"33695d74-ee18-4609-9e50-f4cc9933c876","method":"POST","route":"POST /admin/api/providers","status":201,"latencyMs":2419}
+    # Subtest: the owner creates a loopback provider (the mock upstream)
+    ok 3 - the owner creates a loopback provider (the mock upstream)
+      ---
+      duration_ms: 2420.8976
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:53.225Z","level":"info","msg":"request","requestId":"2dd42d37-c50b-4f36-8ecc-6741c31a0f74","method":"PUT","route":"PUT /admin/api/providers/:id/api-key","status":403,"latencyMs":699}
+    # Subtest: setting an API key needs a recent password confirmation
+    ok 4 - setting an API key needs a recent password confirmation
+      ---
+      duration_ms: 702.8506
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:54.343Z","level":"info","msg":"request","requestId":"a64cfcfb-935a-4afa-b0e2-00314555f8bf","method":"POST","route":"POST /admin/api/auth/reauth","status":401,"latencyMs":1115}
+# {"time":"2026-10-19T21:49:55.797Z","level":"info","msg":"request","requestId":"b913bde9-7ed5-47c1-b57c-af039f254dd8","method":"POST","route":"POST /admin/api/auth/reauth","status":200,"latencyMs":1453}
+    # Subtest: reauthentication grants a short window
+    ok 5 - reauthentication grants a short window
+      ---
+      duration_ms: 2572.0525
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:49:57.536Z","level":"info","msg":"request","requestId":"e22cc3c2-5b84-4eec-8efc-506282c45ed9","method":"PUT","route":"PUT /admin/api/providers/:id/api-key","status":200,"latencyMs":1736}
+# {"time":"2026-10-19T21:49:58.575Z","level":"info","msg":"request","requestId":"868a77cb-23f6-4015-b3d8-749dc75ba334","method":"GET","route":"GET /admin/api/providers","status":200,"latencyMs":1037}
+    # Subtest: the API key is stored, reported as present, and never returned
+    ok 6 - the API key is stored, reported as present, and never returned
+      ---
+      duration_ms: 3123.3541
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:00.656Z","level":"info","msg":"request","requestId":"752b43a4-ddf9-4f09-b980-6ead06e28fdd","method":"POST","route":"POST /admin/api/providers/:id/test","status":200,"latencyMs":1733}
+    # Subtest: a test call uses the stored key and records the result
+    ok 7 - a test call uses the stored key and records the result
+      ---
+      duration_ms: 1735.6248
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:03.095Z","level":"info","msg":"request","requestId":"035e1b69-8cac-4a18-8b80-8224717aa1a8","method":"POST","route":"POST /admin/api/providers/:id/discover","status":200,"latencyMs":2437}
+# {"time":"2026-10-19T21:50:05.524Z","level":"info","msg":"request","requestId":"f3532347-1062-4d7e-bfb8-8f53cd467fb3","method":"POST","route":"POST /admin/api/providers/:id/discover","status":200,"latencyMs":2428}
+# {"time":"2026-10-19T21:50:06.564Z","level":"info","msg":"request","requestId":"09a76e65-6c62-4873-90cc-30ce3a832a4b","method":"GET","route":"GET /admin/api/models","status":200,"latencyMs":1039}
+    # Subtest: discovery adds upstream models as disabled entries with unknown capabilities
+    ok 8 - discovery adds upstream models as disabled entries with unknown capabilities
+      ---
+      duration_ms: 5907.7195
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:09.333Z","level":"info","msg":"request","requestId":"45f5c92c-10ed-41df-9fbc-ab4887d56371","method":"PATCH","route":"PATCH /admin/api/models/:id","status":200,"latencyMs":2764}
+# {"time":"2026-10-19T21:50:12.462Z","level":"info","msg":"request","requestId":"64e149a9-33b6-4477-aa37-7d843eb34a9a","method":"POST","route":"POST /admin/api/models/:id/default","status":200,"latencyMs":3127}
+    # Subtest: a model is enabled with explicit capabilities and becomes the default
+    ok 9 - a model is enabled with explicit capabilities and becomes the default
+      ---
+      duration_ms: 5897.9253
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:13.505Z","level":"info","msg":"request","requestId":"ea8c869c-74f6-4a5e-8503-24817e517f81","method":"POST","route":"POST /admin/api/models/:id/default","status":409,"latencyMs":1041}
+    # Subtest: a disabled model cannot be made the default
+    ok 10 - a disabled model cannot be made the default
+      ---
+      duration_ms: 1042.3798
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:14.543Z","level":"info","msg":"request","requestId":"5592def8-fd48-49d3-b0ab-77bcf0eee471","method":"PATCH","route":"PATCH /admin/api/models/:id","status":400,"latencyMs":1036}
+    # Subtest: a capability value that is not known is refused
+    ok 11 - a capability value that is not known is refused
+      ---
+      duration_ms: 1038.4332
+      type: 'test'
+      ...
+    1..11
+ok 3 - providers and models
+  ---
+  duration_ms: 26529.882
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:50:15.931Z","level":"info","msg":"request","requestId":"f76fd212-fc5a-4cc2-8a7c-106882628cba","method":"POST","route":"POST /admin/api/enrollment-codes","status":201,"latencyMs":1385}
+# Subtest: desktop devices
+    # Subtest: the owner creates a one-time enrollment code
+    ok 1 - the owner creates a one-time enrollment code
+      ---
+      duration_ms: 1387.226
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:18.709Z","level":"info","msg":"request","requestId":"b5800a0d-5821-47ba-a95e-dcb42cea8edc","method":"POST","route":"POST /v1/devices/enroll","status":201,"latencyMs":2776}
+# {"time":"2026-10-19T21:50:20.101Z","level":"info","msg":"request","requestId":"8eb07476-047a-4b99-b283-3e8a276bf3a5","method":"POST","route":"POST /v1/devices/enroll","status":400,"latencyMs":1391}
+    # Subtest: enrollment exchanges the code for a device token, once
+    ok 2 - enrollment exchanges the code for a device token, once
+      ---
+      duration_ms: 4170.2522
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:21.483Z","level":"info","msg":"request","requestId":"aca33b2e-c25e-475e-a40c-e919cfb02da3","method":"POST","route":"POST /v1/devices/enroll","status":400,"latencyMs":1380}
+# {"time":"2026-10-19T21:50:23.213Z","level":"info","msg":"request","requestId":"2d6fd8ab-f231-4449-89d7-11e2a6ca23ef","method":"POST","route":"POST /v1/devices/enroll","status":400,"latencyMs":1382}
+    # Subtest: a wrong code and an expired code get the same answer
+    ok 3 - a wrong code and an expired code get the same answer
+      ---
+      duration_ms: 3111.8743
+      type: 'test'
+      ...
+    # Subtest: the device token is hashed in the database
+    ok 4 - the device token is hashed in the database
+      ---
+      duration_ms: 345.8405
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:24.613Z","level":"info","msg":"request","requestId":"df86d237-8656-4c5e-a0c7-516330edf82b","method":"GET","route":"GET /v1/catalogue","status":200,"latencyMs":1052}
+# {"time":"2026-10-19T21:50:25.651Z","level":"info","msg":"request","requestId":"037cb0d3-0361-4f61-824e-961ab86213dd","method":"GET","route":"GET /v1/catalogue","status":304,"latencyMs":1036}
+    # Subtest: the catalogue lists only enabled models, with public fields and an ETag
+    ok 5 - the catalogue lists only enabled models, with public fields and an ETag
+      ---
+      duration_ms: 2092.0803
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:25.653Z","level":"info","msg":"request","requestId":"1db520c7-d78c-40b9-82bf-bf1e2b2851bc","method":"GET","route":"GET /v1/catalogue","status":401,"latencyMs":0}
+# {"time":"2026-10-19T21:50:25.654Z","level":"info","msg":"request","requestId":"e525cc6c-c925-44ec-b9c4-d6d039871455","method":"GET","route":"GET /v1/catalogue","status":401,"latencyMs":0}
+    # Subtest: the catalogue requires a device token; admin sessions do not work here
+    ok 6 - the catalogue requires a device token; admin sessions do not work here
+      ---
+      duration_ms: 2.685
+      type: 'test'
+      ...
+    1..6
+ok 4 - desktop devices
+  ---
+  duration_ms: 11110.4445
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:50:30.151Z","level":"info","msg":"request","requestId":"56fb1013-bca2-4330-bfc4-b3953bd9f3f5","method":"POST","route":"POST /v1/chat/completions","status":200,"latencyMs":4494}
+# Subtest: central chat routing
+    # Subtest: a non-streaming chat request goes through the server to the upstream
+    ok 1 - a non-streaming chat request goes through the server to the upstream
+      ---
+      duration_ms: 4497.3398
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:35.975Z","level":"info","msg":"request","requestId":"fd11e6b7-44bb-4601-9caf-76c67be65fe4","method":"POST","route":"POST /v1/chat/completions","status":200,"latencyMs":5822}
+    # Subtest: the upstream receives the provider key from the server, never from the client
+    ok 2 - the upstream receives the provider key from the server, never from the client
+      ---
+      duration_ms: 5823.4866
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:40.137Z","level":"info","msg":"request","requestId":"5a30dc1a-eeb1-4613-8c35-a9d9bf3a42a0","method":"POST","route":"POST /v1/chat/completions","status":400,"latencyMs":4160}
+    # Subtest: unknown fields such as a client-chosen base URL are refused
+    ok 3 - unknown fields such as a client-chosen base URL are refused
+      ---
+      duration_ms: 4162.4131
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:44.296Z","level":"info","msg":"request","requestId":"3e8b0982-c3c4-405f-b128-1b3c95b5688d","method":"POST","route":"POST /v1/chat/completions","status":400,"latencyMs":4157}
+# {"time":"2026-10-19T21:50:48.788Z","level":"info","msg":"request","requestId":"351e49e2-bbb0-4010-b1b6-0d15f9187642","method":"POST","route":"POST /v1/chat/completions","status":404,"latencyMs":4491}
+    # Subtest: a model that is not in the catalogue is refused, including upstream ids
+    ok 4 - a model that is not in the catalogue is refused, including upstream ids
+      ---
+      duration_ms: 8650.5391
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:53.299Z","level":"info","msg":"request","requestId":"f751e873-7664-44ab-84b8-2c269bec993e","method":"POST","route":"POST /v1/chat/completions","status":200,"latencyMs":4508}
+    # Subtest: a streaming request relays SSE and records usage from the provider
+    ok 5 - a streaming request relays SSE and records usage from the provider
+      ---
+      duration_ms: 5301.074
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:58.542Z","level":"info","msg":"request","requestId":"da217b96-5146-459a-adde-c04f762a5f95","method":"POST","route":"POST /v1/chat/completions","status":200,"latencyMs":4450}
+# {"time":"2026-10-19T21:50:59.581Z","level":"info","msg":"request","requestId":"dccefb1e-2f88-438b-b99d-d4d039b199a7","method":"GET","route":"GET /admin/api/logs","status":200,"latencyMs":1037}
+    # Subtest: a non-streaming request without provider usage is logged as usage none
+    ok 6 - a non-streaming request without provider usage is logged as usage none
+      ---
+      duration_ms: 5491.9211
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:01.325Z","level":"info","msg":"request","requestId":"73b9490b-ce45-42b6-bf7f-18fcaadddbce","method":"PUT","route":"PUT /admin/api/providers/:id/api-key","status":200,"latencyMs":1741}
+# {"time":"2026-10-19T21:51:05.824Z","level":"info","msg":"request","requestId":"bf6fb015-b25e-4471-a5c6-0ad53f4d915b","method":"POST","route":"POST /v1/chat/completions","status":502,"latencyMs":4498}
+# {"time":"2026-10-19T21:51:07.535Z","level":"info","msg":"request","requestId":"5a6df44a-ce01-4a7c-9829-f08714606305","method":"PUT","route":"PUT /admin/api/providers/:id/api-key","status":200,"latencyMs":1710}
+    # Subtest: a rejected provider key is reported as a stable code and no key is shown
+    ok 7 - a rejected provider key is reported as a stable code and no key is shown
+      ---
+      duration_ms: 7953.7432
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:10.265Z","level":"info","msg":"request","requestId":"136fc08d-7adf-4b7b-b70b-300c1f58f816","method":"PATCH","route":"PATCH /admin/api/providers/:id","status":200,"latencyMs":2728}
+# {"time":"2026-10-19T21:51:15.702Z","level":"info","msg":"request","requestId":"65aa8be1-0222-4ffc-b241-8c6bcf012ab8","method":"POST","route":"POST /v1/chat/completions","status":504,"latencyMs":5436}
+# {"time":"2026-10-19T21:51:18.468Z","level":"info","msg":"request","requestId":"17cc94c9-4c34-4def-91a5-98a6855e28fc","method":"PATCH","route":"PATCH /admin/api/providers/:id","status":200,"latencyMs":2764}
+    # Subtest: an upstream that is too slow times out with 504
+    ok 8 - an upstream that is too slow times out with 504
+      ---
+      duration_ms: 10933.2636
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:21.236Z","level":"info","msg":"request","requestId":"939aae4d-7519-4fe0-b430-6ff0d6947a91","method":"PATCH","route":"PATCH /admin/api/models/:id","status":200,"latencyMs":2766}
+# {"time":"2026-10-19T21:51:26.075Z","level":"info","msg":"request","requestId":"d274da8f-8d35-4f04-a6de-0cd7d6e95584","method":"POST","route":"POST /v1/chat/completions","status":403,"latencyMs":4837}
+# {"time":"2026-10-19T21:51:28.839Z","level":"info","msg":"request","requestId":"1c5c9cbe-ad47-4890-a1cd-01edfc4dd096","method":"PATCH","route":"PATCH /admin/api/models/:id","status":200,"latencyMs":2763}
+    # Subtest: a disabled model is refused with model_disabled
+    ok 9 - a disabled model is refused with model_disabled
+      ---
+      duration_ms: 10371.2036
+      type: 'test'
+      ...
+    # Subtest: a streamed reply is cancelled upstream when the desktop disconnects
+    ok 10 - a streamed reply is cancelled upstream when the desktop disconnects
+      ---
+      duration_ms: 5310.2142
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:36.224Z","level":"info","msg":"request","requestId":"fbcc22da-f7b0-43f8-ba6d-f7729fec1e74","method":"PATCH","route":"PATCH /admin/api/settings","status":200,"latencyMs":2072}
+# {"time":"2026-10-19T21:51:40.725Z","level":"info","msg":"request","requestId":"929700f8-05b4-4abf-a42c-f65195a49d42","method":"POST","route":"POST /v1/chat/completions","status":429,"latencyMs":4194}
+# {"time":"2026-10-19T21:51:43.254Z","level":"info","msg":"request","requestId":"d85a70bd-a2be-4981-9a1d-6327bc8d2556","method":"POST","route":"POST /v1/chat/completions","status":200,"latencyMs":7028}
+# {"time":"2026-10-19T21:51:45.304Z","level":"info","msg":"request","requestId":"1d19359c-5338-43dc-97a8-8e023fcecfa8","method":"PATCH","route":"PATCH /admin/api/settings","status":200,"latencyMs":2049}
+    # Subtest: the per-device concurrency limit returns 429
+    ok 11 - the per-device concurrency limit returns 429
+      ---
+      duration_ms: 11153.3038
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:46.329Z","level":"info","msg":"request","requestId":"6d4af15e-d06f-436f-92d2-fd12900a51ca","method":"GET","route":"GET /admin/api/devices","status":200,"latencyMs":1023}
+# {"time":"2026-10-19T21:51:47.353Z","level":"info","msg":"request","requestId":"3e9783dd-9ad6-4614-bf30-49c8998a17f8","method":"POST","route":"POST /admin/api/devices/:id/revoke","status":400,"latencyMs":1022}
+# {"time":"2026-10-19T21:51:48.718Z","level":"info","msg":"request","requestId":"a876f3d1-d8d4-4abf-bad0-25f29161b7d4","method":"POST","route":"POST /admin/api/devices/:id/revoke","status":200,"latencyMs":1364}
+# {"time":"2026-10-19T21:51:49.060Z","level":"info","msg":"request","requestId":"374ab92e-f68a-401a-9857-a1f7dc9d0a8d","method":"POST","route":"POST /v1/chat/completions","status":401,"latencyMs":340}
+# {"time":"2026-10-19T21:51:49.403Z","level":"info","msg":"request","requestId":"163e905d-e7d7-4c13-8bdc-17b36eb4c6c3","method":"GET","route":"GET /v1/catalogue","status":401,"latencyMs":342}
+    # Subtest: a revoked device loses access immediately
+    ok 12 - a revoked device loses access immediately
+      ---
+      duration_ms: 4098.5901
+      type: 'test'
+      ...
+    1..12
+ok 5 - central chat routing
+  ---
+  duration_ms: 83747.9822
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:51:51.468Z","level":"info","msg":"request","requestId":"a053294d-0499-4385-8986-b5352cca8013","method":"GET","route":"GET /admin/api/usage","status":200,"latencyMs":2063}
+# {"time":"2026-10-19T21:51:52.151Z","level":"info","msg":"request","requestId":"59374ce1-8d01-4abb-a9bf-cbcab175c4e5","method":"GET","route":"GET /admin/api/usage","status":400,"latencyMs":682}
+# Subtest: usage, logs and settings
+    # Subtest: usage totals split provider-reported tokens from requests without usage
+    ok 1 - usage totals split provider-reported tokens from requests without usage
+      ---
+      duration_ms: 2748.0082
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:53.177Z","level":"info","msg":"request","requestId":"a1b84967-9b8a-4c4a-be5c-5f850326de06","method":"GET","route":"GET /admin/api/logs","status":200,"latencyMs":1024}
+# {"time":"2026-10-19T21:51:54.200Z","level":"info","msg":"request","requestId":"189803fa-51ee-4113-9a39-d96ee30a067e","method":"GET","route":"GET /admin/api/logs","status":200,"latencyMs":1022}
+    # Subtest: logs paginate by id and never contain message text
+    ok 2 - logs paginate by id and never contain message text
+      ---
+      duration_ms: 2049.018
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:55.566Z","level":"info","msg":"request","requestId":"acb78124-a768-4598-807d-5eb01c4d53b0","method":"GET","route":"GET /admin/api/overview","status":200,"latencyMs":1364}
+    # Subtest: the overview counts devices, models and recent failures
+    ok 3 - the overview counts devices, models and recent failures
+      ---
+      duration_ms: 1365.8244
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:51:57.003Z","level":"info","msg":"request","requestId":"46dda79f-ed76-46f8-9fb6-678f3bbaee10","method":"POST","route":"POST /admin/api/auth/login","status":200,"latencyMs":1435}
+# {"time":"2026-10-19T21:51:57.687Z","level":"info","msg":"request","requestId":"b90b68d8-208a-4085-893b-1c8d1e29a7c3","method":"PATCH","route":"PATCH /admin/api/settings","status":403,"latencyMs":682}
+    # Subtest: allowing direct-provider mode needs a fresh password confirmation
+    ok 4 - allowing direct-provider mode needs a fresh password confirmation
+      ---
+      duration_ms: 2121.6816
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:52:00.077Z","level":"info","msg":"request","requestId":"d27a9c34-bd16-418d-a3c9-0fe1cf7f637b","method":"PATCH","route":"PATCH /admin/api/settings","status":200,"latencyMs":2387}
+# {"time":"2026-10-19T21:52:01.101Z","level":"info","msg":"request","requestId":"51af222e-f664-4923-9a74-b1147767b4cf","method":"GET","route":"GET /admin/api/settings","status":200,"latencyMs":1023}
+    # Subtest: direct-provider mode is off by default and reported in the catalogue policy
+    ok 5 - direct-provider mode is off by default and reported in the catalogue policy
+      ---
+      duration_ms: 3413.2261
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:52:02.127Z","level":"info","msg":"request","requestId":"a4ec5f83-e1a2-42fb-831f-d04e5144e03d","method":"POST","route":"POST /admin/api/auth/logout","status":204,"latencyMs":1024}
+# {"time":"2026-10-19T21:52:02.469Z","level":"info","msg":"request","requestId":"4f23de56-0a82-47c4-bc25-68f2ee7de87e","method":"GET","route":"GET /admin/api/providers","status":401,"latencyMs":341}
+    # Subtest: logout ends the session
+    ok 6 - logout ends the session
+      ---
+      duration_ms: 1368.2414
+      type: 'test'
+      ...
+    1..6
+ok 6 - usage, logs and settings
+  ---
+  duration_ms: 13066.6862
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:52:03.565Z","level":"info","msg":"request","requestId":"5ac03897-2fca-429f-b3b2-3108bbe2e87d","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1093}
+# {"time":"2026-10-19T21:52:04.671Z","level":"info","msg":"request","requestId":"11cf6f76-2c3e-4376-9466-187f7eecc527","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1104}
+# {"time":"2026-10-19T21:52:05.765Z","level":"info","msg":"request","requestId":"bd17ef96-5abd-4d54-af7e-df01f13aee3c","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1092}
+# {"time":"2026-10-19T21:52:06.864Z","level":"info","msg":"request","requestId":"5653ea8e-60ae-4ba1-950e-520d4e9e78a8","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1097}
+# {"time":"2026-10-19T21:52:07.966Z","level":"info","msg":"request","requestId":"bdd56609-960c-4995-a3ff-2df8ceb2ef43","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":1101}
+# {"time":"2026-10-19T21:52:08.647Z","level":"info","msg":"request","requestId":"9b391470-d985-4a5d-aa48-d39ed1483fc4","method":"POST","route":"POST /admin/api/auth/login","status":401,"latencyMs":680}
+# Subtest: lockout
+    # Subtest: five wrong passwords lock the owner for a while
+    ok 1 - five wrong passwords lock the owner for a while
+      ---
+      duration_ms: 6177.8735
+      type: 'test'
+      ...
+    1..1
+ok 7 - lockout
+  ---
+  duration_ms: 6178.0427
+  type: 'suite'
+  ...
+# Subtest: development defaults are usable on a laptop
+ok 8 - development defaults are usable on a laptop
+  ---
+  duration_ms: 2.3799
+  type: 'test'
+  ...
+# Subtest: production needs the secret keyring, a secure cookie and an origin without a path
+ok 9 - production needs the secret keyring, a secure cookie and an origin without a path
+  ---
+  duration_ms: 1.3546
+  type: 'test'
+  ...
+# Subtest: production refuses a plaintext database connection unless it is explicitly allowed for a private network
+ok 10 - production refuses a plaintext database connection unless it is explicitly allowed for a private network
+  ---
+  duration_ms: 0.6925
+  type: 'test'
+  ...
+# Subtest: sslmode values are mapped strictly
+ok 11 - sslmode values are mapped strictly
+  ---
+  duration_ms: 0.5879
+  type: 'test'
+  ...
+# Subtest: invalid values fail fast with a clear message
+ok 12 - invalid values fail fast with a clear message
+  ---
+  duration_ms: 0.6674
+  type: 'test'
+  ...
+# Subtest: the admin origin is normalized and only an origin is accepted
+ok 13 - the admin origin is normalized and only an origin is accepted
+  ---
+  duration_ms: 0.5224
+  type: 'test'
+  ...
+# Subtest: password hashes verify only the right password and are salted
+ok 14 - password hashes verify only the right password and are salted
+  ---
+  duration_ms: 343.8895
+  type: 'test'
+  ...
+# Subtest: tokens are random and hashed for storage
+ok 15 - tokens are random and hashed for storage
+  ---
+  duration_ms: 0.5655
+  type: 'test'
+  ...
+# Subtest: enrollment codes are grouped, unambiguous and normalize
+ok 16 - enrollment codes are grouped, unambiguous and normalize
+  ---
+  duration_ms: 0.5343
+  type: 'test'
+  ...
+# Subtest: secrets round-trip, are bound to their row, and survive key rotation
+ok 17 - secrets round-trip, are bound to their row, and survive key rotation
+  ---
+  duration_ms: 1.6389
+  type: 'test'
+  ...
+# Subtest: keyring rejects bad input
+ok 18 - keyring rejects bad input
+  ---
+  duration_ms: 0.2908
+  type: 'test'
+  ...
+# Subtest: the shipped migrations are well formed and versioned
+ok 19 - the shipped migrations are well formed and versioned
+  ---
+  duration_ms: 11.3271
+  type: 'test'
+  ...
+# Subtest: migrations apply once, revert, and re-apply
+ok 20 - migrations apply once, revert, and re-apply
+  ---
+  duration_ms: 22015.9362
+  type: 'test'
+  ...
+# Subtest: a changed applied migration is refused
+ok 21 - a changed applied migration is refused
+  ---
+  duration_ms: 9981.3421
+  type: 'test'
+  ...
+# Subtest: a failing migration is rolled back completely
+ok 22 - a failing migration is rolled back completely
+  ---
+  duration_ms: 9662.6824
+  type: 'test'
+  ...
+# Subtest: persistent rate limits
+    # Subtest: counts are shared across connections and survive a restart
+    ok 1 - counts are shared across connections and survive a restart
+      ---
+      duration_ms: 4542.1363
+      type: 'test'
+      ...
+    # Subtest: concurrent hits never exceed the limit
+    ok 2 - concurrent hits never exceed the limit
+      ---
+      duration_ms: 2844.3595
+      type: 'test'
+      ...
+    1..2
+ok 23 - persistent rate limits
+  ---
+  duration_ms: 14625.6564
+  type: 'suite'
+  ...
+# Subtest: device request leases
+    # Subtest: a device runs at most the configured number of requests, and a finished request frees its slot
+    ok 1 - a device runs at most the configured number of requests, and a finished request frees its slot
+      ---
+      duration_ms: 10285.6811
+      type: 'test'
+      ...
+    # Subtest: one device's requests do not use another device's slots
+    ok 2 - one device's requests do not use another device's slots
+      ---
+      duration_ms: 8589.4757
+      type: 'test'
+      ...
+    # Subtest: a lease left behind by a crashed request expires and frees the slot
+    ok 3 - a lease left behind by a crashed request expires and frees the slot
+      ---
+      duration_ms: 4456.8015
+      type: 'test'
+      ...
+    # Subtest: a repeated Idempotency-Key is refused while it is in flight and after it completed
+    ok 4 - a repeated Idempotency-Key is refused while it is in flight and after it completed
+      ---
+      duration_ms: 9608.2354
+      type: 'test'
+      ...
+    # Subtest: a duplicate usage row for one key is rejected by the database
+    ok 5 - a duplicate usage row for one key is rejected by the database
+      ---
+      duration_ms: 1048.16
+      type: 'test'
+      ...
+    1..5
+ok 24 - device request leases
+  ---
+  duration_ms: 33989.3439
+  type: 'suite'
+  ...
+# {"time":"2026-10-19T21:50:22.798Z","level":"info","msg":"request","requestId":"82345d7e-b363-4de6-a1ee-3735a3b9d300","method":"POST","route":"POST /admin/api/auth/login","status":200,"latencyMs":1448}
+# {"time":"2026-10-19T21:50:23.151Z","level":"info","msg":"request","requestId":"fe7932f3-ff8c-407b-86d1-2fdff3dec91e","method":"GET","route":"GET /healthz","status":200,"latencyMs":1}
+# {"time":"2026-10-19T21:50:23.154Z","level":"info","msg":"request","requestId":"ba9e1963-aa41-4717-80ef-7cc435039878","method":"GET","route":"GET /healthz","status":200,"latencyMs":1}
+# Subtest: HTTP: request IDs, owner-only health, device checks
+    # Subtest: every response carries a server-generated request id
+    ok 1 - every response carries a server-generated request id
+      ---
+      duration_ms: 7.6374
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:23.157Z","level":"info","msg":"request","requestId":"52a21558-3b6c-4a6e-a129-d7047ae8585f","method":"GET","route":"GET /admin/api/health","status":401,"latencyMs":1}
+# {"time":"2026-10-19T21:50:23.159Z","level":"info","msg":"request","requestId":"87e48d8e-bc0e-49bc-a16e-907738436c08","method":"GET","route":"GET /admin/api/health","status":401,"latencyMs":1}
+    # Subtest: the health view is refused without an owner session and for a device token
+    ok 2 - the health view is refused without an owner session and for a device token
+      ---
+      duration_ms: 4.4776
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:26.250Z","level":"info","msg":"request","requestId":"8ba81888-7533-4ed8-b3c9-a63603462177","method":"GET","route":"GET /admin/api/health","status":200,"latencyMs":3089}
+    # Subtest: the owner health view reports real state and never returns secret values
+    ok 3 - the owner health view reports real state and never returns secret values
+      ---
+      duration_ms: 3092.885
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:26.954Z","level":"info","msg":"request","requestId":"bb29dc3c-e428-4fb9-b388-0582e1356235","method":"POST","route":"POST /v1/chat/completions","status":400,"latencyMs":698}
+    # Subtest: chat refuses a malformed Idempotency-Key before any work is done
+    ok 4 - chat refuses a malformed Idempotency-Key before any work is done
+      ---
+      duration_ms: 702.8784
+      type: 'test'
+      ...
+# {"time":"2026-10-19T21:50:30.396Z","level":"info","msg":"request","requestId":"06e628b1-50a9-4b52-b7ee-e1bbbd6931ea","method":"POST","route":"POST /v1/chat/completions","status":409,"latencyMs":3095}
+    # Subtest: chat answers 409 for a repeated Idempotency-Key from the same device
+    ok 5 - chat answers 409 for a repeated Idempotency-Key from the same device
+      ---
+      duration_ms: 3442.5189
+      type: 'test'
+      ...
+    1..5
+ok 25 - HTTP: request IDs, owner-only health, device checks
+  ---
+  duration_ms: 9484.7229
+  type: 'suite'
+  ...
+# Subtest: text values are decoded by column type
+ok 26 - text values are decoded by column type
+  ---
+  duration_ms: 5.0021
+  type: 'test'
+  ...
+# Subtest: the wire client copes with large results split across socket reads
+ok 27 - the wire client copes with large results split across socket reads
+  ---
+  duration_ms: 22190.0882
+  type: 'test'
+  ...
+# Subtest: parameters are bound as data, never executed
+ok 28 - parameters are bound as data, never executed
+  ---
+  duration_ms: 6900.7021
+  type: 'test'
+  ...
+# Subtest: a wrong password is refused with a clear error and no socket is left open
+ok 29 - a wrong password is refused with a clear error and no socket is left open
+  ---
+  duration_ms: 1428.4563
+  type: 'test'
+  ...
+# Subtest: an unreachable host fails fast
+ok 30 - an unreachable host fails fast
+  ---
+  duration_ms: 1.4395
+  type: 'test'
+  ...
+# Subtest: a database error carries its SQLSTATE
+ok 31 - a database error carries its SQLSTATE
+  ---
+  duration_ms: 1770.9021
+  type: 'test'
+  ...
+1..31
+# tests 78
+# suites 10
+# pass 78
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 158970.9028
