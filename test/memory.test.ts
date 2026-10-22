@@ -8,25 +8,34 @@ import type { Server } from 'node:http';
 import { createTestDb, SKIP_NO_PG, type TestDb } from './helpers.ts';
 import { loadConfig } from '../src/config.ts';
 import { createServer } from '../src/app.ts';
+import { hashPassword } from '../src/crypto.ts';
 import { loadMigrations, migrateUp } from '../src/db/migrate.ts';
 
 const KEYRING = `1=${crypto.randomBytes(32).toString('base64')}`;
 const INSTALL_ID = 'install-0123456789abcdef';
+const OWNER_EMAIL = 'owner@example.test';
+const OWNER_PASSWORD = 'correct horse battery staple';
 
 let tdb: TestDb | null = null;
 let server: Server;
 let base = '';
 let deviceToken = '';
+let ownerCookie = '';
+let csrf = '';
 
 interface Res {
   status: number;
   json: any;
 }
 
-async function call(method: string, path: string, opts: { body?: unknown; device?: string } = {}): Promise<Res> {
+async function call(method: string, path: string, opts: { body?: unknown; device?: string; session?: boolean } = {}): Promise<Res> {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers['content-type'] = 'application/json';
   if (opts.device) headers.authorization = `Bearer ${opts.device}`;
+  if (opts.session) {
+    headers.cookie = ownerCookie;
+    if (method !== 'GET') headers['x-csrf-token'] = csrf;
+  }
   const res = await fetch(base + path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body), redirect: 'manual' });
   const text = await res.text();
   let json: any = null;
@@ -46,6 +55,7 @@ before(async () => {
   tdb = await createTestDb();
   if (!tdb) return;
   await migrateUp(tdb.db, loadMigrations());
+  await tdb.db.query('INSERT INTO owners (email, password_hash) VALUES ($1, $2)', [OWNER_EMAIL, await hashPassword(OWNER_PASSWORD)]);
   const pw = encodeURIComponent(tdb.config.password);
   const env = {
     DEVORA_ENV: 'development',
@@ -59,6 +69,14 @@ before(async () => {
   server = createServer({ db: tdb.db, config, fetch: globalThis.fetch });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const login = await fetch(base + '/admin/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: OWNER_EMAIL, password: OWNER_PASSWORD }),
+  });
+  ownerCookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+  const session = (await (await fetch(base + '/admin/api/auth/session', { headers: { cookie: ownerCookie } })).json()) as { csrfToken: string };
+  csrf = session.csrfToken;
   const reg = await call('POST', '/v1/devices/register', { body: { installId: INSTALL_ID, deviceName: 'test-box' } });
   deviceToken = reg.json.token;
 });
@@ -146,5 +164,72 @@ describe('memory sync', { skip: !tdb && SKIP_NO_PG }, () => {
     const reg2 = await call('POST', '/v1/devices/register', { body: { installId: 'install-fedcba9876543210', deviceName: 'other-box' } });
     const pull = await call('POST', '/v1/memory/sync', { device: reg2.json.token, body: { changes: [], since: 0 } });
     assert.equal(pull.json.entries.length, 0);
+  });
+});
+
+describe('admin memory API', { skip: !tdb && SKIP_NO_PG }, () => {
+  test('the memory list is owner-only', async () => {
+    const anon = await call('GET', '/admin/api/memory');
+    assert.equal(anon.status, 401);
+    const device = await call('GET', '/admin/api/memory', { device: deviceToken });
+    assert.equal(device.status, 401);
+  });
+
+  test('the owner sees stored memories with device names, totals and filters', async () => {
+    const list = await call('GET', '/admin/api/memory?limit=50', { session: true });
+    assert.equal(list.status, 200);
+    assert.ok(list.json.total >= 3, 'the earlier pushes are visible');
+    assert.ok(list.json.active >= 2);
+    const row = list.json.memories.find((m: any) => m.content === 'tests run with vitest, not jest');
+    assert.ok(row, 'the newest fact is in the list');
+    assert.equal(row.deviceName, 'test-box');
+    assert.equal(row.kind, 'fact');
+    assert.equal(typeof row.updatedAt, 'string');
+    assert.equal(list.json.memories.every((m: any) => !('client_key' in m)), 'rows are camelCase');
+    const facts = await call('GET', '/admin/api/memory?kind=lesson', { session: true });
+    assert.equal(facts.json.total, 1);
+    const search = await call('GET', '/admin/api/memory?q=vitest', { session: true });
+    assert.equal(search.json.total, 1);
+    const none = await call('GET', '/admin/api/memory?q=no-such-memory-text', { session: true });
+    assert.equal(none.json.total, 0);
+  });
+
+  test('the devices list carries the memory count per device', async () => {
+    const list = await call('GET', '/admin/api/devices', { session: true });
+    assert.equal(list.status, 200);
+    const box = list.json.devices.find((d: any) => d.name === 'test-box');
+    assert.ok(box.memories >= 2);
+  });
+
+  test('clearing needs CSRF and the password confirmation', async () => {
+    const noCsrf = await fetch(base + '/admin/api/memory', { method: 'DELETE', headers: { cookie: ownerCookie } });
+    assert.equal(noCsrf.status, 403);
+    const noReauth = await call('DELETE', '/admin/api/memory', { session: true });
+    assert.equal(noReauth.status, 403);
+    assert.equal(noReauth.json.error.code, 'reauth_required');
+  });
+
+  test('after the password confirmation the owner can clear one device, then everything', async () => {
+    const reauth = await call('POST', '/admin/api/auth/reauth', { session: true, body: { password: OWNER_PASSWORD } });
+    assert.equal(reauth.status, 200);
+    const other = await call('POST', '/v1/devices/register', { body: { installId: 'install-aaaabbbbccccdddd', deviceName: 'clear-box' } });
+    await call('POST', '/v1/memory/sync', { device: other.json.token, body: { changes: [{ clientKey: 'd'.repeat(16) + '-other-0001', scope: 'global', projectKey: '', kind: 'fact', content: 'memories on the second device', source: 'agent', confidence: 0.5, updatedAt: 100 }] } });
+
+    const box = (await call('GET', '/admin/api/devices', { session: true })).json.devices.find((d: any) => d.name === 'test-box');
+    const clearedOne = await call('DELETE', `/admin/api/memory/${box.id}`, { session: true });
+    assert.equal(clearedOne.status, 200);
+    assert.ok(clearedOne.json.cleared >= 3);
+    const left = await call('GET', '/admin/api/memory', { session: true });
+    assert.equal(left.json.total, 1, 'only the second device still has memory');
+    assert.equal(left.json.memories[0].deviceName, 'clear-box');
+
+    const clearedAll = await call('DELETE', '/admin/api/memory', { session: true });
+    assert.equal(clearedAll.status, 200);
+    assert.equal(clearedAll.json.cleared, 1);
+    const empty = await call('GET', '/admin/api/memory', { session: true });
+    assert.equal(empty.json.total, 0);
+    // The devices keep working: the next sync starts over and the desktop restores itself from its local copy.
+    const repush = await call('POST', '/v1/memory/sync', { device: other.json.token, body: { changes: [{ clientKey: 'd'.repeat(16) + '-other-0001', scope: 'global', projectKey: '', kind: 'fact', content: 'memories on the second device', source: 'agent', confidence: 0.5, updatedAt: 200 }] } });
+    assert.equal(repush.json.applied, 1);
   });
 });

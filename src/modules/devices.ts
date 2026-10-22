@@ -73,7 +73,8 @@ export async function listDevices(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query(
     `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via,
-            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted
+            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted,
+            (SELECT count(*)::int FROM memory_entries me WHERE me.device_id = d.id AND me.deleted = false) AS memories
        FROM devices d ORDER BY d.created_at DESC LIMIT 500`,
   );
   sendJson(ctx.res, 200, {
@@ -87,6 +88,7 @@ export async function listDevices(ctx: Ctx): Promise<void> {
       modelAccess: r.model_access,
       registeredVia: r.registered_via,
       grantedModels: r.granted,
+      memories: r.memories,
     })),
   });
 }

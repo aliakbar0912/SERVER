@@ -70,6 +70,9 @@ const routes: Route[] = [
 
   R('GET', '/admin/api/usage', data.usage),
   R('GET', '/admin/api/logs', data.logs),
+  R('GET', '/admin/api/memory', memory.adminListMemory),
+  R('DELETE', '/admin/api/memory', memory.adminClearAllMemory),
+  R('DELETE', '/admin/api/memory/:id', memory.adminClearDeviceMemory),
   R('GET', '/admin/api/settings', data.getSettings),
   R('PATCH', '/admin/api/settings', data.patchSettings),
 ];

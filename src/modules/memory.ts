@@ -5,7 +5,8 @@
 // changed on the server since its cursor. Memory belongs to one device: another computer can never read it,
 // and a revoked device loses access with everything else. Secrets are refused, mirroring the desktop's own guard.
 import type { Ctx } from '../context.ts';
-import { fail, readJson, rejectUnknown, requireObject, sendJson, str, bool, int } from '../http/util.ts';
+import { fail, readJson, rejectUnknown, requireObject, sendJson, str, bool, int, UUID, uuidParam } from '../http/util.ts';
+import { guardOwner } from './auth.ts';
 import { authenticateDevice } from './devices.ts';
 
 const SYNC_PER_DEVICE = 40;
@@ -196,4 +197,108 @@ async function pullChanges(ctx: Ctx, deviceId: string, since: number): Promise<{
   // When truncated, the cursor only advances to the last returned row, so nothing is skipped.
   const serverTime = truncated && entries.length ? entries[entries.length - 1].updatedAt : Date.now();
   return { serverTime, truncated, entries };
+}
+
+// ---- admin: the owner's view of what the devices remember ----------------------------------
+
+const ADMIN_LIMIT = 500;
+
+interface MemoryFilter {
+  where: string;
+  params: unknown[];
+}
+
+/** Builds the WHERE clause for the admin list from the query string. Every value is bounded and whitelisted. */
+function memoryFilter(ctx: Ctx): MemoryFilter {
+  const sp = ctx.url.searchParams;
+  const where: string[] = [];
+  const params: unknown[] = [];
+  const q = (sp.get('q') ?? '').trim().slice(0, 120);
+  if (q) {
+    params.push(`%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
+    where.push(`m.content ILIKE $${params.length}`);
+  }
+  const scope = sp.get('scope') ?? '';
+  if (scope === 'global' || scope === 'project') {
+    params.push(scope);
+    where.push(`m.scope = $${params.length}`);
+  }
+  const kind = sp.get('kind') ?? '';
+  if (['fact', 'preference', 'lesson', 'decision'].includes(kind)) {
+    params.push(kind);
+    where.push(`m.kind = $${params.length}`);
+  }
+  const deviceId = sp.get('deviceId') ?? '';
+  if (UUID.test(deviceId)) {
+    params.push(deviceId);
+    where.push(`m.device_id = $${params.length}`);
+  }
+  return { where: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+/**
+ * GET /admin/api/memory: the owner's read-only view of stored memories, newest first. Filters: q (text search
+ * in the content), scope, kind, deviceId. Returns the matching totals plus one page of rows, so the admin site
+ * can page with `offset`. Contents are shown here on purpose: memory text is the owner's own data and holds no
+ * secrets (the sync endpoint refuses them at write time).
+ */
+export async function adminListMemory(ctx: Ctx): Promise<void> {
+  await guardOwner(ctx, { write: false });
+  const limitRaw = Number(ctx.url.searchParams.get('limit') ?? 100);
+  const limit = Number.isInteger(limitRaw) && limitRaw >= 1 && limitRaw <= ADMIN_LIMIT ? limitRaw : 100;
+  const offsetRaw = Number(ctx.url.searchParams.get('offset') ?? 0);
+  const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 && offsetRaw <= 1_000_000 ? offsetRaw : 0;
+  const f = memoryFilter(ctx);
+  const { rows: counted } = await ctx.deps.db.query(
+    `SELECT count(*)::int AS total, count(*) FILTER (WHERE m.deleted = false)::int AS active FROM memory_entries m ${f.where}`,
+    f.params,
+  );
+  const listParams = [...f.params, limit, offset];
+  const { rows } = await ctx.deps.db.query(
+    `SELECT m.id, m.device_id, m.scope, m.project_key, m.kind, m.content, m.tags, m.source, m.confidence,
+            m.verified, m.pinned, m.hits, m.deleted, m.created_at, m.updated_at, d.name AS device_name
+       FROM memory_entries m LEFT JOIN devices d ON d.id = m.device_id
+       ${f.where} ORDER BY m.updated_at DESC LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+    listParams,
+  );
+  sendJson(ctx.res, 200, {
+    total: counted[0]?.total ?? 0,
+    active: counted[0]?.active ?? 0,
+    memories: rows.map((r: Record<string, unknown>) => ({
+      id: r.id,
+      deviceId: r.device_id,
+      deviceName: r.device_name ?? null,
+      scope: r.scope,
+      projectKey: r.project_key,
+      kind: r.kind,
+      content: r.content,
+      tags: Array.isArray(r.tags) ? r.tags : [],
+      source: r.source,
+      confidence: Number(r.confidence),
+      verified: r.verified === true,
+      pinned: r.pinned === true,
+      hits: Number(r.hits) || 0,
+      deleted: r.deleted === true,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    })),
+  });
+}
+
+async function clearMemories(ctx: Ctx, deviceId: string | null): Promise<void> {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const { rows } = deviceId
+    ? await ctx.deps.db.query('WITH gone AS (DELETE FROM memory_entries WHERE device_id = $1 RETURNING 1) SELECT count(*)::int AS n FROM gone', [deviceId])
+    : await ctx.deps.db.query('WITH gone AS (DELETE FROM memory_entries RETURNING 1) SELECT count(*)::int AS n FROM gone');
+  sendJson(ctx.res, 200, { cleared: rows[0]?.n ?? 0 });
+}
+
+/** DELETE /admin/api/memory/:deviceId: forgets one computer's stored memories. Sensitive: password confirmation. */
+export async function adminClearDeviceMemory(ctx: Ctx): Promise<void> {
+  await clearMemories(ctx, uuidParam(ctx.params.id));
+}
+
+/** DELETE /admin/api/memory: forgets everything every device stored. Sensitive: password confirmation. */
+export async function adminClearAllMemory(ctx: Ctx): Promise<void> {
+  await clearMemories(ctx, null);
 }
