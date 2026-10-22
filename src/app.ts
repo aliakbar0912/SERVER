@@ -12,6 +12,7 @@ import * as catalogue from './modules/catalogue.ts';
 import * as providers from './modules/providers.ts';
 import * as models from './modules/models.ts';
 import * as chat from './modules/chat.ts';
+import * as memory from './modules/memory.ts';
 import * as data from './modules/admin-data.ts';
 import * as health from './modules/health.ts';
 import * as clientConfig from './modules/client-config.ts';
@@ -36,6 +37,7 @@ const routes: Route[] = [
   R('GET', '/v1/models/:id', catalogue.modelRoute),
   R('GET', '/v1/usage', catalogue.deviceUsageRoute),
   R('POST', '/v1/chat/completions', chat.chatCompletions),
+  R('POST', '/v1/memory/sync', memory.syncMemories),
 
   R('POST', '/admin/api/auth/login', auth.login),
   R('GET', '/admin/api/auth/session', auth.sessionInfo),
