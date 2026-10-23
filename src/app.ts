@@ -16,6 +16,7 @@ import * as memory from './modules/memory.ts';
 import * as data from './modules/admin-data.ts';
 import * as health from './modules/health.ts';
 import * as clientConfig from './modules/client-config.ts';
+import * as releases from './modules/releases.ts';
 
 type Handler = (ctx: Ctx) => Promise<void>;
 interface Route {
@@ -38,6 +39,8 @@ const routes: Route[] = [
   R('GET', '/v1/usage', catalogue.deviceUsageRoute),
   R('POST', '/v1/chat/completions', chat.chatCompletions),
   R('POST', '/v1/memory/sync', memory.syncMemories),
+  R('GET', '/v1/updates/check', releases.checkForUpdate),
+  R('GET', '/v1/updates/:id/download', releases.downloadUpdate),
 
   R('POST', '/admin/api/auth/login', auth.login),
   R('GET', '/admin/api/auth/session', auth.sessionInfo),
@@ -73,6 +76,12 @@ const routes: Route[] = [
   R('GET', '/admin/api/memory', memory.adminListMemory),
   R('DELETE', '/admin/api/memory', memory.adminClearAllMemory),
   R('DELETE', '/admin/api/memory/:id', memory.adminClearDeviceMemory),
+  R('GET', '/admin/api/releases', releases.listReleases),
+  R('POST', '/admin/api/releases', releases.createRelease),
+  R('PUT', '/admin/api/releases/:id/chunks/:seq', releases.uploadChunk),
+  R('POST', '/admin/api/releases/:id/complete', releases.completeUpload),
+  R('PATCH', '/admin/api/releases/:id', releases.updateRelease),
+  R('DELETE', '/admin/api/releases/:id', releases.deleteRelease),
   R('GET', '/admin/api/settings', data.getSettings),
   R('PATCH', '/admin/api/settings', data.patchSettings),
 ];

@@ -102,7 +102,7 @@ describe('health and schema', () => {
     assert.equal((await call('GET', '/healthz')).status, 200);
     const ready = await call('GET', '/readyz');
     assert.equal(ready.status, 200);
-    assert.equal(ready.json.schemaVersion, 4);
+    assert.equal(ready.json.schemaVersion, loadMigrations().length);
   });
 
   test('desktop runtime configuration is public, versioned and free of secrets', async (t) => {

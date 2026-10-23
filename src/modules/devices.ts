@@ -59,20 +59,24 @@ export async function authenticateDevice(ctx: Ctx): Promise<DeviceAuth> {
   const match = /^Bearer\s+([A-Za-z0-9_-]{20,128})$/.exec(header);
   if (!match) fail(401, 'unauthenticated', 'a device token is required');
   const { rows } = await ctx.deps.db.query(
-    `SELECT id, name, status, model_access, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
+    `SELECT id, name, status, model_access, app_version, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
        FROM devices WHERE token_hash = $1`,
     [sha256Hex(match[1]), DEVICE_TOUCH_SECONDS],
   );
   const row = rows[0];
   if (!row || row.status !== 'active') fail(401, 'device_revoked', 'this device is not allowed to use the service');
-  if (row.touch) await ctx.deps.db.query('UPDATE devices SET last_seen_at = now() WHERE id = $1', [row.id]);
+  // Desktop apps report their version (x-devora-version) so the owner can follow an update's rollout.
+  const reported = String(ctx.req.headers['x-devora-version'] ?? '');
+  const version = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]{1,30})?$/.test(reported) ? reported : null;
+  if (version && version !== row.app_version) await ctx.deps.db.query('UPDATE devices SET last_seen_at = now(), app_version = $2 WHERE id = $1', [row.id, version]);
+  else if (row.touch) await ctx.deps.db.query('UPDATE devices SET last_seen_at = now() WHERE id = $1', [row.id]);
   return { deviceId: row.id, name: row.name, modelAccess: row.model_access };
 }
 
 export async function listDevices(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query(
-    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via,
+    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via, d.app_version,
             (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted,
             (SELECT count(*)::int FROM memory_entries me WHERE me.device_id = d.id AND me.deleted = false) AS memories
        FROM devices d ORDER BY d.created_at DESC LIMIT 500`,
@@ -89,6 +93,7 @@ export async function listDevices(ctx: Ctx): Promise<void> {
       registeredVia: r.registered_via,
       grantedModels: r.granted,
       memories: r.memories,
+      appVersion: r.app_version ?? null,
     })),
   });
 }
