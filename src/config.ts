@@ -39,6 +39,18 @@ export interface Config {
    * same id, so a changed domain can never point its device token at a different server.
    */
   instanceId: string;
+  /** Devora accounts (PocketBase). Null = accounts are off: sign-in endpoints answer 503 and devices work as before. */
+  pocketbase: PocketBaseConfig | null;
+}
+
+export interface PocketBaseConfig {
+  /** Base URL of the PocketBase server (POCKETBASE_URL). https in production. */
+  url: string;
+  /** Auth collection holding Devora users (POCKETBASE_USERS_COLLECTION, default users). */
+  usersCollection: string;
+  /** A dedicated PocketBase superuser for this server only. Never sent to a desktop or to the admin website. */
+  adminEmail: string;
+  adminPassword: string;
 }
 
 export interface DesktopReleaseConfig {
@@ -182,6 +194,31 @@ export function parseDatabase(env: NodeJS.ProcessEnv, production: boolean): PgCo
   return cfg;
 }
 
+/** POCKETBASE_URL + a dedicated superuser. All three are needed: the server re-checks accounts with the superuser. */
+function pocketbase(env: NodeJS.ProcessEnv, production: boolean): PocketBaseConfig | null {
+  const raw = (env.POCKETBASE_URL ?? '').trim();
+  const email = (env.POCKETBASE_ADMIN_EMAIL ?? '').trim();
+  const password = env.POCKETBASE_ADMIN_PASSWORD ?? '';
+  if (!raw) {
+    if (email || password) throw new Error('POCKETBASE_ADMIN_EMAIL/POCKETBASE_ADMIN_PASSWORD are set but POCKETBASE_URL is not');
+    return null;
+  }
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error('POCKETBASE_URL must be a URL such as https://pocketbase.YOUR_DOMAIN');
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('POCKETBASE_URL must start with https://');
+  if (u.username || u.password || u.search || u.hash) throw new Error('POCKETBASE_URL must not contain credentials, a query or a fragment');
+  if (production && u.protocol !== 'https:') throw new Error('POCKETBASE_URL must use https in production');
+  if (!email || !password) throw new Error('POCKETBASE_URL needs POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD (a superuser dedicated to this server)');
+  if (production && password.length < 12) throw new Error('POCKETBASE_ADMIN_PASSWORD is too short for production');
+  const usersCollection = (env.POCKETBASE_USERS_COLLECTION ?? '').trim() || 'users';
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(usersCollection)) throw new Error('POCKETBASE_USERS_COLLECTION must be a collection name');
+  return { url: u.toString().replace(/\/+$/, ''), usersCollection, adminEmail: email, adminPassword: password };
+}
+
 function redisPrefix(v: string | undefined): string {
   if (v === undefined || v === '') return 'devora';
   if (!/^[A-Za-z0-9_.-]{1,40}$/.test(v)) throw new Error('REDIS_KEY_PREFIX may contain only letters, digits, _ . - (up to 40)');
@@ -227,6 +264,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       statusMessage,
     },
     instanceId: instanceId(env, keyring),
+    pocketbase: pocketbase(env, production),
   };
 }
 
@@ -235,6 +273,7 @@ export function configWarnings(c: Config): string[] {
   const out: string[] = [...c.ignoredSettings];
   if (c.env === 'production' && !c.publicApiOrigin) out.push('PUBLIC_API_ORIGIN is not set: desktop apps cannot be moved to a new API domain automatically');
   if (c.env === 'production' && !c.trustProxy) out.push('TRUST_PROXY is false: behind Dokploy/Traefik every request appears to come from the proxy');
+  if (c.pocketbase && !c.publicApiOrigin) out.push('PUBLIC_API_ORIGIN is not set: Google/GitHub sign-in is off because it needs the public callback address');
   if (c.env === 'production' && !c.redis) out.push('REDIS_URL is not set: rate limits use PostgreSQL and there is no cache');
   return out;
 }
@@ -254,5 +293,6 @@ export function redactedConfig(c: Config): Record<string, unknown> {
     redis: c.redis ? `${c.redis.host}:${c.redis.port}/${c.redis.db}${c.redis.tls ? ' (tls)' : ''}` : null,
     requestTimeoutMs: c.requestTimeoutMs,
     desktopMinVersion: c.desktop.minVersion,
+    pocketbase: c.pocketbase ? `${c.pocketbase.url} (collection ${c.pocketbase.usersCollection})` : null,
   };
 }

@@ -4,6 +4,7 @@ import type { Queryer } from '../db/pg-wire.ts';
 import { bool, fail, int, readJson, requireObject, rejectUnknown, sendJson } from '../http/util.ts';
 import { guardOwner, requireReauth } from './auth.ts';
 import { bumpCatalogue, readSettings } from './catalogue.ts';
+import { forgetLoginSetting } from './sessions.ts';
 
 export async function overview(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
@@ -127,7 +128,7 @@ export async function logs(ctx: Ctx): Promise<void> {
 
 export async function getSettings(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
-  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+  sendJson(ctx.res, 200, { ...(await currentSettings(ctx.deps.db)), accountsConfigured: !!ctx.deps.pocketbase });
 }
 
 export async function currentSettings(db: Queryer) {
@@ -138,6 +139,7 @@ export async function currentSettings(db: Queryer) {
     maxOutputTokens: Number(s.max_output_tokens ?? 8192),
     allowDirectProvider: s.allow_direct_provider === true,
     allowAutoRegistration: s.allow_auto_registration !== false,
+    requireLoginForCentralAi: s.require_login_for_central_ai === true,
   };
 }
 
@@ -147,6 +149,7 @@ const SETTING_KEYS: Record<string, string> = {
   maxOutputTokens: 'max_output_tokens',
   allowDirectProvider: 'allow_direct_provider',
   allowAutoRegistration: 'allow_auto_registration',
+  requireLoginForCentralAi: 'require_login_for_central_ai',
 };
 
 export async function patchSettings(ctx: Ctx): Promise<void> {
@@ -167,6 +170,13 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
   }
   const autoReg = bool(body, 'allowAutoRegistration', { optional: true });
   if (autoReg !== undefined) changes.push(['allow_auto_registration', autoReg]);
+  const requireLogin = bool(body, 'requireLoginForCentralAi', { optional: true });
+  if (requireLogin !== undefined) {
+    // Changes who may use central AI: password confirmation, and only when accounts are configured on this server.
+    requireReauth(session);
+    if (requireLogin && !ctx.deps.pocketbase) fail(409, 'accounts_not_configured', 'set POCKETBASE_URL and the PocketBase superuser on the server first');
+    changes.push(['require_login_for_central_ai', requireLogin]);
+  }
   if (changes.length === 0) fail(400, 'invalid_request', 'no settings were given');
   await ctx.deps.db.transaction(async (q) => {
     for (const [k, v] of changes) {
@@ -177,7 +187,8 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
     }
     if (changes.some(([k]) => k === 'max_output_tokens' || k === 'allow_direct_provider')) await bumpCatalogue(q);
   });
-  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+  forgetLoginSetting(ctx.deps.db);
+  sendJson(ctx.res, 200, { ...(await currentSettings(ctx.deps.db)), accountsConfigured: !!ctx.deps.pocketbase });
 }
 
 /** Deletes request logs older than the retention period. The only automatic deletion in the server. */

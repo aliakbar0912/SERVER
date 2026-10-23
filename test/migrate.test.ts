@@ -19,15 +19,21 @@ test('migrations apply once, revert, and re-apply', { skip: false }, async (t) =
   if (!tdb) return t.skip(SKIP_NO_PG);
   try {
     const first = await migrateUp(tdb.db, loadMigrations(repoMigrations));
-    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql', '0004_auto_registration.sql', '0005_memory.sql', '0006_desktop_releases.sql']);
+    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql', '0004_auto_registration.sql', '0005_memory.sql', '0006_desktop_releases.sql', '0007_accounts.sql']);
     const again = await migrateUp(tdb.db, loadMigrations(repoMigrations));
     assert.deepEqual(again, []);
     const status = await migrationStatus(tdb.db, loadMigrations(repoMigrations));
-    assert.equal(status.currentVersion, 6);
+    assert.equal(status.currentVersion, 7);
     assert.equal(status.pending.length, 0);
     const { rows } = await tdb.db.query("SELECT count(*)::int AS n FROM settings WHERE key = 'catalogue_version'");
     assert.equal(rows[0].n, 1);
 
+    // 0007 reverts cleanly: account tables, device account columns and the setting go; devices stay.
+    await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));
+    assert.equal((await tdb.db.query("SELECT to_regclass('public.app_users') AS t")).rows[0].t, null);
+    assert.equal((await tdb.db.query("SELECT to_regclass('public.auth_handoffs') AS t")).rows[0].t, null);
+    assert.equal((await tdb.db.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = 'devices' AND column_name = 'user_id'")).rows[0].n, 0);
+    assert.equal((await tdb.db.query("SELECT count(*)::int AS n FROM settings WHERE key = 'require_login_for_central_ai'")).rows[0].n, 0);
     // 0006 reverts cleanly: the release tables and the device version column go.
     await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));
     assert.equal((await tdb.db.query("SELECT to_regclass('public.desktop_releases') AS t")).rows[0].t, null);
@@ -87,6 +93,35 @@ test('a failing migration is rolled back completely', { skip: false }, async (t)
     assert.equal(s.currentVersion, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+    await tdb.drop();
+  }
+});
+
+test('0007 keeps every existing device, token, memory and log untouched', async (t) => {
+  const tdb = await createTestDb();
+  if (!tdb) return t.skip(SKIP_NO_PG);
+  try {
+    const all = loadMigrations(repoMigrations);
+    await migrateUp(tdb.db, all.filter((m) => m.version <= 6));
+    const dev = await tdb.db.query(
+      "INSERT INTO devices (name, token_hash, install_id, registered_via) VALUES ('Old PC', 'aaaa', 'install-old-device-0001', 'auto') RETURNING id",
+    );
+    const id = dev.rows[0].id;
+    await tdb.db.query(
+      "INSERT INTO memory_entries (device_id, client_key, scope, kind, content, source, confidence, client_updated_at) VALUES ($1, 'kkkkkkkkkkkkkkkkkk', 'global', 'fact', 'old memory', 'user', 1, 1)",
+      [id],
+    );
+    await tdb.db.query("INSERT INTO request_logs (device_id, model_name, provider_name, status, http_status, latency_ms) VALUES ($1, 'm', 'p', 'ok', 200, 5)", [id]);
+    const before = (await tdb.db.query('SELECT * FROM devices WHERE id = $1', [id])).rows[0];
+    assert.deepEqual(await migrateUp(tdb.db, all), ['0007_accounts.sql']);
+    const after = (await tdb.db.query('SELECT * FROM devices WHERE id = $1', [id])).rows[0];
+    for (const k of Object.keys(before)) assert.deepEqual(after[k], before[k], k);
+    assert.equal(after.user_id, null);
+    assert.equal(after.token_expires_at, null, 'legacy tokens do not get an expiry');
+    assert.equal((await tdb.db.query('SELECT count(*)::int AS n FROM memory_entries WHERE device_id = $1', [id])).rows[0].n, 1);
+    assert.equal((await tdb.db.query('SELECT count(*)::int AS n FROM request_logs WHERE device_id = $1', [id])).rows[0].n, 1);
+    assert.equal((await tdb.db.query("SELECT value FROM settings WHERE key = 'require_login_for_central_ai'")).rows[0].value, false);
+  } finally {
     await tdb.drop();
   }
 });

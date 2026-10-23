@@ -14,6 +14,8 @@ export const CHUNK_BYTES = 4 * 1024 * 1024;
 /** Largest installer accepted. */
 export const MAX_RELEASE_BYTES = 600 * 1024 * 1024;
 const MAX_CHUNKS = Math.ceil(MAX_RELEASE_BYTES / CHUNK_BYTES);
+const CHECKS_PER_HOUR = 60;
+const DOWNLOADS_PER_HOUR = 6;
 const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const FILE_NAME = /^[A-Za-z0-9 ._()+-]{1,200}$/;
@@ -248,7 +250,9 @@ export async function deleteRelease(ctx: Ctx): Promise<void> {
 
 /** GET /v1/updates/check?current=1.2.3: the newest published release when it is newer than `current`. */
 export async function checkForUpdate(ctx: Ctx): Promise<void> {
-  await authenticateDevice(ctx);
+  const device = await authenticateDevice(ctx, { central: false });
+  const rl = await ctx.deps.limits.hit(`updates:check:${device.deviceId}`, CHECKS_PER_HOUR, 3600);
+  if (!rl.allowed) fail(429, 'rate_limited', 'too many update checks; try again later', { 'retry-after': String(rl.retryAfterSeconds) });
   const current = ctx.url.searchParams.get('current') ?? '';
   if (!VERSION.test(current)) fail(400, 'invalid_request', 'current must be the installed version, for example 1.2.3');
   const { latest, mandatory } = await latestPublished(ctx.deps.db, current);
@@ -273,7 +277,10 @@ export async function checkForUpdate(ctx: Ctx): Promise<void> {
 
 /** GET /v1/updates/:id/download: streams an uploaded, published installer. */
 export async function downloadUpdate(ctx: Ctx): Promise<void> {
-  await authenticateDevice(ctx);
+  const device = await authenticateDevice(ctx, { central: false });
+  // Installers are large: a computer may start only a few downloads an hour, so one token cannot drain the server.
+  const rl = await ctx.deps.limits.hit(`updates:download:${device.deviceId}`, DOWNLOADS_PER_HOUR, 3600);
+  if (!rl.allowed) fail(429, 'rate_limited', 'too many update downloads from this computer; try again later', { 'retry-after': String(rl.retryAfterSeconds) });
   const id = uuidParam(ctx.params.id);
   const r = await getRelease(ctx.deps.db, id);
   if (r.status !== 'published' || !r.upload_complete) fail(404, 'not_found', 'release not found');

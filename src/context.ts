@@ -4,6 +4,7 @@ import type { Config } from './config.ts';
 import type { Db } from './db/pg-wire.ts';
 import type { LimitStore } from './limits.ts';
 import type { Redis } from './redis.ts';
+import type { PocketBase } from './pocketbase.ts';
 
 export interface Deps {
   db: Db;
@@ -14,6 +15,8 @@ export interface Deps {
   redis: Redis | null;
   /** Upstream calls go through this. Tests replace it to pin timeouts or to observe requests. */
   fetch: typeof fetch;
+  /** PocketBase client for Devora accounts, or null when accounts are not configured. */
+  pocketbase: PocketBase | null;
 }
 
 export interface Ctx {
@@ -41,4 +44,10 @@ export interface DeviceAuth {
   name: string;
   /** 'all' = every enabled model; 'selected' = only the models granted to this device. */
   modelAccess: 'all' | 'selected';
+  /** The PocketBase user this device is signed in as, or null for a legacy / signed-out device. */
+  userId: string | null;
+  /** sha256 of the presented token (for rotation). */
+  tokenHash: string;
+  /** Expiry of a signed-in token; null for legacy tokens (no expiry). */
+  tokenExpiresAt: string | null;
 }

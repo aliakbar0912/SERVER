@@ -7,6 +7,8 @@
 //   node dist/cli.mjs healthcheck
 //   node dist/cli.mjs create-database   (creates DATABASE_NAME on the server if it does not exist)
 //   node dist/cli.mjs redis-check       (connects with REDIS_URL, reports whether a password is needed and accepted)
+import { PocketBase } from './pocketbase.ts';
+import { accountMaintenance } from './modules/sessions.ts';
 import http from 'node:http';
 import { createServer } from './app.ts';
 import { hashPassword } from './crypto.ts';
@@ -71,7 +73,9 @@ async function serve(): Promise<void> {
   }
   log('info', 'runtime state store', { store: limits.kind, redis: redis?.target ?? null });
 
-  const server = createServer({ db, config, limits, redis, fetch: globalThis.fetch });
+  // One PocketBase client for the HTTP server and the background jobs (it caches the superuser sign-in).
+  const pocketbase = config.pocketbase ? new PocketBase(config.pocketbase, globalThis.fetch) : null;
+  const server = createServer({ db, config, limits, redis, fetch: globalThis.fetch, pocketbase });
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
   log('info', 'devora backend listening', { port: config.port, env: config.env, schemaVersion: status.currentVersion });
 
@@ -98,7 +102,12 @@ async function serve(): Promise<void> {
   countersTimer.unref();
 
   // Refreshes provider model lists in the background. New models arrive disabled; nothing is exposed automatically.
-  const deps = { db, config, limits, redis, fetch: globalThis.fetch };
+  const deps = { db, config, limits, redis, fetch: globalThis.fetch, pocketbase };
+  // Finishes interrupted account deletions and clears expired browser sign-ins.
+  const accountJob = () => limits.withLock('account-maintenance', 5 * 60_000, () => accountMaintenance(deps)).catch((e) => log('error', 'account maintenance failed', { error: e instanceof Error ? e.name : 'unknown' }));
+  const accountTimer = setInterval(accountJob, 10 * 60_000);
+  accountTimer.unref();
+  setTimeout(accountJob, 30_000).unref();
   const discover = () => scheduledDiscovery(deps).catch((e) => log('error', 'scheduled discovery failed', { error: e instanceof Error ? e.name : 'unknown' }));
   let discoveryTimer: NodeJS.Timeout | null = null;
   let firstDiscovery: NodeJS.Timeout | null = null;
@@ -113,6 +122,7 @@ async function serve(): Promise<void> {
     log('info', 'shutting down', { signal });
     clearInterval(timer);
     clearInterval(countersTimer);
+    clearInterval(accountTimer);
     if (discoveryTimer) clearInterval(discoveryTimer);
     if (firstDiscovery) clearTimeout(firstDiscovery);
     const closed = new Promise<void>((r) => server.close(() => r()));

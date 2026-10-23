@@ -5,7 +5,7 @@ import http2 from "node:http";
 
 // src/app.ts
 import http from "node:http";
-import crypto5 from "node:crypto";
+import crypto6 from "node:crypto";
 
 // src/http/util.ts
 var HttpError = class extends Error {
@@ -729,15 +729,6 @@ function randomToken(bytes = 32) {
 function sha256Hex(value) {
   return crypto3.createHash("sha256").update(value, "utf8").digest("hex");
 }
-var CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-function enrollmentCode() {
-  let out = "";
-  for (let i = 0; i < 16; i++) out += CODE_ALPHABET[crypto3.randomInt(CODE_ALPHABET.length)];
-  return out.match(/.{4}/g).join("-");
-}
-function normalizeEnrollmentCode(input) {
-  return input.toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
 function parseKeyring(spec, active) {
   const keys = /* @__PURE__ */ new Map();
   for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
@@ -1437,95 +1428,64 @@ async function deviceUsageRoute(ctx) {
 }
 
 // src/modules/devices.ts
-var CODE_MINUTES = 15;
-var MAX_OUTSTANDING_CODES = 20;
-var ENROLL_PER_IP = 10;
-var ENROLL_WINDOW_SECONDS = 15 * 60;
+var REGISTER_PER_IP = 10;
+var REGISTER_WINDOW_SECONDS = 15 * 60;
 var DEVICE_TOUCH_SECONDS = 60;
-async function createEnrollmentCode(ctx) {
-  const s = await guardOwner(ctx, { write: true, sensitive: true });
-  const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ["label"]);
-  const label = str(body, "label", { max: 80, optional: true }) ?? "";
-  const { rows: outstanding } = await ctx.deps.db.query("SELECT count(*)::int AS n FROM enrollment_codes WHERE used_at IS NULL AND expires_at > now()");
-  if (outstanding[0].n >= MAX_OUTSTANDING_CODES) fail(409, "too_many_codes", "too many enrollment codes are waiting; let them expire or use one first");
-  const code = enrollmentCode();
-  const { rows } = await ctx.deps.db.query(
-    `INSERT INTO enrollment_codes (code_hash, label, created_by, expires_at)
-     VALUES ($1, $2, $3, now() + make_interval(mins => $4))
-     RETURNING expires_at`,
-    [sha256Hex(normalizeEnrollmentCode(code)), label, s.ownerId, CODE_MINUTES]
-  );
-  sendJson(ctx.res, 201, { code, label, expiresAt: new Date(rows[0].expires_at).toISOString() });
-}
-async function listEnrollmentCodes(ctx) {
-  await guardOwner(ctx, { write: false });
-  const { rows } = await ctx.deps.db.query(
-    `SELECT id, label, created_at, expires_at, used_at, device_id,
-            (used_at IS NULL AND expires_at > now()) AS usable
-       FROM enrollment_codes ORDER BY created_at DESC LIMIT 100`
-  );
-  sendJson(ctx.res, 200, {
-    codes: rows.map((r) => ({
-      id: r.id,
-      label: r.label,
-      createdAt: r.created_at,
-      expiresAt: r.expires_at,
-      usedAt: r.used_at,
-      deviceId: r.device_id,
-      status: r.used_at ? "used" : r.usable ? "waiting" : "expired"
-    }))
-  });
-}
-async function enrollDevice(ctx) {
+var INSTALL_ID = /^[A-Za-z0-9_-]{16,64}$/;
+async function registerDevice(ctx) {
   const { db, config } = ctx.deps;
   const ip = clientAddress(ctx.req, config.trustProxy);
-  const limit = await ctx.deps.limits.hit(`enroll:ip:${ip}`, ENROLL_PER_IP, ENROLL_WINDOW_SECONDS);
-  if (!limit.allowed) fail(429, "rate_limited", "too many enrollment attempts; try again later", { "retry-after": String(limit.retryAfterSeconds) });
+  const limit = await ctx.deps.limits.hit(`register:ip:${ip}`, REGISTER_PER_IP, REGISTER_WINDOW_SECONDS);
+  if (!limit.allowed) fail(429, "rate_limited", "too many registrations from this network; try again later", { "retry-after": String(limit.retryAfterSeconds) });
   const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ["code", "deviceName"]);
-  const code = str(body, "code", { min: 16, max: 40 });
+  rejectUnknown(body, ["installId", "deviceName"]);
+  const installId = str(body, "installId", { min: 16, max: 64 });
+  if (!INSTALL_ID.test(installId)) fail(400, "invalid_request", "installId must be 16 to 64 letters, digits, _ or -");
   const deviceName = str(body, "deviceName", { min: 1, max: 80 });
-  const invalid = () => fail(400, "invalid_enrollment_code", "the enrollment code is not valid, has expired, or was already used");
   const token = randomToken(32);
   const result = await db.transaction(async (q) => {
-    const { rows } = await q.query(
-      `SELECT id FROM enrollment_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now() FOR UPDATE`,
-      [sha256Hex(normalizeEnrollmentCode(code))]
-    );
-    if (!rows[0]) return null;
+    const { rows } = await q.query("SELECT id, status FROM devices WHERE install_id = $1 FOR UPDATE", [installId]);
+    const existing = rows[0];
+    if (existing) {
+      if (existing.status !== "active") return { blocked: true };
+      await q.query("UPDATE devices SET token_hash = $2, name = $3, last_seen_at = now() WHERE id = $1", [existing.id, sha256Hex(token), deviceName]);
+      return { id: existing.id, created: false };
+    }
+    const settings = await readSettings(q);
+    if (settings.allow_auto_registration === false) return { closed: true };
     const dev = await q.query(
-      `INSERT INTO devices (name, token_hash, created_by, last_seen_at)
-       SELECT $1, $2, created_by, now() FROM enrollment_codes WHERE id = $3
-       RETURNING id`,
-      [deviceName, sha256Hex(token), rows[0].id]
+      `INSERT INTO devices (name, token_hash, install_id, registered_via, last_seen_at) VALUES ($1, $2, $3, 'auto', now()) RETURNING id`,
+      [deviceName, sha256Hex(token), installId]
     );
-    await q.query("UPDATE enrollment_codes SET used_at = now(), device_id = $2 WHERE id = $1", [rows[0].id, dev.rows[0].id]);
-    return dev.rows[0].id;
+    return { id: dev.rows[0].id, created: true };
   });
-  if (!result) invalid();
-  await ctx.deps.limits.clear(`enroll:ip:${ip}`);
-  sendJson(ctx.res, 201, { deviceId: result, token, catalogueVersion: await catalogueVersion(db) });
+  if ("blocked" in result) fail(403, "device_blocked", "the owner has blocked this computer");
+  if ("closed" in result) fail(403, "registration_closed", "the owner is not accepting new computers right now");
+  sendJson(ctx.res, result.created ? 201 : 200, { deviceId: result.id, token, catalogueVersion: await catalogueVersion(db) });
 }
 async function authenticateDevice(ctx) {
   const header = ctx.req.headers.authorization ?? "";
   const match2 = /^Bearer\s+([A-Za-z0-9_-]{20,128})$/.exec(header);
   if (!match2) fail(401, "unauthenticated", "a device token is required");
   const { rows } = await ctx.deps.db.query(
-    `SELECT id, name, status, model_access, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
+    `SELECT id, name, status, model_access, app_version, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
        FROM devices WHERE token_hash = $1`,
     [sha256Hex(match2[1]), DEVICE_TOUCH_SECONDS]
   );
   const row = rows[0];
-  if (!row || row.status !== "active") fail(401, "device_revoked", "this device is not allowed to use the service; sign in to the desktop app again after the owner re-enrolls it");
-  if (row.touch) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now() WHERE id = $1", [row.id]);
+  if (!row || row.status !== "active") fail(401, "device_revoked", "this device is not allowed to use the service");
+  const reported = String(ctx.req.headers["x-devora-version"] ?? "");
+  const version2 = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]{1,30})?$/.test(reported) ? reported : null;
+  if (version2 && version2 !== row.app_version) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now(), app_version = $2 WHERE id = $1", [row.id, version2]);
+  else if (row.touch) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now() WHERE id = $1", [row.id]);
   return { deviceId: row.id, name: row.name, modelAccess: row.model_access };
 }
 async function listDevices(ctx) {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query(
-    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access,
-            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted
+    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via, d.app_version,
+            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted,
+            (SELECT count(*)::int FROM memory_entries me WHERE me.device_id = d.id AND me.deleted = false) AS memories
        FROM devices d ORDER BY d.created_at DESC LIMIT 500`
   );
   sendJson(ctx.res, 200, {
@@ -1537,7 +1497,10 @@ async function listDevices(ctx) {
       lastSeenAt: r.last_seen_at,
       revokedAt: r.revoked_at,
       modelAccess: r.model_access,
-      grantedModels: r.granted
+      registeredVia: r.registered_via,
+      grantedModels: r.granted,
+      memories: r.memories,
+      appVersion: r.app_version ?? null
     }))
   });
 }
@@ -1549,10 +1512,19 @@ async function revokeDevice(ctx) {
   const confirm = str(body, "confirmName", { max: 80, optional: true });
   const { rows } = await ctx.deps.db.query("SELECT name, status FROM devices WHERE id = $1", [id]);
   if (!rows[0]) fail(404, "not_found", "device not found");
-  if (confirm !== rows[0].name) fail(400, "confirmation_mismatch", "type the device name exactly to revoke it");
-  if (rows[0].status === "revoked") fail(409, "already_revoked", "this device is already revoked");
+  if (confirm !== rows[0].name) fail(400, "confirmation_mismatch", "type the device name exactly to block it");
+  if (rows[0].status === "revoked") fail(409, "already_revoked", "this device is already blocked");
   await ctx.deps.db.query("UPDATE devices SET status = 'revoked', revoked_at = now() WHERE id = $1", [id]);
   sendJson(ctx.res, 200, { id, status: "revoked" });
+}
+async function unblockDevice(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (rows[0].status === "active") fail(409, "not_blocked", "this device is not blocked");
+  await ctx.deps.db.query("UPDATE devices SET status = 'active', revoked_at = NULL, token_hash = $2 WHERE id = $1", [id, sha256Hex(randomToken(32))]);
+  sendJson(ctx.res, 200, { id, status: "active" });
 }
 async function getDeviceModels(ctx) {
   await guardOwner(ctx, { write: false });
@@ -2253,6 +2225,232 @@ async function writeLog(deps, r) {
   }
 }
 
+// src/modules/memory.ts
+var SYNC_PER_DEVICE = 40;
+var SYNC_WINDOW_SECONDS = 5 * 60;
+var MAX_CHANGES = 200;
+var MAX_PULL = 800;
+var BODY_LIMIT2 = 512 * 1024;
+var KINDS = /* @__PURE__ */ new Set(["fact", "preference", "lesson", "decision"]);
+var SOURCES = /* @__PURE__ */ new Set(["user", "agent", "system"]);
+var CLIENT_KEY = /^[A-Za-z0-9_-]{16,128}$/;
+var SECRET_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk|ghp|xox[baprs])-?[A-Za-z0-9_-]{16,}|\bAKIA[0-9A-Z]{16}\b|\b(?:api[_-]?key|secret|token|password|passwd|bearer)\b\s*[:=]\s*\S{12,}/i;
+var SECRET_SKIP = /(your[_-]|example|placeholder|changeme|xxxx|\$\{|process\.env|os\.environ|getenv|<[^>]+>)/i;
+function parseChange(raw, index) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) fail(400, "invalid_request", `changes[${index}] must be an object`);
+  const c = requireObject(raw, `changes[${index}]`);
+  rejectUnknown(c, ["clientKey", "scope", "projectKey", "kind", "content", "tags", "source", "confidence", "verified", "pinned", "hits", "deleted", "updatedAt"]);
+  const clientKey = str(c, "clientKey", { min: 16, max: 128, pattern: CLIENT_KEY });
+  if (!clientKey) fail(400, "invalid_request", `changes[${index}].clientKey is required`);
+  const scope = str(c, "scope", { min: 6, max: 7 });
+  if (scope !== "global" && scope !== "project") fail(400, "invalid_request", `changes[${index}].scope must be global or project`);
+  const projectKey = str(c, "projectKey", { max: 120 }) ?? "";
+  if (scope === "global" && projectKey) fail(400, "invalid_request", `changes[${index}].projectKey must be empty for global memories`);
+  if (scope === "project" && !projectKey) fail(400, "invalid_request", `changes[${index}].projectKey is required for project memories`);
+  const kind = str(c, "kind", { min: 4, max: 10 });
+  if (!kind || !KINDS.has(kind)) fail(400, "invalid_request", `changes[${index}].kind must be fact, preference, lesson or decision`);
+  const content = str(c, "content", { min: 4, max: 600 });
+  if (!content) fail(400, "invalid_request", `changes[${index}].content is required`);
+  if (SECRET_RE.test(content) && !SECRET_SKIP.test(content)) {
+    fail(422, "content_refused", `changes[${index}].content looks like a secret; memories never store keys, tokens or passwords`);
+  }
+  const source = str(c, "source", { min: 4, max: 6 }) ?? "agent";
+  if (!SOURCES.has(source)) fail(400, "invalid_request", `changes[${index}].source must be user, agent or system`);
+  const confidenceRaw = c.confidence;
+  if (typeof confidenceRaw !== "number" || !Number.isFinite(confidenceRaw) || confidenceRaw < 0 || confidenceRaw > 1) {
+    fail(400, "invalid_request", `changes[${index}].confidence must be a number from 0 to 1`);
+  }
+  const tagsRaw = c.tags ?? [];
+  if (!Array.isArray(tagsRaw) || tagsRaw.length > 12) fail(400, "invalid_request", `changes[${index}].tags must be an array of at most 12 items`);
+  const tags = tagsRaw.map((t) => String(t).toLowerCase().trim().slice(0, 40)).filter((t) => t.length >= 2);
+  const clientUpdatedAt = int(c, "updatedAt", { min: 0, max: 8999999999999 });
+  if (clientUpdatedAt === void 0) fail(400, "invalid_request", `changes[${index}].updatedAt is required`);
+  return {
+    clientKey,
+    scope,
+    projectKey,
+    kind,
+    content,
+    tags,
+    source,
+    confidence: confidenceRaw,
+    verified: bool(c, "verified", { def: false }) ?? false,
+    pinned: bool(c, "pinned", { def: false }) ?? false,
+    hits: int(c, "hits", { min: 0, max: 1e6, optional: true }) ?? 0,
+    deleted: bool(c, "deleted", { def: false }) ?? false,
+    clientUpdatedAt
+  };
+}
+async function syncMemories(ctx) {
+  const auth = await authenticateDevice(ctx);
+  const limit = await ctx.deps.limits.hit(`memory:sync:${auth.deviceId}`, SYNC_PER_DEVICE, SYNC_WINDOW_SECONDS);
+  if (!limit.allowed) fail(429, "rate_limited", "too many memory syncs; try again shortly", { "retry-after": String(limit.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, BODY_LIMIT2));
+  rejectUnknown(body, ["changes", "since"]);
+  const rawChanges = body.changes ?? [];
+  if (!Array.isArray(rawChanges)) fail(400, "invalid_request", "changes must be an array");
+  if (rawChanges.length > MAX_CHANGES) fail(413, "payload_too_large", `at most ${MAX_CHANGES} memories per sync`);
+  const changes = rawChanges.map(parseChange);
+  const since = int(body, "since", { min: 0, max: 8999999999999, optional: true }) ?? 0;
+  const applied = await pushChanges(ctx, auth.deviceId, changes);
+  const pull = await pullChanges(ctx, auth.deviceId, since);
+  sendJson(ctx.res, 200, { ...pull, applied });
+}
+async function pushChanges(ctx, deviceId, changes) {
+  let applied = 0;
+  for (const ch of changes) {
+    const { rows } = await ctx.deps.db.query(
+      `INSERT INTO memory_entries
+         (device_id, client_key, scope, project_key, kind, content, tags, source, confidence, verified, pinned, hits, deleted, client_updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (device_id, client_key) DO UPDATE SET
+         scope = EXCLUDED.scope,
+         project_key = EXCLUDED.project_key,
+         kind = EXCLUDED.kind,
+         content = EXCLUDED.content,
+         tags = EXCLUDED.tags,
+         source = EXCLUDED.source,
+         confidence = EXCLUDED.confidence,
+         verified = EXCLUDED.verified,
+         pinned = EXCLUDED.pinned,
+         hits = EXCLUDED.hits,
+         deleted = EXCLUDED.deleted,
+         client_updated_at = EXCLUDED.client_updated_at,
+         updated_at = now()
+       WHERE memory_entries.client_updated_at <= EXCLUDED.client_updated_at
+       RETURNING id`,
+      [
+        deviceId,
+        ch.clientKey,
+        ch.scope,
+        ch.projectKey,
+        ch.kind,
+        ch.content,
+        JSON.stringify(ch.tags),
+        ch.source,
+        ch.confidence,
+        ch.verified,
+        ch.pinned,
+        ch.hits,
+        ch.deleted,
+        ch.clientUpdatedAt
+      ]
+    );
+    applied += rows.length;
+  }
+  return applied;
+}
+async function pullChanges(ctx, deviceId, since) {
+  const { rows } = await ctx.deps.db.query(
+    `SELECT client_key, scope, project_key, kind, content, tags, source, confidence, verified, pinned, hits, deleted,
+            extract(epoch from updated_at) * 1000 AS updated_ms
+       FROM memory_entries
+      WHERE device_id = $1 AND updated_at > to_timestamp($2 / 1000.0)
+      ORDER BY updated_at ASC
+      LIMIT $3`,
+    [deviceId, since, MAX_PULL + 1]
+  );
+  const truncated = rows.length > MAX_PULL;
+  const kept = truncated ? rows.slice(0, MAX_PULL) : rows;
+  const entries = kept.map((r) => ({
+    clientKey: r.client_key,
+    scope: r.scope,
+    projectKey: r.project_key,
+    kind: r.kind,
+    content: r.content,
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    source: r.source,
+    confidence: Number(r.confidence),
+    verified: r.verified === true,
+    pinned: r.pinned === true,
+    hits: Number(r.hits) || 0,
+    deleted: r.deleted === true,
+    updatedAt: Math.round(Number(r.updated_ms))
+  }));
+  const serverTime = truncated && entries.length ? entries[entries.length - 1].updatedAt : Date.now();
+  return { serverTime, truncated, entries };
+}
+var ADMIN_LIMIT = 500;
+function memoryFilter(ctx) {
+  const sp = ctx.url.searchParams;
+  const where = [];
+  const params = [];
+  const q = (sp.get("q") ?? "").trim().slice(0, 120);
+  if (q) {
+    params.push(`%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
+    where.push(`m.content ILIKE $${params.length}`);
+  }
+  const scope = sp.get("scope") ?? "";
+  if (scope === "global" || scope === "project") {
+    params.push(scope);
+    where.push(`m.scope = $${params.length}`);
+  }
+  const kind = sp.get("kind") ?? "";
+  if (["fact", "preference", "lesson", "decision"].includes(kind)) {
+    params.push(kind);
+    where.push(`m.kind = $${params.length}`);
+  }
+  const deviceId = sp.get("deviceId") ?? "";
+  if (UUID.test(deviceId)) {
+    params.push(deviceId);
+    where.push(`m.device_id = $${params.length}`);
+  }
+  return { where: where.length ? `WHERE ${where.join(" AND ")}` : "", params };
+}
+async function adminListMemory(ctx) {
+  await guardOwner(ctx, { write: false });
+  const limitRaw = Number(ctx.url.searchParams.get("limit") ?? 100);
+  const limit = Number.isInteger(limitRaw) && limitRaw >= 1 && limitRaw <= ADMIN_LIMIT ? limitRaw : 100;
+  const offsetRaw = Number(ctx.url.searchParams.get("offset") ?? 0);
+  const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 && offsetRaw <= 1e6 ? offsetRaw : 0;
+  const f = memoryFilter(ctx);
+  const { rows: counted } = await ctx.deps.db.query(
+    `SELECT count(*)::int AS total, count(*) FILTER (WHERE m.deleted = false)::int AS active FROM memory_entries m ${f.where}`,
+    f.params
+  );
+  const listParams = [...f.params, limit, offset];
+  const { rows } = await ctx.deps.db.query(
+    `SELECT m.id, m.device_id, m.scope, m.project_key, m.kind, m.content, m.tags, m.source, m.confidence,
+            m.verified, m.pinned, m.hits, m.deleted, m.created_at, m.updated_at, d.name AS device_name
+       FROM memory_entries m LEFT JOIN devices d ON d.id = m.device_id
+       ${f.where} ORDER BY m.updated_at DESC LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+    listParams
+  );
+  sendJson(ctx.res, 200, {
+    total: counted[0]?.total ?? 0,
+    active: counted[0]?.active ?? 0,
+    memories: rows.map((r) => ({
+      id: r.id,
+      deviceId: r.device_id,
+      deviceName: r.device_name ?? null,
+      scope: r.scope,
+      projectKey: r.project_key,
+      kind: r.kind,
+      content: r.content,
+      tags: Array.isArray(r.tags) ? r.tags : [],
+      source: r.source,
+      confidence: Number(r.confidence),
+      verified: r.verified === true,
+      pinned: r.pinned === true,
+      hits: Number(r.hits) || 0,
+      deleted: r.deleted === true,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at
+    }))
+  });
+}
+async function clearMemories(ctx, deviceId) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const { rows } = deviceId ? await ctx.deps.db.query("WITH gone AS (DELETE FROM memory_entries WHERE device_id = $1 RETURNING 1) SELECT count(*)::int AS n FROM gone", [deviceId]) : await ctx.deps.db.query("WITH gone AS (DELETE FROM memory_entries RETURNING 1) SELECT count(*)::int AS n FROM gone");
+  sendJson(ctx.res, 200, { cleared: rows[0]?.n ?? 0 });
+}
+async function adminClearDeviceMemory(ctx) {
+  await clearMemories(ctx, uuidParam(ctx.params.id));
+}
+async function adminClearAllMemory(ctx) {
+  await clearMemories(ctx, null);
+}
+
 // src/modules/admin-data.ts
 async function overview(ctx) {
   await guardOwner(ctx, { write: false });
@@ -2380,14 +2578,16 @@ async function currentSettings(db) {
     rateLimitPerMinute: Number(s.rate_limit_per_minute ?? 60),
     maxConcurrentPerDevice: Number(s.max_concurrent_per_device ?? 2),
     maxOutputTokens: Number(s.max_output_tokens ?? 8192),
-    allowDirectProvider: s.allow_direct_provider === true
+    allowDirectProvider: s.allow_direct_provider === true,
+    allowAutoRegistration: s.allow_auto_registration !== false
   };
 }
 var SETTING_KEYS = {
   rateLimitPerMinute: "rate_limit_per_minute",
   maxConcurrentPerDevice: "max_concurrent_per_device",
   maxOutputTokens: "max_output_tokens",
-  allowDirectProvider: "allow_direct_provider"
+  allowDirectProvider: "allow_direct_provider",
+  allowAutoRegistration: "allow_auto_registration"
 };
 async function patchSettings(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -2405,10 +2605,15 @@ async function patchSettings(ctx) {
     requireReauth(session);
     changes.push(["allow_direct_provider", direct]);
   }
+  const autoReg = bool(body, "allowAutoRegistration", { optional: true });
+  if (autoReg !== void 0) changes.push(["allow_auto_registration", autoReg]);
   if (changes.length === 0) fail(400, "invalid_request", "no settings were given");
   await ctx.deps.db.transaction(async (q) => {
     for (const [k, v] of changes) {
-      await q.query("UPDATE settings SET value = $2, updated_at = now() WHERE key = $1", [k, JSON.stringify(v)]);
+      await q.query(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        [k, JSON.stringify(v)]
+      );
     }
     if (changes.some(([k]) => k === "max_output_tokens" || k === "allow_direct_provider")) await bumpCatalogue(q);
   });
@@ -2477,18 +2682,265 @@ async function adminHealth(ctx) {
   });
 }
 
+// src/modules/releases.ts
+import crypto5 from "node:crypto";
+var CHUNK_BYTES = 4 * 1024 * 1024;
+var MAX_RELEASE_BYTES = 600 * 1024 * 1024;
+var MAX_CHUNKS = Math.ceil(MAX_RELEASE_BYTES / CHUNK_BYTES);
+var VERSION = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/;
+var SHA256 = /^[0-9a-f]{64}$/;
+var FILE_NAME = /^[A-Za-z0-9 ._()+-]{1,200}$/;
+function compareVersions(a, b) {
+  const parse = (v) => {
+    const [core, pre = ""] = v.split(/[-+]/, 2);
+    return { nums: core.split(".").map((n) => Number(n) || 0), pre: v.includes("-") ? pre : "" };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < 3; i++) if ((x.nums[i] ?? 0) !== (y.nums[i] ?? 0)) return (x.nums[i] ?? 0) < (y.nums[i] ?? 0) ? -1 : 1;
+  if (x.pre === y.pre) return 0;
+  if (!x.pre) return 1;
+  if (!y.pre) return -1;
+  return x.pre < y.pre ? -1 : 1;
+}
+function view(r) {
+  return {
+    id: r.id,
+    version: r.version,
+    notes: r.notes,
+    mandatory: r.mandatory,
+    status: r.status,
+    source: r.source,
+    externalUrl: r.external_url,
+    fileName: r.file_name,
+    fileSize: Number(r.file_size),
+    sha256: r.sha256,
+    uploadComplete: r.upload_complete,
+    uploadedBytes: Number(r.uploaded_bytes ?? 0),
+    downloads: r.downloads,
+    createdAt: r.created_at,
+    publishedAt: r.published_at
+  };
+}
+var SELECT = `SELECT r.*, coalesce((SELECT sum(length(c.data)) FROM desktop_release_chunks c WHERE c.release_id = r.id), 0)::bigint AS uploaded_bytes
+                  FROM desktop_releases r`;
+async function getRelease(q, id) {
+  const { rows } = await q.query(`${SELECT} WHERE r.id = $1`, [id]);
+  if (!rows[0]) fail(404, "not_found", "release not found");
+  return rows[0];
+}
+async function latestPublished(q, current) {
+  const { rows } = await q.query("SELECT * FROM desktop_releases WHERE status = 'published' AND upload_complete");
+  const list = rows.sort((a, b) => compareVersions(b.version, a.version));
+  const latest = list[0] ?? null;
+  const mandatoryList = list.filter((r) => r.mandatory);
+  const minVersion = mandatoryList[0]?.version ?? null;
+  const mandatory = !!current && mandatoryList.some((r) => compareVersions(r.version, current) > 0);
+  return { latest, mandatory, minVersion };
+}
+async function listReleases(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(`${SELECT} ORDER BY r.created_at DESC LIMIT 200`);
+  const adoption = await ctx.deps.db.query(
+    `SELECT coalesce(app_version, 'unknown') AS version, count(*)::int AS devices
+       FROM devices WHERE status = 'active' GROUP BY 1 ORDER BY 2 DESC LIMIT 50`
+  );
+  const list = rows.map(view).sort((a, b) => compareVersions(b.version, a.version));
+  sendJson(ctx.res, 200, {
+    releases: list,
+    adoption: adoption.rows,
+    chunkBytes: CHUNK_BYTES,
+    maxBytes: MAX_RELEASE_BYTES
+  });
+}
+async function createRelease(ctx) {
+  await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 32 * 1024));
+  rejectUnknown(body, ["version", "notes", "mandatory", "externalUrl", "sha256", "fileName", "fileSize"]);
+  const version2 = str(body, "version", { min: 5, max: 40, pattern: VERSION });
+  const notes = str(body, "notes", { max: 1e4, optional: true }) ?? "";
+  const mandatory = bool(body, "mandatory", { def: false });
+  const externalUrl = str(body, "externalUrl", { max: 2e3, optional: true }) || null;
+  let sha256 = (str(body, "sha256", { max: 64, optional: true }) || "").toLowerCase() || null;
+  const fileName = str(body, "fileName", { max: 200, optional: true }) || `Devora-Setup-${version2}.exe`;
+  if (!FILE_NAME.test(fileName)) fail(400, "invalid_request", "fileName may contain letters, digits, spaces and . _ ( ) + -");
+  const fileSize = typeof body.fileSize === "number" && Number.isInteger(body.fileSize) && body.fileSize > 0 ? body.fileSize : 0;
+  if (fileSize > MAX_RELEASE_BYTES) fail(413, "payload_too_large", `the installer may be at most ${MAX_RELEASE_BYTES / 1024 / 1024} MB`);
+  if (externalUrl) {
+    let u;
+    try {
+      u = new URL(externalUrl);
+    } catch {
+      fail(400, "invalid_request", "externalUrl is not a URL");
+    }
+    if (u.protocol !== "https:" || u.username || u.password) fail(400, "invalid_request", "externalUrl must be an https address without credentials");
+    if (!sha256 || !SHA256.test(sha256)) fail(400, "invalid_request", "give the SHA-256 of the installer at externalUrl, so desktops can verify the download");
+  } else sha256 = null;
+  try {
+    const { rows } = await ctx.deps.db.query(
+      `INSERT INTO desktop_releases (version, notes, mandatory, source, external_url, sha256, file_name, file_size, upload_complete)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [version2, notes, mandatory, externalUrl ? "url" : "upload", externalUrl, sha256, fileName, fileSize, !!externalUrl]
+    );
+    sendJson(ctx.res, 201, { release: view(await getRelease(ctx.deps.db, rows[0].id)), chunkBytes: CHUNK_BYTES });
+  } catch (e) {
+    if (/duplicate key|unique/i.test(e.message)) fail(409, "version_exists", `version ${version2} already exists`);
+    throw e;
+  }
+}
+async function uploadChunk(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const seq = Number(ctx.params.seq);
+  if (!Number.isInteger(seq) || seq < 0 || seq >= MAX_CHUNKS) fail(400, "invalid_request", "chunk number is out of range");
+  const r = await getRelease(ctx.deps.db, id);
+  if (r.source !== "upload") fail(409, "not_upload", "this release downloads from an external address");
+  if (r.status === "published" || r.upload_complete) fail(409, "upload_closed", "the upload of this release is finished; create a new version to change the installer");
+  const declared = Number(ctx.req.headers["content-length"] ?? 0);
+  if (declared > CHUNK_BYTES) fail(413, "payload_too_large", `each piece may be at most ${CHUNK_BYTES} bytes`);
+  const parts = [];
+  let size = 0;
+  for await (const c of ctx.req) {
+    size += c.length;
+    if (size > CHUNK_BYTES) {
+      ctx.req.destroy();
+      fail(413, "payload_too_large", `each piece may be at most ${CHUNK_BYTES} bytes`);
+    }
+    parts.push(c);
+  }
+  if (!size) fail(400, "invalid_request", "the piece is empty");
+  await ctx.deps.db.query(
+    `INSERT INTO desktop_release_chunks (release_id, seq, data) VALUES ($1, $2, $3)
+     ON CONFLICT (release_id, seq) DO UPDATE SET data = EXCLUDED.data`,
+    [id, seq, Buffer.concat(parts)]
+  );
+  sendJson(ctx.res, 200, { seq, bytes: size });
+}
+async function completeUpload(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["sha256"]);
+  const expected = (str(body, "sha256", { max: 64, optional: true }) || "").toLowerCase();
+  const r = await getRelease(ctx.deps.db, id);
+  if (r.source !== "upload") fail(409, "not_upload", "this release downloads from an external address");
+  const { rows } = await ctx.deps.db.query("SELECT seq, length(data)::int AS n FROM desktop_release_chunks WHERE release_id = $1 ORDER BY seq", [id]);
+  if (!rows.length) fail(400, "upload_incomplete", "no installer was uploaded");
+  rows.forEach((c, i) => {
+    if (c.seq !== i) fail(400, "upload_incomplete", `piece ${i} is missing; upload it again`);
+  });
+  const hash = crypto5.createHash("sha256");
+  let total = 0;
+  for (const c of rows) {
+    const part = await ctx.deps.db.query("SELECT data FROM desktop_release_chunks WHERE release_id = $1 AND seq = $2", [id, c.seq]);
+    const buf = part.rows[0].data;
+    total += buf.length;
+    hash.update(buf);
+  }
+  const sha256 = hash.digest("hex");
+  if (expected && expected !== sha256) fail(400, "checksum_mismatch", "the uploaded installer does not match the file you chose; upload it again");
+  if (total > MAX_RELEASE_BYTES) fail(413, "payload_too_large", "the installer is too large");
+  const head = await ctx.deps.db.query("SELECT substring(data from 1 for 2) AS h FROM desktop_release_chunks WHERE release_id = $1 AND seq = 0", [id]);
+  const magic = head.rows[0]?.h?.toString("latin1") ?? "";
+  if (magic !== "MZ") fail(400, "not_an_installer", "this file is not a Windows installer (.exe)");
+  await ctx.deps.db.query("UPDATE desktop_releases SET sha256 = $2, file_size = $3, upload_complete = true WHERE id = $1", [id, sha256, total]);
+  sendJson(ctx.res, 200, { release: view(await getRelease(ctx.deps.db, id)) });
+}
+async function updateRelease(ctx) {
+  const session = await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 32 * 1024));
+  rejectUnknown(body, ["notes", "mandatory", "status"]);
+  const r = await getRelease(ctx.deps.db, id);
+  const notes = str(body, "notes", { max: 1e4, optional: true });
+  const mandatory = bool(body, "mandatory", { optional: true });
+  const status = str(body, "status", { max: 20, optional: true, pattern: /^(draft|published)$/ });
+  if (status === "published" && r.status !== "published") {
+    if (!r.upload_complete || !r.sha256) fail(409, "upload_incomplete", "upload the installer before publishing");
+    requireReauth(session);
+  }
+  if (mandatory === true && !r.mandatory && (status ?? r.status) === "published") requireReauth(session);
+  await ctx.deps.db.query(
+    `UPDATE desktop_releases SET notes = coalesce($2, notes), mandatory = coalesce($3, mandatory), status = coalesce($4, status),
+            published_at = CASE WHEN $4 = 'published' AND status <> 'published' THEN now() WHEN $4 = 'draft' THEN NULL ELSE published_at END
+      WHERE id = $1`,
+    [id, notes ?? null, mandatory ?? null, status ?? null]
+  );
+  forgetPublishedVersions();
+  sendJson(ctx.res, 200, { release: view(await getRelease(ctx.deps.db, id)) });
+}
+async function deleteRelease(ctx) {
+  const session = await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const r = await getRelease(ctx.deps.db, id);
+  if (r.status === "published") requireReauth(session);
+  await ctx.deps.db.query("DELETE FROM desktop_releases WHERE id = $1", [id]);
+  forgetPublishedVersions();
+  sendJson(ctx.res, 200, { deleted: true });
+}
+async function checkForUpdate(ctx) {
+  await authenticateDevice(ctx);
+  const current = ctx.url.searchParams.get("current") ?? "";
+  if (!VERSION.test(current)) fail(400, "invalid_request", "current must be the installed version, for example 1.2.3");
+  const { latest, mandatory } = await latestPublished(ctx.deps.db, current);
+  if (!latest || compareVersions(latest.version, current) <= 0) {
+    sendJson(ctx.res, 200, { update: null });
+    return;
+  }
+  sendJson(ctx.res, 200, {
+    update: {
+      id: latest.id,
+      version: latest.version,
+      notes: latest.notes,
+      mandatory,
+      fileName: latest.file_name,
+      size: Number(latest.file_size),
+      sha256: latest.sha256,
+      publishedAt: latest.published_at,
+      download: latest.source === "url" ? latest.external_url : `/v1/updates/${latest.id}/download`
+    }
+  });
+}
+async function downloadUpdate(ctx) {
+  await authenticateDevice(ctx);
+  const id = uuidParam(ctx.params.id);
+  const r = await getRelease(ctx.deps.db, id);
+  if (r.status !== "published" || !r.upload_complete) fail(404, "not_found", "release not found");
+  if (r.source !== "upload") fail(409, "external_download", "this release downloads from its external address");
+  const { rows } = await ctx.deps.db.query("SELECT seq FROM desktop_release_chunks WHERE release_id = $1 ORDER BY seq", [id]);
+  await ctx.deps.db.query("UPDATE desktop_releases SET downloads = downloads + 1 WHERE id = $1", [id]);
+  ctx.res.writeHead(200, {
+    "content-type": "application/octet-stream",
+    "content-length": String(Number(r.file_size)),
+    "content-disposition": `attachment; filename="${r.file_name.replace(/"/g, "")}"`,
+    "x-content-sha256": r.sha256 ?? ""
+  });
+  for (const c of rows) {
+    if (ctx.res.destroyed) return;
+    const part = await ctx.deps.db.query("SELECT data FROM desktop_release_chunks WHERE release_id = $1 AND seq = $2", [id, c.seq]);
+    const buf = part.rows[0]?.data;
+    if (!buf) {
+      ctx.res.destroy();
+      return;
+    }
+    if (!ctx.res.write(buf)) await new Promise((resolve) => ctx.res.once("drain", () => resolve()));
+  }
+  ctx.res.end();
+}
+
 // src/modules/client-config.ts
 var CLIENT_CONFIG_SCHEMA = 1;
 var CLIENT_CONFIG_MAX_AGE_SECONDS = 7 * 24 * 3600;
-function clientConfigBody(config) {
+var newest = (a, b) => !a ? b : !b ? a : compareVersions(a, b) >= 0 ? a : b;
+function clientConfigBody(config, published = { latestVersion: null, minVersion: null }) {
   return {
     schema: CLIENT_CONFIG_SCHEMA,
     instanceId: config.instanceId,
     apiOrigin: config.publicApiOrigin,
     apiVersions: ["v1"],
     desktop: {
-      minVersion: config.desktop.minVersion,
-      latestVersion: config.desktop.latestVersion,
+      minVersion: newest(config.desktop.minVersion, published.minVersion),
+      latestVersion: newest(config.desktop.latestVersion, published.latestVersion),
       downloadUrl: config.desktop.downloadUrl
     },
     status: { message: config.desktop.statusMessage },
@@ -2498,7 +2950,21 @@ function clientConfigBody(config) {
 }
 async function clientConfigRoute(ctx) {
   ctx.res.setHeader("cache-control", "public, max-age=300");
-  sendJson(ctx.res, 200, clientConfigBody(ctx.deps.config));
+  sendJson(ctx.res, 200, clientConfigBody(ctx.deps.config, await publishedVersions(ctx.deps.db)));
+}
+var cache = null;
+async function publishedVersions(db) {
+  if (cache && Date.now() - cache.at < 3e4) return cache.value;
+  try {
+    const p = await latestPublished(db);
+    cache = { at: Date.now(), value: { latestVersion: p.latest?.version ?? null, minVersion: p.minVersion } };
+  } catch {
+    return cache?.value ?? { latestVersion: null, minVersion: null };
+  }
+  return cache.value;
+}
+function forgetPublishedVersions() {
+  cache = null;
 }
 
 // src/app.ts
@@ -2507,13 +2973,16 @@ var routes = [
   R("GET", "/healthz", async (ctx) => sendJson(ctx.res, 200, { status: "ok" })),
   R("GET", "/readyz", readiness),
   R("GET", "/v1/client-config", clientConfigRoute),
-  R("POST", "/v1/devices/enroll", enrollDevice),
+  R("POST", "/v1/devices/register", registerDevice),
   R("GET", "/v1/device", deviceRoute),
   R("GET", "/v1/catalogue", catalogueRoute),
   R("GET", "/v1/catalogue/status", catalogueStatusRoute),
   R("GET", "/v1/models/:id", modelRoute),
   R("GET", "/v1/usage", deviceUsageRoute),
   R("POST", "/v1/chat/completions", chatCompletions),
+  R("POST", "/v1/memory/sync", syncMemories),
+  R("GET", "/v1/updates/check", checkForUpdate),
+  R("GET", "/v1/updates/:id/download", downloadUpdate),
   R("POST", "/admin/api/auth/login", login),
   R("GET", "/admin/api/auth/session", sessionInfo),
   R("POST", "/admin/api/auth/logout", logout),
@@ -2535,12 +3004,20 @@ var routes = [
   R("DELETE", "/admin/api/models/:id", deleteModel),
   R("GET", "/admin/api/devices", listDevices),
   R("POST", "/admin/api/devices/:id/revoke", revokeDevice),
+  R("POST", "/admin/api/devices/:id/unblock", unblockDevice),
   R("GET", "/admin/api/devices/:id/models", getDeviceModels),
   R("PUT", "/admin/api/devices/:id/models", putDeviceModels),
-  R("GET", "/admin/api/enrollment-codes", listEnrollmentCodes),
-  R("POST", "/admin/api/enrollment-codes", createEnrollmentCode),
   R("GET", "/admin/api/usage", usage),
   R("GET", "/admin/api/logs", logs),
+  R("GET", "/admin/api/memory", adminListMemory),
+  R("DELETE", "/admin/api/memory", adminClearAllMemory),
+  R("DELETE", "/admin/api/memory/:id", adminClearDeviceMemory),
+  R("GET", "/admin/api/releases", listReleases),
+  R("POST", "/admin/api/releases", createRelease),
+  R("PUT", "/admin/api/releases/:id/chunks/:seq", uploadChunk),
+  R("POST", "/admin/api/releases/:id/complete", completeUpload),
+  R("PATCH", "/admin/api/releases/:id", updateRelease),
+  R("DELETE", "/admin/api/releases/:id", deleteRelease),
   R("GET", "/admin/api/settings", getSettings),
   R("PATCH", "/admin/api/settings", patchSettings)
 ];
@@ -2609,7 +3086,7 @@ function applyCors(req, res, deps) {
 function createHandler(input) {
   const deps = { ...input, limits: input.limits ?? new DatabaseLimitStore(input.db), redis: input.redis ?? null };
   return async (req, res) => {
-    const requestId = crypto5.randomUUID();
+    const requestId = crypto6.randomUUID();
     const started = Date.now();
     let routeName = "unmatched";
     res.setHeader("x-request-id", requestId);
@@ -2676,7 +3153,7 @@ function createServer(deps) {
 
 // src/config.ts
 import fs3 from "node:fs";
-import crypto6 from "node:crypto";
+import crypto7 from "node:crypto";
 function bool2(v, fallback) {
   if (v === void 0 || v === "") return fallback;
   if (["1", "true", "yes", "on"].includes(v.toLowerCase())) return true;
@@ -2744,7 +3221,7 @@ function instanceId(env, keyring) {
   }
   const first = [...keyring.keys.keys()].sort((a, b) => a - b)[0];
   if (first === void 0) return "development";
-  return crypto6.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
+  return crypto7.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
 }
 function parseDatabase(env, production) {
   const sslDefault = production ? "require" : "disable";
@@ -2862,7 +3339,7 @@ function redactedConfig(c) {
 }
 
 // src/db/pg-wire.ts
-import crypto7 from "node:crypto";
+import crypto8 from "node:crypto";
 import net2 from "node:net";
 import tls2 from "node:tls";
 import fs4 from "node:fs";
@@ -2948,7 +3425,7 @@ function parseError(body) {
   return new PgError(fields.M ?? "database error", fields.C ?? "", fields.D);
 }
 function hmac(key, data) {
-  return crypto7.createHmac("sha256", key).update(data).digest();
+  return crypto8.createHmac("sha256", key).update(data).digest();
 }
 var PgConnection = class _PgConnection {
   socket;
@@ -3057,7 +3534,7 @@ var PgConnection = class _PgConnection {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
   async scram(password) {
-    const nonce = crypto7.randomBytes(18).toString("base64");
+    const nonce = crypto8.randomBytes(18).toString("base64");
     const clientFirstBare = `n=,r=${nonce}`;
     const initial = Buffer.from(`n,,${clientFirstBare}`, "utf8");
     this.socket.write(frame("p", Buffer.concat([cstr("SCRAM-SHA-256"), int32(initial.length), initial])));
@@ -3070,10 +3547,10 @@ var PgConnection = class _PgConnection {
     const iterations = Number(attrs.i);
     if (!Number.isInteger(iterations) || iterations < 4096 || iterations > 1e6) throw new PgError("unacceptable SCRAM iteration count");
     const salted = await new Promise(
-      (resolve, reject) => crypto7.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
+      (resolve, reject) => crypto8.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
     );
     const clientKey = hmac(salted, "Client Key");
-    const storedKey = crypto7.createHash("sha256").update(clientKey).digest();
+    const storedKey = crypto8.createHash("sha256").update(clientKey).digest();
     const clientFinalNoProof = `c=biws,r=${attrs.r}`;
     const authMessage = `${clientFirstBare},${serverFirst},${clientFinalNoProof}`;
     const signature = hmac(storedKey, authMessage);

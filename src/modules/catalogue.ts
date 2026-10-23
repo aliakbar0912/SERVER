@@ -2,6 +2,7 @@
 import type { Ctx } from '../context.ts';
 import type { Queryer, Db } from '../db/pg-wire.ts';
 import { authenticateDevice } from './devices.ts';
+import { requireLoginForCentralAi } from './sessions.ts';
 import { fail, sendJson, uuidParam } from '../http/util.ts';
 import { allowedModelIds, isAllowed, providerHealth } from './registry.ts';
 
@@ -127,8 +128,16 @@ export async function catalogueRoute(ctx: Ctx): Promise<void> {
 }
 
 export async function deviceRoute(ctx: Ctx): Promise<void> {
-  const d = await authenticateDevice(ctx);
-  sendJson(ctx.res, 200, { deviceId: d.deviceId, name: d.name, status: 'active', catalogueVersion: await catalogueVersion(ctx.deps.db) });
+  const d = await authenticateDevice(ctx, { central: false });
+  sendJson(ctx.res, 200, {
+    deviceId: d.deviceId,
+    name: d.name,
+    status: 'active',
+    catalogueVersion: await catalogueVersion(ctx.deps.db),
+    signedIn: !!d.userId,
+    tokenExpiresAt: d.tokenExpiresAt,
+    loginRequired: await requireLoginForCentralAi(ctx.deps.db),
+  });
 }
 
 /**

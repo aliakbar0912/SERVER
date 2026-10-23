@@ -6,6 +6,8 @@ import { clientAddress, HttpError, log, sendError, sendJson } from './http/util.
 import { migrationStatus } from './db/migrate.ts';
 import { DatabaseLimitStore } from './limits.ts';
 import { RedisUnavailableError } from './redis.ts';
+import { PocketBase } from './pocketbase.ts';
+import * as accounts from './modules/accounts.ts';
 import * as auth from './modules/auth.ts';
 import * as devices from './modules/devices.ts';
 import * as catalogue from './modules/catalogue.ts';
@@ -40,6 +42,16 @@ const routes: Route[] = [
   R('POST', '/v1/chat/completions', chat.chatCompletions),
   R('POST', '/v1/memory/sync', memory.syncMemories),
   R('GET', '/v1/updates/check', releases.checkForUpdate),
+  R('GET', '/v1/auth/config', accounts.authConfig),
+  R('POST', '/v1/auth/session', accounts.createSession),
+  R('POST', '/v1/auth/oauth/start', accounts.oauthStart),
+  R('GET', '/v1/auth/oauth/callback', accounts.oauthCallback),
+  R('POST', '/v1/auth/exchange', accounts.exchange),
+  R('POST', '/v1/auth/refresh', accounts.refresh),
+  R('POST', '/v1/auth/logout', accounts.logout),
+  R('GET', '/v1/account', accounts.account),
+  R('POST', '/v1/account/devices/:id/sign-out', accounts.signOutDevice),
+  R('POST', '/v1/account/delete', accounts.deleteAccount),
   R('GET', '/v1/updates/:id/download', releases.downloadUpdate),
 
   R('POST', '/admin/api/auth/login', auth.login),
@@ -82,6 +94,9 @@ const routes: Route[] = [
   R('POST', '/admin/api/releases/:id/complete', releases.completeUpload),
   R('PATCH', '/admin/api/releases/:id', releases.updateRelease),
   R('DELETE', '/admin/api/releases/:id', releases.deleteRelease),
+  R('GET', '/admin/api/users', accounts.adminListUsers),
+  R('GET', '/admin/api/users/:id', accounts.adminGetUser),
+  R('POST', '/admin/api/users/:id/:action', accounts.adminUserAction),
   R('GET', '/admin/api/settings', data.getSettings),
   R('PATCH', '/admin/api/settings', data.patchSettings),
 ];
@@ -154,10 +169,15 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse, deps: De
 }
 
 /** Deps as callers build them. `limits` defaults to the PostgreSQL store and `redis` to none. */
-export type DepsInput = Omit<Deps, 'limits' | 'redis'> & Partial<Pick<Deps, 'limits' | 'redis'>>;
+export type DepsInput = Omit<Deps, 'limits' | 'redis' | 'pocketbase'> & Partial<Pick<Deps, 'limits' | 'redis' | 'pocketbase'>>;
 
 export function createHandler(input: DepsInput): http.RequestListener {
-  const deps: Deps = { ...input, limits: input.limits ?? new DatabaseLimitStore(input.db), redis: input.redis ?? null };
+  const deps: Deps = {
+    ...input,
+    limits: input.limits ?? new DatabaseLimitStore(input.db),
+    redis: input.redis ?? null,
+    pocketbase: input.pocketbase !== undefined ? input.pocketbase : input.config.pocketbase ? new PocketBase(input.config.pocketbase, input.fetch) : null,
+  };
   return async (req, res) => {
     const requestId = crypto.randomUUID();
     const started = Date.now();
