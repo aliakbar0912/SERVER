@@ -113,7 +113,7 @@ function desktop(identity?: () => { sub: string; email: string }) {
 
 const skip = (t: any) => (!tdb ? (t.skip(SKIP_NO_PG), true) : !pbt ? (t.skip(SKIP_NO_PB), true) : false);
 
-test('desktop: signup, verification, sign-in claims the existing registration, tokens stay out of the renderer', async (t) => {
+test('desktop: email-code signup and sign-in claims the existing registration, tokens stay out of the renderer', async (t) => {
   if (skip(t)) return;
   const d = desktop();
   await d.core.centralRefresh();
@@ -124,16 +124,19 @@ test('desktop: signup, verification, sign-in claims the existing registration, t
   assert.equal(cfg.enabled, true);
   assert.deepEqual(cfg.providers.map((p: any) => p.name), ['oidc']);
 
+  assert.equal(cfg.otp, true, 'email codes are on');
+
   // IPC validation rejects bad input before it reaches the core.
-  await assert.rejects(d.call('account:signUp', { email: 'not-an-email', password: 'x', name: '' }), /Invalid request/);
-  const signed = await d.call('account:signUp', { email: 'Desk@Example.test', password: 'desk-pass-123', name: 'Desk User' });
-  assert.equal(signed.verificationSent, true);
-  await assert.rejects(d.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-123' }), /Verify your email/);
-  const vtoken = await pbt!.waitForMailToken('desk@example.test', 'confirm-verification');
-  assert.equal((await pbt!.api('POST', '/api/collections/users/confirm-verification', { token: vtoken })).status, 204);
+  await assert.rejects(d.call('account:requestCode', { email: 'not-an-email' }), /Invalid request/);
+  await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code: 'abc' }), /Invalid request/);
+  // Sign up: name + email, then the code from the email. No password and no verification link.
+  let mark = pbt!.mails.length;
+  assert.deepEqual(await d.call('account:requestCode', { email: 'Desk@Example.test', name: 'Desk User', create: true }), { sent: true });
+  const code = await pbt!.waitForOtp('desk@example.test', mark);
+  await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code: '00000000' }), /not correct/);
 
   const deviceId = (await tdb!.db.query('SELECT id FROM devices WHERE token_hash = $1', [crypto.createHash('sha256').update(legacyToken!).digest('hex')])).rows[0].id;
-  const status = await d.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-123' });
+  const status = await d.call('account:verifyCode', { email: 'desk@example.test', code });
   assert.equal(status.signedIn, true);
   assert.equal(status.user.email, 'desk@example.test');
   assert.ok(!JSON.stringify(status).includes(d.secrets.get(CENTRAL_TOKEN_KEY)!), 'no device token in IPC results');
@@ -149,8 +152,29 @@ test('desktop: signup, verification, sign-in claims the existing registration, t
   assert.equal(details.devices.filter((x: any) => x.current).length, 1);
 
   // Sign out: server session ends, local projects untouched, the computer reconnects as a new account-less installation.
+  // An unknown address gets the same answer and no email (no account enumeration).
+  mark = pbt!.mails.length;
+  assert.deepEqual(await d.call('account:requestCode', { email: 'nobody@example.test' }), { sent: true });
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(pbt!.mails.slice(mark).filter((m) => m.to.includes('nobody@example.test')).length, 0);
+
   const out = await d.call('account:signOut');
   assert.equal(out.signedIn, false);
+
+  // Signing in again later uses a fresh code; the old one cannot be replayed.
+  mark = pbt!.mails.length;
+  await d.call('account:requestCode', { email: 'desk@example.test' });
+  await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code }), /not correct/);
+  const code2 = await pbt!.waitForOtp('desk@example.test', mark);
+  assert.equal((await d.call('account:verifyCode', { email: 'desk@example.test', code: code2 })).signedIn, true);
+
+  // Deleting the account is confirmed with a code sent to the account's own email.
+  mark = pbt!.mails.length;
+  assert.equal((await d.call('account:deletionCode')).email, 'desk@example.test');
+  const delCode = await pbt!.waitForOtp('desk@example.test', mark);
+  assert.equal((await d.call('account:delete', { code: delCode, confirmed: true })).status, 'done');
+  const left = await pbt!.su('GET', `/api/collections/users/records?filter=${encodeURIComponent("email='desk@example.test'")}`);
+  assert.equal(left.body.items.length, 0);
   const ended = (await tdb!.db.query('SELECT signed_out_reason FROM devices WHERE id = $1', [deviceId])).rows[0];
   assert.equal(ended.signed_out_reason, 'logout');
   assert.ok(d.core.centralStatus().enrolled, 'central access continues without an account while sign-in is optional');
@@ -191,7 +215,10 @@ test('desktop: when sign-in is required, local status says so; after sign-in Dev
     await d.core.centralRefresh();
     assert.equal(d.core.centralStatus().loginRequired, true);
     assert.equal(d.core.centralStatus().enrolled, true, 'the device keeps its registration (updates keep working)');
-    await d.call('account:signIn', { email: 'required@example.test', password: 'required-pass-1' });
+    await d.call('account:config');
+    const mark = pbt!.mails.length;
+    await d.call('account:requestCode', { email: 'required@example.test' });
+    await d.call('account:verifyCode', { email: 'required@example.test', code: await pbt!.waitForOtp('required@example.test', mark) });
     await d.core.centralRefresh();
     assert.equal(d.core.centralStatus().loginRequired, false);
     assert.equal(d.core.centralStatus().lastError, '');

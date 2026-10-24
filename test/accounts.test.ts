@@ -599,3 +599,26 @@ describe('servers without accounts', () => {
     }
   });
 });
+
+describe('email codes (OTP)', () => {
+  test('account deletion accepts only a fresh email code of the same user; PocketBase locks out guessing', async (t) => {
+    if (skip(t)) return;
+    await pbt!.createUser('otp-a@example.test', 'otp-a-pass-1');
+    await pbt!.createUser('otp-b@example.test', 'otp-b-pass-1');
+    const a = await passwordSignIn('otp-a@example.test', 'otp-a-pass-1');
+    // B's valid code cannot delete A.
+    let mark = pbt!.mails.length;
+    const otherReq = await pbt!.api('POST', '/api/collections/users/request-otp', { email: 'otp-b@example.test' });
+    const otherCode = await pbt!.waitForOtp('otp-b@example.test', mark);
+    const cross = await post('/v1/account/delete', { otpId: otherReq.body.otpId, otpCode: otherCode }, a.body.token);
+    assert.equal(cross.status, 401);
+    // Wrong guesses: refused, and PocketBase soon refuses further attempts.
+    mark = pbt!.mails.length;
+    const req = await pbt!.api('POST', '/api/collections/users/request-otp', { email: 'otp-a@example.test' });
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i++) statuses.push((await post('/v1/account/delete', { otpId: req.body.otpId, otpCode: String(10000000 + i) }, a.body.token)).status);
+    assert.ok(statuses.every((s) => s === 401 || s === 429), statuses.join(','));
+    assert.equal((await get('/v1/catalogue', a.body.token)).status, 200, 'nothing was deleted');
+    assert.ok(await pbt!.waitForOtp('otp-a@example.test', mark));
+  });
+});

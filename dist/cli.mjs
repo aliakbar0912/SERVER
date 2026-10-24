@@ -1,11 +1,232 @@
 #!/usr/bin/env node
 
-// src/cli.ts
-import http2 from "node:http";
+// src/pocketbase.ts
+var PbError = class extends Error {
+  status;
+  constructor(status, message) {
+    super(message);
+    this.name = "PbError";
+    this.status = status;
+  }
+};
+var TIMEOUT_MS = 1e4;
+var ID = /^[A-Za-z0-9_]{1,64}$/;
+function jwtExp(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+    return typeof payload.exp === "number" ? payload.exp * 1e3 : 0;
+  } catch {
+    return 0;
+  }
+}
+function pbLiteral(v) {
+  return `'${v.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+}
+var PocketBase = class {
+  superToken = null;
+  superPending = null;
+  cfg;
+  fetchFn;
+  constructor(cfg, fetchFn) {
+    this.cfg = cfg;
+    this.fetchFn = fetchFn;
+  }
+  col() {
+    return encodeURIComponent(this.cfg.usersCollection);
+  }
+  async call(method, path2, opts = {}) {
+    let res;
+    try {
+      res = await this.fetchFn(this.cfg.url + path2, {
+        method,
+        headers: { accept: "application/json", ...opts.body !== void 0 ? { "content-type": "application/json" } : {}, ...opts.auth ? { authorization: opts.auth } : {} },
+        body: opts.body === void 0 ? void 0 : JSON.stringify(opts.body),
+        redirect: "error",
+        signal: AbortSignal.timeout(TIMEOUT_MS)
+      });
+    } catch {
+      throw new PbError(0, "the account service cannot be reached");
+    }
+    const text = await res.text().catch(() => "");
+    let body = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    return { status: res.status, body };
+  }
+  async superuser(force = false) {
+    if (!force && this.superToken && this.superToken.until > Date.now()) return this.superToken.token;
+    if (!this.superPending) {
+      this.superPending = (async () => {
+        const r = await this.call("POST", "/api/collections/_superusers/auth-with-password", { body: { identity: this.cfg.adminEmail, password: this.cfg.adminPassword } });
+        if (r.status !== 200 || typeof r.body?.token !== "string") throw new PbError(r.status === 0 ? 0 : 502, "the server could not sign in to the account service");
+        const token = r.body.token;
+        const exp = jwtExp(token);
+        this.superToken = { token, until: Math.min(exp ? exp - 6e4 : Date.now() + 6e5, Date.now() + 30 * 6e4) };
+        return token;
+      })().finally(() => this.superPending = null);
+    }
+    return this.superPending;
+  }
+  /** A superuser request, signing in again once if the token was rejected (rotated password, restarted PocketBase). */
+  async admin(method, path2, body) {
+    let r = await this.call(method, path2, { body, auth: await this.superuser() });
+    if (r.status === 401 || r.status === 403) r = await this.call(method, path2, { body, auth: await this.superuser(true) });
+    return r;
+  }
+  /** Validates a users-collection record and keeps only the fields Devora uses. */
+  user(rec) {
+    if (!rec || typeof rec.id !== "string" || !ID.test(rec.id)) throw new PbError(502, "the account service returned an unexpected answer");
+    if (rec.collectionName !== void 0 && rec.collectionName !== this.cfg.usersCollection) throw new PbError(401, "this account is not a Devora user account");
+    return {
+      id: rec.id,
+      email: typeof rec.email === "string" ? rec.email : "",
+      name: typeof rec.name === "string" ? rec.name.slice(0, 120) : "",
+      verified: rec.verified === true,
+      created: typeof rec.created === "string" ? rec.created : "",
+      avatar: typeof rec.avatar === "string" ? rec.avatar : ""
+    };
+  }
+  /** OAuth2 providers enabled on the users collection, each with a fresh state and PKCE verifier from PocketBase. */
+  async providers() {
+    const r = await this.call("GET", `/api/collections/${this.col()}/auth-methods`);
+    if (r.status !== 200) throw new PbError(r.status || 0, "the account service is unavailable");
+    const list = r.body?.oauth2?.enabled ? r.body.oauth2.providers : [];
+    if (!Array.isArray(list)) return [];
+    return list.filter((p) => p && typeof p.name === "string" && typeof p.authURL === "string" && typeof p.state === "string" && typeof p.codeVerifier === "string").map((p) => ({ name: p.name, displayName: String(p.displayName ?? p.name).slice(0, 60), state: p.state, authURL: p.authURL, codeVerifier: p.codeVerifier, codeChallengeMethod: String(p.codeChallengeMethod ?? "") }));
+  }
+  /**
+   * Finishes an OAuth2 sign-in: PocketBase exchanges the code with the provider (it holds the client secret), checks PKCE
+   * and the exact redirect URI, and returns the user. With `userToken` the provider is linked to that signed-in user.
+   * The provider's own access/refresh tokens in PocketBase's answer are dropped here.
+   */
+  async finishOAuth(input) {
+    const r = await this.call("POST", `/api/collections/${this.col()}/auth-with-oauth2`, {
+      body: { provider: input.provider, code: input.code, codeVerifier: input.codeVerifier, redirectURL: input.redirectUrl },
+      auth: input.userToken
+    });
+    if (r.status !== 200 || typeof r.body?.token !== "string") throw new PbError(r.status === 0 ? 0 : 401, "the sign-in could not be completed");
+    return { user: this.user(r.body.record), token: r.body.token };
+  }
+  /** Checks a user token by asking PocketBase to refresh it (signature, expiry, tokenKey). The new token is discarded. */
+  async verifyUserToken(token) {
+    if (!/^[A-Za-z0-9._-]{20,4096}$/.test(token)) throw new PbError(401, "the sign-in is not valid");
+    const r = await this.call("POST", `/api/collections/${this.col()}/auth-refresh`, { auth: token });
+    if (r.status !== 200) throw new PbError(r.status === 0 ? 0 : 401, "the sign-in is not valid or has expired");
+    return this.user(r.body?.record);
+  }
+  /** Checks a password for an existing user (re-authentication before account deletion). */
+  async checkPassword(email, password) {
+    const r = await this.call("POST", `/api/collections/${this.col()}/auth-with-password`, { body: { identity: email, password } });
+    if (r.status !== 200) throw new PbError(r.status === 0 ? 0 : 401, "the password is not correct");
+    return this.user(r.body?.record);
+  }
+  /** The user's current record, read as superuser. Null when the account no longer exists. */
+  async getUser(id) {
+    if (!ID.test(id)) return null;
+    const r = await this.admin("GET", `/api/collections/${this.col()}/records/${encodeURIComponent(id)}`);
+    if (r.status === 404) return null;
+    if (r.status !== 200) throw new PbError(r.status || 0, "the account service is unavailable");
+    return this.user(r.body);
+  }
+  async listUsers(opts) {
+    const q = new URLSearchParams({ page: String(opts.page), perPage: String(opts.perPage), sort: "-created" });
+    const s = opts.search.trim().slice(0, 100);
+    if (s) q.set("filter", `(email ~ ${pbLiteral(s)} || name ~ ${pbLiteral(s)} || id = ${pbLiteral(s)})`);
+    const r = await this.admin("GET", `/api/collections/${this.col()}/records?${q}`);
+    if (r.status !== 200 || !Array.isArray(r.body?.items)) throw new PbError(r.status || 0, "the account service is unavailable");
+    return { items: r.body.items.map((x) => this.user(x)), total: Number(r.body.totalItems ?? r.body.items.length) };
+  }
+  /** Google/GitHub identities linked to the user (PocketBase's own _externalAuths records). */
+  async externalAuths(userId) {
+    if (!ID.test(userId)) return [];
+    const filter = `(recordRef = ${pbLiteral(userId)} && collectionRef = ${pbLiteral(await this.collectionId())})`;
+    const r = await this.admin("GET", `/api/collections/_externalAuths/records?perPage=50&filter=${encodeURIComponent(filter)}`);
+    if (r.status !== 200 || !Array.isArray(r.body?.items)) throw new PbError(r.status || 0, "the account service is unavailable");
+    return r.body.items.map((x) => ({ id: String(x.id), provider: String(x.provider), created: String(x.created ?? "") }));
+  }
+  usersCollectionId = null;
+  async collectionId() {
+    if (this.usersCollectionId) return this.usersCollectionId;
+    const r = await this.admin("GET", `/api/collections/${this.col()}`);
+    if (r.status !== 200 || typeof r.body?.id !== "string" || r.body.type !== "auth") throw new PbError(r.status || 0, "the users collection is not available");
+    this.usersCollectionId = r.body.id;
+    return this.usersCollectionId;
+  }
+  /** Deletes the user. PocketBase removes its linked _externalAuths records with it. True also when it was already gone. */
+  async deleteUser(id) {
+    if (!ID.test(id)) throw new PbError(400, "invalid user id");
+    const r = await this.admin("DELETE", `/api/collections/${this.col()}/records/${encodeURIComponent(id)}`);
+    if (r.status !== 204 && r.status !== 200 && r.status !== 404) throw new PbError(r.status || 0, "the account could not be deleted in the account service");
+    return true;
+  }
+};
 
-// src/app.ts
-import http from "node:http";
-import crypto6 from "node:crypto";
+// src/crypto.ts
+import crypto from "node:crypto";
+import { promisify } from "node:util";
+var scryptAsync = promisify(crypto.scrypt);
+var SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const key = await scryptAsync(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, maxmem: 64 * 1024 * 1024 });
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString("base64")}$${key.toString("base64")}`;
+}
+async function verifyPassword(password, stored) {
+  const parts = stored.split("$");
+  if (parts.length !== 6 || parts[0] !== "scrypt") return false;
+  const [N, r, p] = parts.slice(1, 4).map(Number);
+  const salt = Buffer.from(parts[4], "base64");
+  const expected = Buffer.from(parts[5], "base64");
+  const key = await scryptAsync(password, salt, expected.length, { N, r, p, maxmem: 64 * 1024 * 1024 });
+  return key.length === expected.length && crypto.timingSafeEqual(key, expected);
+}
+var dummyHash = null;
+function burnPasswordTime(password) {
+  dummyHash ??= hashPassword("devora-dummy-password-for-timing");
+  return dummyHash.then((h) => verifyPassword(password, h));
+}
+function randomToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+function sha256Hex(value) {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+function parseKeyring(spec, active) {
+  const keys = /* @__PURE__ */ new Map();
+  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const eq = entry.indexOf("=");
+    const id = Number(entry.slice(0, eq));
+    const key = Buffer.from(entry.slice(eq + 1), "base64");
+    if (eq < 1 || !Number.isInteger(id) || id < 1 || id > 999999) throw new Error("DEVORA_SECRET_KEYS entries must look like 1=<base64>");
+    if (key.length !== 32) throw new Error(`key ${id} must decode to 32 bytes`);
+    if (keys.has(id)) throw new Error(`key ${id} appears twice`);
+    keys.set(id, key);
+  }
+  if (keys.size === 0) return { size: 0, activeId: 0, keys };
+  const activeId = Number(active);
+  if (!Number.isInteger(activeId) || !keys.has(activeId)) throw new Error("DEVORA_SECRET_ACTIVE_KEY must name one of the ids in DEVORA_SECRET_KEYS");
+  return { size: keys.size, activeId, keys };
+}
+function sealSecret(keyring, plaintext, aad) {
+  const key = keyring.keys.get(keyring.activeId);
+  if (!key) throw new Error("no encryption key is configured; set DEVORA_SECRET_KEYS and DEVORA_SECRET_ACTIVE_KEY");
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(aad, "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return { keyVersion: keyring.activeId, iv, ciphertext, tag: cipher.getAuthTag() };
+}
+function openSecret(keyring, sealed, aad) {
+  const key = keyring.keys.get(sealed.keyVersion);
+  if (!key) throw new Error(`encryption key ${sealed.keyVersion} is not configured; restore it before reading this secret`);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, sealed.iv);
+  decipher.setAAD(Buffer.from(aad, "utf8"));
+  decipher.setAuthTag(sealed.tag);
+  return Buffer.concat([decipher.update(sealed.ciphertext), decipher.final()]).toString("utf8");
+}
 
 // src/http/util.ts
 var HttpError = class extends Error {
@@ -39,14 +260,14 @@ function sendOpenAiError(res, status, code, message, headers = {}) {
   const type = status >= 500 ? "server_error" : status === 429 ? "rate_limit_error" : status === 401 || status === 403 ? "authentication_error" : "invalid_request_error";
   sendJson(res, status, { error: { message, type, code } }, headers);
 }
-async function readJson(req, limit) {
+async function readJson(req, limit2) {
   const declared = Number(req.headers["content-length"] ?? 0);
-  if (declared > limit) fail(413, "payload_too_large", "the request body is too large");
+  if (declared > limit2) fail(413, "payload_too_large", "the request body is too large");
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) {
+    if (size > limit2) {
       req.destroy();
       fail(413, "payload_too_large", "the request body is too large");
     }
@@ -134,636 +355,8 @@ function log(level, msg, fields = {}) {
   (level === "error" ? process.stderr : process.stdout).write(line + "\n");
 }
 
-// src/db/migrate.ts
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-var LOCK_KEY = 727001001;
-function defaultMigrationsDir() {
-  if (process.env.DEVORA_MIGRATIONS_DIR) return path.resolve(process.env.DEVORA_MIGRATIONS_DIR);
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  for (const c of [path.join(here, "..", "migrations"), path.join(here, "..", "..", "migrations")]) {
-    if (fs.existsSync(c)) return c;
-  }
-  throw new Error("migrations directory not found; set DEVORA_MIGRATIONS_DIR");
-}
-function loadMigrations(dir = defaultMigrationsDir()) {
-  const files = fs.readdirSync(dir).filter((f) => /^\d{4}_[a-z0-9_]+\.sql$/.test(f)).sort();
-  const seen = /* @__PURE__ */ new Set();
-  return files.map((file) => {
-    const m = /^(\d{4})_([a-z0-9_]+)\.sql$/.exec(file);
-    const version2 = Number(m[1]);
-    if (seen.has(version2)) throw new Error(`duplicate migration version ${version2}`);
-    seen.add(version2);
-    const text = fs.readFileSync(path.join(dir, file), "utf8");
-    const upIdx = text.indexOf("-- migrate:up");
-    const downIdx = text.indexOf("-- migrate:down");
-    if (upIdx < 0 || downIdx < 0 || downIdx < upIdx) throw new Error(`${file} must contain "-- migrate:up" followed by "-- migrate:down"`);
-    return {
-      version: version2,
-      name: m[2],
-      file,
-      checksum: crypto.createHash("sha256").update(text).digest("hex"),
-      up: text.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
-      down: text.slice(downIdx + "-- migrate:down".length).trim()
-    };
-  });
-}
-async function ensureTable(c) {
-  await c.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
-    version integer PRIMARY KEY,
-    name text NOT NULL,
-    checksum text NOT NULL,
-    applied_at timestamptz NOT NULL DEFAULT now()
-  )`);
-}
-async function withLock(db, fn) {
-  return db.withConnection(async (c) => {
-    await c.query("SELECT pg_advisory_lock($1)", [LOCK_KEY]);
-    try {
-      await ensureTable(c);
-      return await fn(c);
-    } finally {
-      await c.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY]).catch(() => void 0);
-    }
-  });
-}
-function verify(files, applied) {
-  const byVersion = new Map(files.map((f) => [f.version, f]));
-  for (const row of applied) {
-    const f = byVersion.get(row.version);
-    if (!f) throw new Error(`database has migration ${row.version} (${row.name}) that this server build does not contain; do not start an older build against a newer schema`);
-    if (f.checksum !== row.checksum) throw new Error(`migration ${f.file} was changed after it was applied; create a new migration instead`);
-  }
-}
-async function migrationStatus(db, files = loadMigrations()) {
-  return withLock(db, async (c) => {
-    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
-    verify(files, rows);
-    const appliedSet = new Set(rows.map((r) => r.version));
-    return {
-      applied: rows.map((r) => ({ version: r.version, name: r.name, appliedAt: r.applied_at.toISOString() })),
-      pending: files.filter((f) => !appliedSet.has(f.version)).map((f) => ({ version: f.version, name: f.name })),
-      currentVersion: rows.length ? Math.max(...rows.map((r) => r.version)) : 0,
-      latestVersion: files.length ? files[files.length - 1].version : 0
-    };
-  });
-}
-async function migrateUp(db, files = loadMigrations()) {
-  return withLock(db, async (c) => {
-    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
-    verify(files, rows);
-    const appliedSet = new Set(rows.map((r) => r.version));
-    const done = [];
-    for (const f of files) {
-      if (appliedSet.has(f.version)) continue;
-      await c.exec("BEGIN");
-      try {
-        await c.exec(f.up);
-        await c.query("INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)", [f.version, f.name, f.checksum]);
-        await c.exec("COMMIT");
-      } catch (e) {
-        await c.exec("ROLLBACK").catch(() => void 0);
-        throw new Error(`migration ${f.file} failed and was rolled back: ${e.message}`);
-      }
-      done.push(f.file);
-    }
-    return done;
-  });
-}
-async function migrateDown(db, steps, files = loadMigrations()) {
-  if (!Number.isInteger(steps) || steps < 1) throw new Error("steps must be a positive integer");
-  return withLock(db, async (c) => {
-    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version DESC");
-    verify(files, rows);
-    const reverted = [];
-    for (const row of rows.slice(0, steps)) {
-      const f = files.find((x) => x.version === row.version);
-      await c.exec("BEGIN");
-      try {
-        await c.exec(f.down);
-        await c.query("DELETE FROM schema_migrations WHERE version = $1", [f.version]);
-        await c.exec("COMMIT");
-      } catch (e) {
-        await c.exec("ROLLBACK").catch(() => void 0);
-        throw new Error(`reverting ${f.file} failed and was rolled back: ${e.message}`);
-      }
-      reverted.push(f.file);
-    }
-    return reverted;
-  });
-}
-
-// src/limits.ts
+// src/modules/auth.ts
 import crypto2 from "node:crypto";
-
-// src/persistent-limits.ts
-async function hitRate(q, key, limit, windowSeconds) {
-  const { rows } = await q.query(
-    `INSERT INTO rate_counters (key, bucket, count)
-     VALUES ($1, (floor(extract(epoch FROM now()) / $2) * $2)::bigint, 1)
-     ON CONFLICT (key, bucket) DO UPDATE SET count = rate_counters.count + 1
-     RETURNING count::int AS count,
-               greatest(1, ceil(bucket + $2 - extract(epoch FROM now())))::int AS retry_after`,
-    [key, windowSeconds]
-  );
-  const r = rows[0];
-  if (r.count > limit) return { allowed: false, retryAfterSeconds: r.retry_after };
-  return { allowed: true, retryAfterSeconds: 0 };
-}
-async function clearRate(q, key) {
-  await q.query("DELETE FROM rate_counters WHERE key = $1", [key]);
-}
-async function pruneRates(q) {
-  const { rowCount } = await q.query("DELETE FROM rate_counters WHERE bucket < extract(epoch FROM now())::bigint - 3600");
-  return rowCount;
-}
-async function acquireSlot(db, r) {
-  return db.transaction(async (q) => {
-    await q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`device-slot:${r.deviceId}`]);
-    await q.query("DELETE FROM device_request_leases WHERE device_id = $1 AND expires_at <= now()", [r.deviceId]);
-    if (r.clientRequestId) {
-      const seen = await q.query(
-        `SELECT 1 FROM device_request_leases WHERE device_id = $1 AND client_request_id = $2
-         UNION ALL
-         SELECT 1 FROM request_logs WHERE device_id = $1 AND client_request_id = $2
-         LIMIT 1`,
-        [r.deviceId, r.clientRequestId]
-      );
-      if (seen.rows.length) return "duplicate";
-    }
-    const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE device_id = $1", [r.deviceId]);
-    if (rows[0].n >= r.maxConcurrent) return "busy";
-    await q.query(
-      `INSERT INTO device_request_leases (device_id, request_id, client_request_id, expires_at)
-       VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
-      [r.deviceId, r.requestId, r.clientRequestId, r.leaseSeconds]
-    );
-    return "ok";
-  });
-}
-async function releaseSlot(q, requestId) {
-  await q.query("DELETE FROM device_request_leases WHERE request_id = $1", [requestId]);
-}
-async function activeLeaseCount(q) {
-  const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE expires_at > now()");
-  return rows[0].n;
-}
-
-// src/limits.ts
-var HIT_SCRIPT = `local n = redis.call('INCR', KEYS[1])
-if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
-local ttl = redis.call('PTTL', KEYS[1])
-if ttl < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]); ttl = tonumber(ARGV[1]) end
-return {n, ttl}`;
-var UNLOCK_SCRIPT = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`;
-var RedisLimitStore = class {
-  constructor(redis, prefix = "devora") {
-    this.redis = redis;
-    this.prefix = prefix;
-  }
-  redis;
-  prefix;
-  kind = "redis";
-  k(kind, key) {
-    return `${this.prefix}:${kind}:${key}`;
-  }
-  async hit(key, limit, windowSeconds) {
-    const r = await this.redis.command("EVAL", HIT_SCRIPT, 1, this.k("rl", key), windowSeconds * 1e3);
-    const [count, ttlMs] = r;
-    if (count > limit) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlMs / 1e3)) };
-    return { allowed: true, retryAfterSeconds: 0 };
-  }
-  async clear(key) {
-    await this.redis.command("DEL", this.k("rl", key));
-  }
-  async cacheGet(key) {
-    const v = await this.redis.command("GET", this.k("cache", key));
-    if (typeof v !== "string") return null;
-    try {
-      return JSON.parse(v);
-    } catch {
-      return null;
-    }
-  }
-  async cacheSet(key, value, ttlSeconds) {
-    await this.redis.command("SET", this.k("cache", key), JSON.stringify(value), "EX", ttlSeconds);
-  }
-  async withLock(name, ttlMs, fn) {
-    const key = this.k("lock", name);
-    const token = crypto2.randomUUID();
-    const got = await this.redis.command("SET", key, token, "NX", "PX", ttlMs);
-    if (got !== "OK") return null;
-    try {
-      return await fn();
-    } finally {
-      await this.redis.command("EVAL", UNLOCK_SCRIPT, 1, key, token).catch(() => {
-      });
-    }
-  }
-};
-var DatabaseLimitStore = class {
-  constructor(db) {
-    this.db = db;
-  }
-  db;
-  kind = "database";
-  hit(key, limit, windowSeconds) {
-    return hitRate(this.db, key, limit, windowSeconds);
-  }
-  clear(key) {
-    return clearRate(this.db, key);
-  }
-  async cacheGet() {
-    return null;
-  }
-  async cacheSet() {
-  }
-  async withLock(_name, _ttlMs, fn) {
-    return fn();
-  }
-};
-
-// src/redis.ts
-import net from "node:net";
-import tls from "node:tls";
-import fs2 from "node:fs";
-var RedisUnavailableError = class extends Error {
-  code;
-  constructor(code, message) {
-    super(message);
-    this.name = "RedisUnavailableError";
-    this.code = code;
-  }
-};
-var RedisReplyError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "RedisReplyError";
-  }
-};
-function parseRedisUrl(raw, env = {}) {
-  let u;
-  try {
-    u = new URL(raw);
-  } catch {
-    throw new Error("REDIS_URL must look like redis://default:PASSWORD@host:6379/0");
-  }
-  if (u.protocol !== "redis:" && u.protocol !== "rediss:") throw new Error("REDIS_URL must start with redis:// or rediss://");
-  if (!u.hostname) throw new Error("REDIS_URL has no host");
-  const db = u.pathname && u.pathname !== "/" ? Number(u.pathname.slice(1)) : 0;
-  if (!Number.isInteger(db) || db < 0 || db > 15) throw new Error("REDIS_URL database number must be 0 to 15");
-  const port = u.port ? Number(u.port) : 6379;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("REDIS_URL port is invalid");
-  const num = (v, def, name) => {
-    if (v === void 0 || v === "") return def;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n < 100 || n > 6e4) throw new Error(`${name} must be an integer from 100 to 60000`);
-    return n;
-  };
-  const cfg = {
-    host: u.hostname.replace(/^\[|\]$/g, ""),
-    port,
-    username: u.username ? decodeURIComponent(u.username) : null,
-    password: u.password ? decodeURIComponent(u.password) : null,
-    db,
-    tls: u.protocol === "rediss:",
-    connectTimeoutMs: num(env.REDIS_CONNECT_TIMEOUT_MS, 5e3, "REDIS_CONNECT_TIMEOUT_MS"),
-    commandTimeoutMs: num(env.REDIS_COMMAND_TIMEOUT_MS, 2e3, "REDIS_COMMAND_TIMEOUT_MS")
-  };
-  if (env.REDIS_TLS_CA_FILE) {
-    if (!cfg.tls) throw new Error("REDIS_TLS_CA_FILE needs a rediss:// URL");
-    if (!fs2.existsSync(env.REDIS_TLS_CA_FILE)) throw new Error("REDIS_TLS_CA_FILE does not exist");
-    cfg.caFile = env.REDIS_TLS_CA_FILE;
-  }
-  return cfg;
-}
-var ReplyParser = class {
-  buf = Buffer.alloc(0);
-  push(chunk) {
-    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
-  }
-  /** Returns [value] for one complete reply, or null when more bytes are needed. Error replies come back as RedisReplyError values. */
-  next() {
-    const r = this.read(0);
-    if (!r) return null;
-    this.buf = this.buf.subarray(r[1]);
-    return [r[0]];
-  }
-  line(at) {
-    const end = this.buf.indexOf("\r\n", at);
-    if (end < 0) return null;
-    return [this.buf.toString("utf8", at, end), end + 2];
-  }
-  read(at) {
-    if (at >= this.buf.length) return null;
-    const type = String.fromCharCode(this.buf[at]);
-    const l = this.line(at + 1);
-    if (!l) return null;
-    const [text, after] = l;
-    switch (type) {
-      case "+":
-        return [text, after];
-      case "-":
-        return [new RedisReplyError(text), after];
-      case ":":
-        return [Number(text), after];
-      case "$": {
-        const len = Number(text);
-        if (len < 0) return [null, after];
-        if (this.buf.length < after + len + 2) return null;
-        return [this.buf.toString("utf8", after, after + len), after + len + 2];
-      }
-      case "*": {
-        const n = Number(text);
-        if (n < 0) return [null, after];
-        const out = [];
-        let pos = after;
-        for (let i = 0; i < n; i++) {
-          const item = this.read(pos);
-          if (!item) return null;
-          out.push(item[0] instanceof RedisReplyError ? item[0].message : item[0]);
-          pos = item[1];
-        }
-        return [out, pos];
-      }
-      default:
-        throw new RedisUnavailableError("redis_protocol", `unexpected reply type from Redis`);
-    }
-  }
-};
-function encode(args) {
-  const parts = [Buffer.from(`*${args.length}\r
-`)];
-  for (const a of args) {
-    const b = Buffer.from(String(a), "utf8");
-    parts.push(Buffer.from(`$${b.length}\r
-`), b, Buffer.from("\r\n"));
-  }
-  return Buffer.concat(parts);
-}
-var BACKOFF_MIN_MS = 250;
-var BACKOFF_MAX_MS = 3e4;
-var Redis = class {
-  constructor(cfg, onEvent = () => {
-  }) {
-    this.cfg = cfg;
-    this.onEvent = onEvent;
-  }
-  cfg;
-  onEvent;
-  socket = null;
-  connecting = null;
-  /** Each connection has its own reply queue and parser, so a dying old connection never touches a new one. */
-  conns = /* @__PURE__ */ new Map();
-  closed = false;
-  failures = 0;
-  retryAt = 0;
-  lastError = null;
-  /** Host and port only, for logs and the health view. Never includes credentials. */
-  get target() {
-    return `${this.cfg.tls ? "rediss" : "redis"}://${this.cfg.host}:${this.cfg.port}/${this.cfg.db}`;
-  }
-  get connected() {
-    return this.socket !== null && !this.socket.destroyed;
-  }
-  get lastFailure() {
-    return this.lastError;
-  }
-  /** Sends one command. Connects (or reconnects) first when needed; fails fast during the backoff window. */
-  async command(...args) {
-    const socket = await this.ensure();
-    return this.send(socket, args);
-  }
-  async ping() {
-    const t = Date.now();
-    const r = await this.command("PING");
-    if (r !== "PONG") throw new RedisUnavailableError("redis_bad_reply", "Redis did not answer PING");
-    return Date.now() - t;
-  }
-  /** Graceful shutdown: QUIT, then close. Pending commands are rejected. */
-  async close() {
-    this.closed = true;
-    const s = this.socket;
-    if (!s || s.destroyed) return;
-    try {
-      await Promise.race([this.send(s, ["QUIT"]), new Promise((r) => setTimeout(r, 1e3).unref())]);
-    } catch {
-    }
-    s.destroy();
-    this.socket = null;
-  }
-  send(socket, args) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.fail(socket, new RedisUnavailableError("redis_timeout", `Redis did not answer within ${this.cfg.commandTimeoutMs} ms`));
-      }, this.cfg.commandTimeoutMs);
-      timer.unref();
-      const conn = this.conns.get(socket);
-      if (!conn || socket.destroyed) {
-        clearTimeout(timer);
-        reject(new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
-        return;
-      }
-      conn.pending.push({ resolve, reject, timer });
-      socket.write(encode(args));
-    });
-  }
-  ensure() {
-    if (this.closed) return Promise.reject(new RedisUnavailableError("redis_closed", "the Redis client is shut down"));
-    if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket);
-    if (this.connecting) return this.connecting;
-    const now = Date.now();
-    if (now < this.retryAt) {
-      return Promise.reject(new RedisUnavailableError("redis_unavailable", `Redis is unavailable (${this.lastError ?? "connection failed"}); retrying in ${Math.ceil((this.retryAt - now) / 1e3)} s`));
-    }
-    this.connecting = this.open().then(
-      (s) => {
-        if (this.failures > 0) this.onEvent("info", "redis reconnected", { target: this.target });
-        this.failures = 0;
-        this.retryAt = 0;
-        this.lastError = null;
-        this.connecting = null;
-        return s;
-      },
-      (e) => {
-        this.failures += 1;
-        const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** (this.failures - 1));
-        this.retryAt = Date.now() + delay;
-        this.lastError = e.message;
-        this.connecting = null;
-        this.onEvent("error", "redis connection failed", { target: this.target, reason: e.message, retryInMs: delay });
-        throw e instanceof RedisUnavailableError ? e : new RedisUnavailableError("redis_unavailable", e.message);
-      }
-    );
-    return this.connecting;
-  }
-  open() {
-    return new Promise((resolve, reject) => {
-      const c = this.cfg;
-      const socket = c.tls ? tls.connect({ host: c.host, port: c.port, servername: net.isIP(c.host) ? void 0 : c.host, ca: c.caFile ? fs2.readFileSync(c.caFile) : void 0 }) : net.connect({ host: c.host, port: c.port });
-      socket.setNoDelay(true);
-      socket.setKeepAlive(true, 3e4);
-      let settled = false;
-      const timer = setTimeout(() => done(new RedisUnavailableError("redis_timeout", `could not connect to Redis within ${c.connectTimeoutMs} ms`)), c.connectTimeoutMs);
-      timer.unref();
-      const done = (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (err) {
-          socket.destroy();
-          reject(err);
-        } else resolve(socket);
-      };
-      this.conns.set(socket, { pending: [], parser: new ReplyParser() });
-      socket.on("data", (chunk) => this.onData(socket, chunk));
-      socket.on("error", (e) => {
-        const err = new RedisUnavailableError("redis_unavailable", e.code ? `network error ${e.code}` : "network error");
-        if (!settled) done(err);
-        else this.fail(socket, err);
-      });
-      socket.on("close", () => {
-        if (!settled) done(new RedisUnavailableError("redis_unavailable", "the connection closed during setup"));
-        else this.fail(socket, new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
-      });
-      socket.once(c.tls ? "secureConnect" : "connect", async () => {
-        try {
-          if (c.password !== null) {
-            const args = c.username ? ["AUTH", c.username, c.password] : ["AUTH", c.password];
-            await this.send(socket, args).catch((e) => {
-              throw authError(e);
-            });
-          }
-          if (c.db)
-            await this.send(socket, ["SELECT", c.db]).catch((e) => {
-              throw authError(e);
-            });
-          await this.send(socket, ["PING"]).catch((e) => {
-            throw authError(e);
-          });
-          this.socket = socket;
-          done(null);
-        } catch (e) {
-          done(e instanceof Error ? e : new Error(String(e)));
-        }
-      });
-    });
-  }
-  onData(socket, chunk) {
-    const conn = this.conns.get(socket);
-    if (!conn) return;
-    conn.parser.push(chunk);
-    for (; ; ) {
-      let r;
-      try {
-        r = conn.parser.next();
-      } catch (e) {
-        this.fail(socket, e);
-        return;
-      }
-      if (!r) return;
-      const p = conn.pending.shift();
-      if (!p) continue;
-      clearTimeout(p.timer);
-      if (r[0] instanceof RedisReplyError) p.reject(r[0]);
-      else p.resolve(r[0]);
-    }
-  }
-  fail(socket, err) {
-    if (this.socket === socket) {
-      this.socket = null;
-      if (!this.closed) {
-        this.lastError = err.message;
-        this.onEvent("warn", "redis connection lost", { target: this.target, reason: err.message });
-      }
-    }
-    socket.destroy();
-    const pending = this.conns.get(socket)?.pending ?? [];
-    this.conns.delete(socket);
-    for (const p of pending) {
-      clearTimeout(p.timer);
-      p.reject(err);
-    }
-  }
-};
-function authError(e) {
-  const m = e instanceof Error ? e.message : "";
-  if (/NOAUTH/i.test(m)) return new RedisUnavailableError("redis_auth_required", "Redis requires a password; put it in REDIS_URL (redis://default:PASSWORD@host:6379/0)");
-  if (/WRONGPASS|invalid password|invalid username/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "Redis rejected the username or password in REDIS_URL");
-  if (/AUTH.*no password is set|without any password configured/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "REDIS_URL has a password but this Redis server has none set");
-  return e instanceof Error ? e : new Error(String(e));
-}
-
-// src/modules/auth.ts
-import crypto4 from "node:crypto";
-
-// src/crypto.ts
-import crypto3 from "node:crypto";
-import { promisify } from "node:util";
-var scryptAsync = promisify(crypto3.scrypt);
-var SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
-async function hashPassword(password) {
-  const salt = crypto3.randomBytes(16);
-  const key = await scryptAsync(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, maxmem: 64 * 1024 * 1024 });
-  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString("base64")}$${key.toString("base64")}`;
-}
-async function verifyPassword(password, stored) {
-  const parts = stored.split("$");
-  if (parts.length !== 6 || parts[0] !== "scrypt") return false;
-  const [N, r, p] = parts.slice(1, 4).map(Number);
-  const salt = Buffer.from(parts[4], "base64");
-  const expected = Buffer.from(parts[5], "base64");
-  const key = await scryptAsync(password, salt, expected.length, { N, r, p, maxmem: 64 * 1024 * 1024 });
-  return key.length === expected.length && crypto3.timingSafeEqual(key, expected);
-}
-var dummyHash = null;
-function burnPasswordTime(password) {
-  dummyHash ??= hashPassword("devora-dummy-password-for-timing");
-  return dummyHash.then((h) => verifyPassword(password, h));
-}
-function randomToken(bytes = 32) {
-  return crypto3.randomBytes(bytes).toString("base64url");
-}
-function sha256Hex(value) {
-  return crypto3.createHash("sha256").update(value, "utf8").digest("hex");
-}
-function parseKeyring(spec, active) {
-  const keys = /* @__PURE__ */ new Map();
-  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
-    const eq = entry.indexOf("=");
-    const id = Number(entry.slice(0, eq));
-    const key = Buffer.from(entry.slice(eq + 1), "base64");
-    if (eq < 1 || !Number.isInteger(id) || id < 1 || id > 999999) throw new Error("DEVORA_SECRET_KEYS entries must look like 1=<base64>");
-    if (key.length !== 32) throw new Error(`key ${id} must decode to 32 bytes`);
-    if (keys.has(id)) throw new Error(`key ${id} appears twice`);
-    keys.set(id, key);
-  }
-  if (keys.size === 0) return { size: 0, activeId: 0, keys };
-  const activeId = Number(active);
-  if (!Number.isInteger(activeId) || !keys.has(activeId)) throw new Error("DEVORA_SECRET_ACTIVE_KEY must name one of the ids in DEVORA_SECRET_KEYS");
-  return { size: keys.size, activeId, keys };
-}
-function sealSecret(keyring, plaintext, aad) {
-  const key = keyring.keys.get(keyring.activeId);
-  if (!key) throw new Error("no encryption key is configured; set DEVORA_SECRET_KEYS and DEVORA_SECRET_ACTIVE_KEY");
-  const iv = crypto3.randomBytes(12);
-  const cipher = crypto3.createCipheriv("aes-256-gcm", key, iv);
-  cipher.setAAD(Buffer.from(aad, "utf8"));
-  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  return { keyVersion: keyring.activeId, iv, ciphertext, tag: cipher.getAuthTag() };
-}
-function openSecret(keyring, sealed, aad) {
-  const key = keyring.keys.get(sealed.keyVersion);
-  if (!key) throw new Error(`encryption key ${sealed.keyVersion} is not configured; restore it before reading this secret`);
-  const decipher = crypto3.createDecipheriv("aes-256-gcm", key, sealed.iv);
-  decipher.setAAD(Buffer.from(aad, "utf8"));
-  decipher.setAuthTag(sealed.tag);
-  return Buffer.concat([decipher.update(sealed.ciphertext), decipher.final()]).toString("utf8");
-}
-
-// src/modules/auth.ts
 var SESSION_COOKIE = "devora_admin";
 var SESSION_HOURS = 12;
 var REAUTH_MINUTES = 5;
@@ -847,7 +440,7 @@ function requireCsrf(ctx, session) {
   const value = Array.isArray(sent) ? sent[0] : sent ?? "";
   const a = Buffer.from(value, "utf8");
   const b = Buffer.from(session.csrfToken, "utf8");
-  if (a.length === 0 || a.length !== b.length || !crypto4.timingSafeEqual(a, b)) {
+  if (a.length === 0 || a.length !== b.length || !crypto2.timingSafeEqual(a, b)) {
     fail(403, "csrf_failed", "the request could not be verified; reload the page and try again");
   }
 }
@@ -876,8 +469,8 @@ async function reauth(ctx) {
   const s = await ownerSession(ctx);
   requireCsrf(ctx, s);
   const ipKey = `reauth:ip:${ctx.ip}`;
-  const limit = await ctx.deps.limits.hit(ipKey, LOGIN_PER_IP, LOGIN_WINDOW_SECONDS);
-  if (!limit.allowed) fail(429, "rate_limited", "too many attempts; try again later", { "retry-after": String(limit.retryAfterSeconds) });
+  const limit2 = await ctx.deps.limits.hit(ipKey, LOGIN_PER_IP, LOGIN_WINDOW_SECONDS);
+  if (!limit2.allowed) fail(429, "rate_limited", "too many attempts; try again later", { "retry-after": String(limit2.retryAfterSeconds) });
   const body = requireObject(await readJson(ctx.req, 8 * 1024));
   rejectUnknown(body, ["password"]);
   const password = str(body, "password", { min: 1, max: 256, trim: false });
@@ -1286,6 +879,178 @@ async function setDeviceAccess(db, deviceId, access, modelIds) {
   });
 }
 
+// src/modules/devices.ts
+var REGISTER_PER_IP = 10;
+var REGISTER_WINDOW_SECONDS = 15 * 60;
+var DEVICE_TOUCH_SECONDS = 60;
+var INSTALL_ID = /^[A-Za-z0-9_-]{16,64}$/;
+async function registerDevice(ctx) {
+  const { db, config } = ctx.deps;
+  const ip = clientAddress(ctx.req, config.trustProxy);
+  const limit2 = await ctx.deps.limits.hit(`register:ip:${ip}`, REGISTER_PER_IP, REGISTER_WINDOW_SECONDS);
+  if (!limit2.allowed) fail(429, "rate_limited", "too many registrations from this network; try again later", { "retry-after": String(limit2.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["installId", "deviceName"]);
+  const installId = str(body, "installId", { min: 16, max: 64 });
+  if (!INSTALL_ID.test(installId)) fail(400, "invalid_request", "installId must be 16 to 64 letters, digits, _ or -");
+  const deviceName = str(body, "deviceName", { min: 1, max: 80 });
+  const token = randomToken(32);
+  const result = await db.transaction(async (q) => {
+    const { rows } = await q.query("SELECT id, status, user_id FROM devices WHERE install_id = $1 FOR UPDATE", [installId]);
+    const existing = rows[0];
+    if (existing) {
+      if (existing.status !== "active") return { blocked: true };
+      if (existing.user_id) return { account: true };
+      await q.query("UPDATE devices SET token_hash = $2, name = $3, last_seen_at = now() WHERE id = $1", [existing.id, sha256Hex(token), deviceName]);
+      return { id: existing.id, created: false };
+    }
+    const settings = await readSettings(q);
+    if (settings.allow_auto_registration === false) return { closed: true };
+    const dev = await q.query(
+      `INSERT INTO devices (name, token_hash, install_id, registered_via, last_seen_at) VALUES ($1, $2, $3, 'auto', now()) RETURNING id`,
+      [deviceName, sha256Hex(token), installId]
+    );
+    return { id: dev.rows[0].id, created: true };
+  });
+  if ("blocked" in result) fail(403, "device_blocked", "the owner has blocked this computer");
+  if ("account" in result) fail(409, "account_device", "this computer is signed in to a Devora account; sign in again to continue");
+  if ("closed" in result) fail(403, "registration_closed", "the owner is not accepting new computers right now");
+  sendJson(ctx.res, result.created ? 201 : 200, { deviceId: result.id, token, catalogueVersion: await catalogueVersion(db) });
+}
+function bearerToken(ctx) {
+  const m = /^Bearer\s+([A-Za-z0-9_-]{20,128})$/.exec(ctx.req.headers.authorization ?? "");
+  return m ? m[1] : null;
+}
+async function authenticateDevice(ctx, opts = {}) {
+  const central = opts.central !== false;
+  const token = bearerToken(ctx);
+  if (!token) fail(401, "unauthenticated", "a device token is required");
+  const hash = sha256Hex(token);
+  const { rows } = await ctx.deps.db.query(
+    `SELECT d.id, d.name, d.status, d.model_access, d.app_version, d.user_id, d.token_expires_at,
+            (d.token_hash = $1) AS current,
+            (d.prev_token_grace_until IS NOT NULL AND d.prev_token_grace_until > now()) AS in_grace,
+            (d.token_expires_at IS NOT NULL AND d.token_expires_at <= now()) AS expired,
+            (d.user_checked_at IS NULL OR d.user_checked_at < now() - make_interval(secs => $3)) AS recheck,
+            (d.user_checked_at IS NOT NULL AND d.user_checked_at > now() - make_interval(secs => $4)) AS recently_checked,
+            u.status AS user_status,
+            (d.last_seen_at IS NULL OR d.last_seen_at < now() - make_interval(secs => $2)) AS touch
+       FROM devices d LEFT JOIN app_users u ON u.user_id = d.user_id
+      WHERE d.token_hash = $1 OR d.prev_token_hash = $1`,
+    [hash, DEVICE_TOUCH_SECONDS, RECHECK_SECONDS, OFFLINE_GRACE_SECONDS]
+  );
+  const row = rows[0];
+  if (!row || row.status !== "active") fail(401, "device_revoked", "this device is not allowed to use the service");
+  if (!row.current && !row.in_grace) {
+    await endSession(ctx.deps.db, row.id, "token_reuse");
+    log("warn", "rotated device token reused; session ended", { deviceId: row.id });
+    fail(401, "session_revoked", "this sign-in was ended for security reasons; sign in again");
+  }
+  if (row.expired) fail(401, "token_expired", "this sign-in has expired; sign in again");
+  if (row.user_id) {
+    if (row.user_status === "blocked") fail(403, "account_blocked", "this account has been blocked by the administrator");
+    if (row.user_status === "deleting" || row.user_status === "deleted") fail(401, "account_deleted", "this account has been deleted");
+    if (row.recheck) {
+      const r = await recheckUser(ctx.deps, row.user_id);
+      if (r === "deleted") fail(401, "account_deleted", "this account has been deleted");
+      if (r === "unverified") fail(403, "email_not_verified", "verify your email address to use Devora AI");
+      if (r === "unavailable" && !row.recently_checked) {
+        fail(503, "accounts_unavailable", "the account service is temporarily unavailable; local features keep working", { "retry-after": "30" });
+      }
+    }
+  } else if (central && await requireLoginForCentralAi(ctx.deps.db)) {
+    fail(403, "login_required", "sign in to your Devora account to use Devora AI");
+  }
+  const reported = String(ctx.req.headers["x-devora-version"] ?? "");
+  const version2 = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]{1,30})?$/.test(reported) ? reported : null;
+  if (version2 && version2 !== row.app_version) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now(), app_version = $2 WHERE id = $1", [row.id, version2]);
+  else if (row.touch) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now() WHERE id = $1", [row.id]);
+  return {
+    deviceId: row.id,
+    name: row.name,
+    modelAccess: row.model_access,
+    userId: row.user_id ?? null,
+    tokenHash: hash,
+    tokenExpiresAt: row.token_expires_at ? new Date(row.token_expires_at).toISOString() : null
+  };
+}
+async function listDevices(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query(
+    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via, d.app_version,
+            d.user_id, d.signed_out_at, d.token_expires_at,
+            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted,
+            (SELECT count(*)::int FROM memory_entries me WHERE me.device_id = d.id AND me.deleted = false) AS memories
+       FROM devices d ORDER BY d.created_at DESC LIMIT 500`
+  );
+  sendJson(ctx.res, 200, {
+    devices: rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      status: r.status,
+      createdAt: r.created_at,
+      lastSeenAt: r.last_seen_at,
+      revokedAt: r.revoked_at,
+      modelAccess: r.model_access,
+      registeredVia: r.registered_via,
+      grantedModels: r.granted,
+      memories: r.memories,
+      appVersion: r.app_version ?? null,
+      userId: r.user_id ?? null,
+      signedIn: !!r.user_id && !r.signed_out_at
+    }))
+  });
+}
+async function revokeDevice(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["confirmName"]);
+  const confirm = str(body, "confirmName", { max: 80, optional: true });
+  const { rows } = await ctx.deps.db.query("SELECT name, status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (confirm !== rows[0].name) fail(400, "confirmation_mismatch", "type the device name exactly to block it");
+  if (rows[0].status === "revoked") fail(409, "already_revoked", "this device is already blocked");
+  await ctx.deps.db.query("UPDATE devices SET status = 'revoked', revoked_at = now() WHERE id = $1", [id]);
+  sendJson(ctx.res, 200, { id, status: "revoked" });
+}
+async function unblockDevice(ctx) {
+  await guardOwner(ctx, { write: true, sensitive: true });
+  const id = uuidParam(ctx.params.id);
+  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (rows[0].status === "active") fail(409, "not_blocked", "this device is not blocked");
+  await ctx.deps.db.query("UPDATE devices SET status = 'active', revoked_at = NULL, token_hash = $2 WHERE id = $1", [id, sha256Hex(randomToken(32))]);
+  sendJson(ctx.res, 200, { id, status: "active" });
+}
+async function getDeviceModels(ctx) {
+  await guardOwner(ctx, { write: false });
+  const id = uuidParam(ctx.params.id);
+  const { rows } = await ctx.deps.db.query("SELECT model_access FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  const granted = await ctx.deps.db.query("SELECT model_id FROM device_models WHERE device_id = $1 ORDER BY created_at", [id]);
+  sendJson(ctx.res, 200, { modelAccess: rows[0].model_access, modelIds: granted.rows.map((r) => r.model_id) });
+}
+async function putDeviceModels(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["modelAccess", "modelIds"]);
+  const access = body.modelAccess;
+  if (access !== "all" && access !== "selected") fail(400, "invalid_request", "modelAccess must be all or selected");
+  const raw = body.modelIds ?? [];
+  if (!Array.isArray(raw) || raw.length > 1e3) fail(400, "invalid_request", "modelIds must be a list of model ids");
+  const modelIds = [...new Set(raw.map((v) => uuidParam(typeof v === "string" ? v : "")))];
+  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
+  if (!rows[0]) fail(404, "not_found", "device not found");
+  if (modelIds.length) {
+    const found = await ctx.deps.db.query("SELECT count(*)::int AS n FROM models WHERE id IN (SELECT (jsonb_array_elements_text($1::jsonb))::uuid)", [modelIds]);
+    if (found.rows[0].n !== modelIds.length) fail(400, "invalid_request", "one or more models do not exist");
+  }
+  await setDeviceAccess(ctx.deps.db, id, access, access === "selected" ? modelIds : []);
+  sendJson(ctx.res, 200, { modelAccess: access, modelIds: access === "selected" ? modelIds : [] });
+}
+
 // src/modules/catalogue.ts
 var CAPABILITY_NAMES = ["streaming", "tools", "vision", "reasoning"];
 var CAPABILITY_SOURCES = ["unknown", "admin", "provider_reported", "test"];
@@ -1376,8 +1141,16 @@ async function catalogueRoute(ctx) {
   sendJson(ctx.res, 200, cat, { etag, "cache-control": "no-store" });
 }
 async function deviceRoute(ctx) {
-  const d = await authenticateDevice(ctx);
-  sendJson(ctx.res, 200, { deviceId: d.deviceId, name: d.name, status: "active", catalogueVersion: await catalogueVersion(ctx.deps.db) });
+  const d = await authenticateDevice(ctx, { central: false });
+  sendJson(ctx.res, 200, {
+    deviceId: d.deviceId,
+    name: d.name,
+    status: "active",
+    catalogueVersion: await catalogueVersion(ctx.deps.db),
+    signedIn: !!d.userId,
+    tokenExpiresAt: d.tokenExpiresAt,
+    loginRequired: await requireLoginForCentralAi(ctx.deps.db)
+  });
 }
 async function forDevice(ctx, cat, deviceId, access) {
   const allowed = await allowedModelIds(ctx.deps.db, deviceId, access);
@@ -1427,131 +1200,1187 @@ async function deviceUsageRoute(ctx) {
   });
 }
 
-// src/modules/devices.ts
-var REGISTER_PER_IP = 10;
-var REGISTER_WINDOW_SECONDS = 15 * 60;
-var DEVICE_TOUCH_SECONDS = 60;
-var INSTALL_ID = /^[A-Za-z0-9_-]{16,64}$/;
-async function registerDevice(ctx) {
-  const { db, config } = ctx.deps;
-  const ip = clientAddress(ctx.req, config.trustProxy);
-  const limit = await ctx.deps.limits.hit(`register:ip:${ip}`, REGISTER_PER_IP, REGISTER_WINDOW_SECONDS);
-  if (!limit.allowed) fail(429, "rate_limited", "too many registrations from this network; try again later", { "retry-after": String(limit.retryAfterSeconds) });
-  const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ["installId", "deviceName"]);
-  const installId = str(body, "installId", { min: 16, max: 64 });
-  if (!INSTALL_ID.test(installId)) fail(400, "invalid_request", "installId must be 16 to 64 letters, digits, _ or -");
-  const deviceName = str(body, "deviceName", { min: 1, max: 80 });
+// src/modules/sessions.ts
+var TOKEN_TTL_DAYS = 30;
+var ROTATE_GRACE_SECONDS = 120;
+var RECHECK_SECONDS = 15 * 60;
+var OFFLINE_GRACE_SECONDS = 24 * 3600;
+async function issueToken(q, deviceId) {
   const token = randomToken(32);
-  const result = await db.transaction(async (q) => {
-    const { rows } = await q.query("SELECT id, status FROM devices WHERE install_id = $1 FOR UPDATE", [installId]);
-    const existing = rows[0];
-    if (existing) {
-      if (existing.status !== "active") return { blocked: true };
-      await q.query("UPDATE devices SET token_hash = $2, name = $3, last_seen_at = now() WHERE id = $1", [existing.id, sha256Hex(token), deviceName]);
-      return { id: existing.id, created: false };
-    }
-    const settings = await readSettings(q);
-    if (settings.allow_auto_registration === false) return { closed: true };
-    const dev = await q.query(
-      `INSERT INTO devices (name, token_hash, install_id, registered_via, last_seen_at) VALUES ($1, $2, $3, 'auto', now()) RETURNING id`,
-      [deviceName, sha256Hex(token), installId]
-    );
-    return { id: dev.rows[0].id, created: true };
-  });
-  if ("blocked" in result) fail(403, "device_blocked", "the owner has blocked this computer");
-  if ("closed" in result) fail(403, "registration_closed", "the owner is not accepting new computers right now");
-  sendJson(ctx.res, result.created ? 201 : 200, { deviceId: result.id, token, catalogueVersion: await catalogueVersion(db) });
-}
-async function authenticateDevice(ctx) {
-  const header = ctx.req.headers.authorization ?? "";
-  const match2 = /^Bearer\s+([A-Za-z0-9_-]{20,128})$/.exec(header);
-  if (!match2) fail(401, "unauthenticated", "a device token is required");
-  const { rows } = await ctx.deps.db.query(
-    `SELECT id, name, status, model_access, app_version, (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $2)) AS touch
-       FROM devices WHERE token_hash = $1`,
-    [sha256Hex(match2[1]), DEVICE_TOUCH_SECONDS]
+  const { rows } = await q.query(
+    `UPDATE devices SET token_hash = $2, token_issued_at = now(), token_expires_at = now() + make_interval(days => $3),
+            prev_token_hash = NULL, prev_token_grace_until = NULL, signed_out_at = NULL, signed_out_reason = NULL,
+            user_checked_at = now(), last_seen_at = now()
+      WHERE id = $1 RETURNING token_expires_at`,
+    [deviceId, sha256Hex(token), TOKEN_TTL_DAYS]
   );
-  const row = rows[0];
-  if (!row || row.status !== "active") fail(401, "device_revoked", "this device is not allowed to use the service");
-  const reported = String(ctx.req.headers["x-devora-version"] ?? "");
-  const version2 = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]{1,30})?$/.test(reported) ? reported : null;
-  if (version2 && version2 !== row.app_version) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now(), app_version = $2 WHERE id = $1", [row.id, version2]);
-  else if (row.touch) await ctx.deps.db.query("UPDATE devices SET last_seen_at = now() WHERE id = $1", [row.id]);
-  return { deviceId: row.id, name: row.name, modelAccess: row.model_access };
+  return { token, expiresAt: new Date(rows[0].token_expires_at).toISOString() };
 }
-async function listDevices(ctx) {
-  await guardOwner(ctx, { write: false });
+async function rotateToken(q, deviceId, currentHash) {
+  const token = randomToken(32);
+  const { rows } = await q.query(
+    `UPDATE devices SET token_hash = $2, prev_token_hash = $3, prev_token_grace_until = now() + make_interval(secs => $4),
+            token_issued_at = now(), token_expires_at = now() + make_interval(days => $5)
+      WHERE id = $1 AND token_hash = $3 RETURNING token_expires_at`,
+    [deviceId, sha256Hex(token), currentHash, ROTATE_GRACE_SECONDS, TOKEN_TTL_DAYS]
+  );
+  if (!rows[0]) fail(409, "token_changed", "this sign-in changed; sign in again");
+  return { token, expiresAt: new Date(rows[0].token_expires_at).toISOString() };
+}
+async function endSession(q, deviceId, reason) {
+  await q.query(
+    `UPDATE devices SET token_hash = $2, prev_token_hash = NULL, prev_token_grace_until = NULL, signed_out_at = now(),
+            signed_out_reason = $3, install_id = NULL, token_expires_at = NULL
+      WHERE id = $1`,
+    [deviceId, sha256Hex(randomToken(32)), reason.slice(0, 40)]
+  );
+}
+async function endUserSessions(q, userId, reason) {
+  const { rows } = await q.query("SELECT id FROM devices WHERE user_id = $1 AND signed_out_at IS NULL", [userId]);
+  for (const r of rows) await endSession(q, r.id, reason);
+  return rows.length;
+}
+var loginCache = /* @__PURE__ */ new WeakMap();
+async function requireLoginForCentralAi(db) {
+  const hit = loginCache.get(db);
+  if (hit && Date.now() - hit.at < 5e3) return hit.value;
+  const s = await readSettings(db);
+  const value = s.require_login_for_central_ai === true;
+  loginCache.set(db, { value, at: Date.now() });
+  return value;
+}
+function forgetLoginSetting(db) {
+  loginCache.delete(db);
+}
+async function bindDevice(db, input) {
+  return db.transaction(async (q) => {
+    const u = await q.query(
+      `INSERT INTO app_users (user_id, last_login_at) VALUES ($1, now())
+       ON CONFLICT (user_id) DO UPDATE SET last_login_at = now() RETURNING status`,
+      [input.userId]
+    );
+    const status = u.rows[0].status;
+    if (status === "blocked") fail(403, "account_blocked", "this account has been blocked by the administrator");
+    if (status !== "active") fail(403, "account_deleted", "this account has been deleted");
+    const { rows } = await q.query("SELECT id, status, user_id, token_hash FROM devices WHERE install_id = $1 FOR UPDATE", [input.installId]);
+    const row = rows[0];
+    const proven = !!row && !!input.proofHash && row.token_hash === input.proofHash;
+    if (row && row.status !== "active") fail(403, "device_blocked", "the owner has blocked this computer");
+    let deviceId;
+    let claimed;
+    if (row && row.user_id === input.userId) {
+      deviceId = row.id;
+      claimed = "same_user";
+    } else if (row && row.user_id === null) {
+      if (!proven) fail(409, "device_proof_required", "this computer is registered already; sign in again from the Devora app on it");
+      deviceId = row.id;
+      claimed = "legacy";
+    } else if (row) {
+      if (!proven) fail(409, "device_proof_required", "this computer is signed in to another account; sign out there first");
+      await endSession(q, row.id, "switched_account");
+      deviceId = await newDevice(q, input);
+      claimed = "switched";
+    } else {
+      deviceId = await newDevice(q, input);
+      claimed = "new";
+    }
+    await q.query("UPDATE devices SET user_id = $2, name = $3, install_id = $4 WHERE id = $1", [deviceId, input.userId, input.deviceName, input.installId]);
+    const t = await issueToken(q, deviceId);
+    return { deviceId, ...t, claimed };
+  });
+}
+async function newDevice(q, input) {
+  const { rows } = await q.query(
+    `INSERT INTO devices (name, token_hash, registered_via, last_seen_at) VALUES ($1, $2, 'auto', now()) RETURNING id`,
+    [input.deviceName, sha256Hex(randomToken(32))]
+  );
+  return rows[0].id;
+}
+var inflight = /* @__PURE__ */ new Map();
+function recheckUser(deps, userId) {
+  const running = inflight.get(userId);
+  if (running) return running;
+  const p = (async () => {
+    if (!deps.pocketbase) return "unavailable";
+    try {
+      const user = await deps.pocketbase.getUser(userId);
+      if (!user) {
+        await markDeleted(deps.db, userId, "data");
+        void runDeletion(deps, userId).catch(() => void 0);
+        return "deleted";
+      }
+      if (!user.verified) return "unverified";
+      await deps.db.query("UPDATE devices SET user_checked_at = now() WHERE user_id = $1 AND signed_out_at IS NULL", [userId]);
+      return "ok";
+    } catch (e) {
+      log("warn", "account check failed", { reason: e instanceof PbError ? e.status : "error" });
+      return "unavailable";
+    }
+  })().finally(() => inflight.delete(userId));
+  inflight.set(userId, p);
+  return p;
+}
+async function markDeleted(db, userId, firstStep) {
+  await db.transaction(async (q) => {
+    await q.query(
+      `INSERT INTO app_users (user_id, status, deletion_requested_at, deletion_step) VALUES ($1, 'deleting', now(), $2)
+       ON CONFLICT (user_id) DO UPDATE SET status = 'deleting', deletion_requested_at = coalesce(app_users.deletion_requested_at, now()),
+         deletion_step = CASE WHEN app_users.status = 'deleting' THEN app_users.deletion_step ELSE EXCLUDED.deletion_step END
+       WHERE app_users.status <> 'deleted'`,
+      [userId, firstStep]
+    );
+    await endUserSessions(q, userId, "account_deleted");
+  });
+}
+async function runDeletion(deps, userId) {
+  for (let i = 0; i < 5; i++) {
+    const { rows } = await deps.db.query("SELECT status, deletion_step FROM app_users WHERE user_id = $1", [userId]);
+    const row = rows[0];
+    if (!row || row.status === "deleted") return "done";
+    if (row.status !== "deleting") return "pending";
+    try {
+      if (row.deletion_step === "devices") {
+        await deps.db.transaction(async (q) => {
+          await endUserSessions(q, userId, "account_deleted");
+          await q.query("UPDATE app_users SET deletion_step = 'data', deletion_error = NULL WHERE user_id = $1", [userId]);
+        });
+      } else if (row.deletion_step === "data") {
+        await deps.db.transaction(async (q) => {
+          await endUserSessions(q, userId, "account_deleted");
+          await q.query("DELETE FROM memory_entries WHERE device_id IN (SELECT id FROM devices WHERE user_id = $1)", [userId]);
+          await q.query("DELETE FROM auth_handoffs WHERE user_id = $1 OR expected_user_id = $1", [userId]);
+          await q.query("UPDATE devices SET user_id = NULL, name = 'Deleted account' WHERE user_id = $1", [userId]);
+          await q.query("UPDATE app_users SET deletion_step = 'identity', deletion_error = NULL WHERE user_id = $1", [userId]);
+        });
+      } else if (row.deletion_step === "identity") {
+        if (!deps.pocketbase) throw new PbError(0, "accounts are not configured on this server");
+        await deps.pocketbase.deleteUser(userId);
+        await deps.db.query("UPDATE app_users SET deletion_step = 'done', status = 'deleted', deleted_at = now(), deletion_error = NULL WHERE user_id = $1", [userId]);
+        return "done";
+      } else {
+        await deps.db.query("UPDATE app_users SET status = 'deleted', deleted_at = coalesce(deleted_at, now()) WHERE user_id = $1", [userId]);
+        return "done";
+      }
+    } catch (e) {
+      const msg = e instanceof PbError ? e.message : "the deletion step failed";
+      await deps.db.query("UPDATE app_users SET deletion_error = $2 WHERE user_id = $1", [userId, msg.slice(0, 200)]).catch(() => void 0);
+      log("warn", "account deletion step failed", { step: row.deletion_step });
+      return "pending";
+    }
+  }
+  return "pending";
+}
+async function accountMaintenance(deps) {
+  await deps.db.query("DELETE FROM auth_handoffs WHERE expires_at < now() - interval '1 hour'");
+  const { rows } = await deps.db.query("SELECT user_id FROM app_users WHERE status = 'deleting' ORDER BY deletion_requested_at LIMIT 20");
+  for (const r of rows) await runDeletion(deps, r.user_id);
+}
+
+// src/cli.ts
+import http2 from "node:http";
+
+// src/app.ts
+import http from "node:http";
+import crypto7 from "node:crypto";
+
+// src/db/migrate.ts
+import crypto3 from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+var LOCK_KEY = 727001001;
+function defaultMigrationsDir() {
+  if (process.env.DEVORA_MIGRATIONS_DIR) return path.resolve(process.env.DEVORA_MIGRATIONS_DIR);
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const c of [path.join(here, "..", "migrations"), path.join(here, "..", "..", "migrations")]) {
+    if (fs.existsSync(c)) return c;
+  }
+  throw new Error("migrations directory not found; set DEVORA_MIGRATIONS_DIR");
+}
+function loadMigrations(dir = defaultMigrationsDir()) {
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}_[a-z0-9_]+\.sql$/.test(f)).sort();
+  const seen = /* @__PURE__ */ new Set();
+  return files.map((file) => {
+    const m = /^(\d{4})_([a-z0-9_]+)\.sql$/.exec(file);
+    const version2 = Number(m[1]);
+    if (seen.has(version2)) throw new Error(`duplicate migration version ${version2}`);
+    seen.add(version2);
+    const text = fs.readFileSync(path.join(dir, file), "utf8");
+    const upIdx = text.indexOf("-- migrate:up");
+    const downIdx = text.indexOf("-- migrate:down");
+    if (upIdx < 0 || downIdx < 0 || downIdx < upIdx) throw new Error(`${file} must contain "-- migrate:up" followed by "-- migrate:down"`);
+    return {
+      version: version2,
+      name: m[2],
+      file,
+      checksum: crypto3.createHash("sha256").update(text).digest("hex"),
+      up: text.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
+      down: text.slice(downIdx + "-- migrate:down".length).trim()
+    };
+  });
+}
+async function ensureTable(c) {
+  await c.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version integer PRIMARY KEY,
+    name text NOT NULL,
+    checksum text NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+  )`);
+}
+async function withLock(db, fn) {
+  return db.withConnection(async (c) => {
+    await c.query("SELECT pg_advisory_lock($1)", [LOCK_KEY]);
+    try {
+      await ensureTable(c);
+      return await fn(c);
+    } finally {
+      await c.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY]).catch(() => void 0);
+    }
+  });
+}
+function verify(files, applied) {
+  const byVersion = new Map(files.map((f) => [f.version, f]));
+  for (const row of applied) {
+    const f = byVersion.get(row.version);
+    if (!f) throw new Error(`database has migration ${row.version} (${row.name}) that this server build does not contain; do not start an older build against a newer schema`);
+    if (f.checksum !== row.checksum) throw new Error(`migration ${f.file} was changed after it was applied; create a new migration instead`);
+  }
+}
+async function migrationStatus(db, files = loadMigrations()) {
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
+    verify(files, rows);
+    const appliedSet = new Set(rows.map((r) => r.version));
+    return {
+      applied: rows.map((r) => ({ version: r.version, name: r.name, appliedAt: r.applied_at.toISOString() })),
+      pending: files.filter((f) => !appliedSet.has(f.version)).map((f) => ({ version: f.version, name: f.name })),
+      currentVersion: rows.length ? Math.max(...rows.map((r) => r.version)) : 0,
+      latestVersion: files.length ? files[files.length - 1].version : 0
+    };
+  });
+}
+async function migrateUp(db, files = loadMigrations()) {
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version");
+    verify(files, rows);
+    const appliedSet = new Set(rows.map((r) => r.version));
+    const done = [];
+    for (const f of files) {
+      if (appliedSet.has(f.version)) continue;
+      await c.exec("BEGIN");
+      try {
+        await c.exec(f.up);
+        await c.query("INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)", [f.version, f.name, f.checksum]);
+        await c.exec("COMMIT");
+      } catch (e) {
+        await c.exec("ROLLBACK").catch(() => void 0);
+        throw new Error(`migration ${f.file} failed and was rolled back: ${e.message}`);
+      }
+      done.push(f.file);
+    }
+    return done;
+  });
+}
+async function migrateDown(db, steps, files = loadMigrations()) {
+  if (!Number.isInteger(steps) || steps < 1) throw new Error("steps must be a positive integer");
+  return withLock(db, async (c) => {
+    const { rows } = await c.query("SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version DESC");
+    verify(files, rows);
+    const reverted = [];
+    for (const row of rows.slice(0, steps)) {
+      const f = files.find((x) => x.version === row.version);
+      await c.exec("BEGIN");
+      try {
+        await c.exec(f.down);
+        await c.query("DELETE FROM schema_migrations WHERE version = $1", [f.version]);
+        await c.exec("COMMIT");
+      } catch (e) {
+        await c.exec("ROLLBACK").catch(() => void 0);
+        throw new Error(`reverting ${f.file} failed and was rolled back: ${e.message}`);
+      }
+      reverted.push(f.file);
+    }
+    return reverted;
+  });
+}
+
+// src/limits.ts
+import crypto4 from "node:crypto";
+
+// src/persistent-limits.ts
+async function hitRate(q, key, limit2, windowSeconds) {
+  const { rows } = await q.query(
+    `INSERT INTO rate_counters (key, bucket, count)
+     VALUES ($1, (floor(extract(epoch FROM now()) / $2) * $2)::bigint, 1)
+     ON CONFLICT (key, bucket) DO UPDATE SET count = rate_counters.count + 1
+     RETURNING count::int AS count,
+               greatest(1, ceil(bucket + $2 - extract(epoch FROM now())))::int AS retry_after`,
+    [key, windowSeconds]
+  );
+  const r = rows[0];
+  if (r.count > limit2) return { allowed: false, retryAfterSeconds: r.retry_after };
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+async function clearRate(q, key) {
+  await q.query("DELETE FROM rate_counters WHERE key = $1", [key]);
+}
+async function pruneRates(q) {
+  const { rowCount } = await q.query("DELETE FROM rate_counters WHERE bucket < extract(epoch FROM now())::bigint - 3600");
+  return rowCount;
+}
+async function acquireSlot(db, r) {
+  return db.transaction(async (q) => {
+    await q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`device-slot:${r.deviceId}`]);
+    await q.query("DELETE FROM device_request_leases WHERE device_id = $1 AND expires_at <= now()", [r.deviceId]);
+    if (r.clientRequestId) {
+      const seen = await q.query(
+        `SELECT 1 FROM device_request_leases WHERE device_id = $1 AND client_request_id = $2
+         UNION ALL
+         SELECT 1 FROM request_logs WHERE device_id = $1 AND client_request_id = $2
+         LIMIT 1`,
+        [r.deviceId, r.clientRequestId]
+      );
+      if (seen.rows.length) return "duplicate";
+    }
+    const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE device_id = $1", [r.deviceId]);
+    if (rows[0].n >= r.maxConcurrent) return "busy";
+    await q.query(
+      `INSERT INTO device_request_leases (device_id, request_id, client_request_id, expires_at)
+       VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
+      [r.deviceId, r.requestId, r.clientRequestId, r.leaseSeconds]
+    );
+    return "ok";
+  });
+}
+async function releaseSlot(q, requestId) {
+  await q.query("DELETE FROM device_request_leases WHERE request_id = $1", [requestId]);
+}
+async function activeLeaseCount(q) {
+  const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE expires_at > now()");
+  return rows[0].n;
+}
+
+// src/limits.ts
+var HIT_SCRIPT = `local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[1]); ttl = tonumber(ARGV[1]) end
+return {n, ttl}`;
+var UNLOCK_SCRIPT = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`;
+var RedisLimitStore = class {
+  constructor(redis, prefix = "devora") {
+    this.redis = redis;
+    this.prefix = prefix;
+  }
+  redis;
+  prefix;
+  kind = "redis";
+  k(kind, key) {
+    return `${this.prefix}:${kind}:${key}`;
+  }
+  async hit(key, limit2, windowSeconds) {
+    const r = await this.redis.command("EVAL", HIT_SCRIPT, 1, this.k("rl", key), windowSeconds * 1e3);
+    const [count, ttlMs] = r;
+    if (count > limit2) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlMs / 1e3)) };
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  async clear(key) {
+    await this.redis.command("DEL", this.k("rl", key));
+  }
+  async cacheGet(key) {
+    const v = await this.redis.command("GET", this.k("cache", key));
+    if (typeof v !== "string") return null;
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  async cacheSet(key, value, ttlSeconds) {
+    await this.redis.command("SET", this.k("cache", key), JSON.stringify(value), "EX", ttlSeconds);
+  }
+  async withLock(name, ttlMs, fn) {
+    const key = this.k("lock", name);
+    const token = crypto4.randomUUID();
+    const got = await this.redis.command("SET", key, token, "NX", "PX", ttlMs);
+    if (got !== "OK") return null;
+    try {
+      return await fn();
+    } finally {
+      await this.redis.command("EVAL", UNLOCK_SCRIPT, 1, key, token).catch(() => {
+      });
+    }
+  }
+};
+var DatabaseLimitStore = class {
+  constructor(db) {
+    this.db = db;
+  }
+  db;
+  kind = "database";
+  hit(key, limit2, windowSeconds) {
+    return hitRate(this.db, key, limit2, windowSeconds);
+  }
+  clear(key) {
+    return clearRate(this.db, key);
+  }
+  async cacheGet() {
+    return null;
+  }
+  async cacheSet() {
+  }
+  async withLock(_name, _ttlMs, fn) {
+    return fn();
+  }
+};
+
+// src/redis.ts
+import net from "node:net";
+import tls from "node:tls";
+import fs2 from "node:fs";
+var RedisUnavailableError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.name = "RedisUnavailableError";
+    this.code = code;
+  }
+};
+var RedisReplyError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RedisReplyError";
+  }
+};
+function parseRedisUrl(raw, env = {}) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("REDIS_URL must look like redis://default:PASSWORD@host:6379/0");
+  }
+  if (u.protocol !== "redis:" && u.protocol !== "rediss:") throw new Error("REDIS_URL must start with redis:// or rediss://");
+  if (!u.hostname) throw new Error("REDIS_URL has no host");
+  const db = u.pathname && u.pathname !== "/" ? Number(u.pathname.slice(1)) : 0;
+  if (!Number.isInteger(db) || db < 0 || db > 15) throw new Error("REDIS_URL database number must be 0 to 15");
+  const port = u.port ? Number(u.port) : 6379;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("REDIS_URL port is invalid");
+  const num = (v, def, name) => {
+    if (v === void 0 || v === "") return def;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 100 || n > 6e4) throw new Error(`${name} must be an integer from 100 to 60000`);
+    return n;
+  };
+  const cfg = {
+    host: u.hostname.replace(/^\[|\]$/g, ""),
+    port,
+    username: u.username ? decodeURIComponent(u.username) : null,
+    password: u.password ? decodeURIComponent(u.password) : null,
+    db,
+    tls: u.protocol === "rediss:",
+    connectTimeoutMs: num(env.REDIS_CONNECT_TIMEOUT_MS, 5e3, "REDIS_CONNECT_TIMEOUT_MS"),
+    commandTimeoutMs: num(env.REDIS_COMMAND_TIMEOUT_MS, 2e3, "REDIS_COMMAND_TIMEOUT_MS")
+  };
+  if (env.REDIS_TLS_CA_FILE) {
+    if (!cfg.tls) throw new Error("REDIS_TLS_CA_FILE needs a rediss:// URL");
+    if (!fs2.existsSync(env.REDIS_TLS_CA_FILE)) throw new Error("REDIS_TLS_CA_FILE does not exist");
+    cfg.caFile = env.REDIS_TLS_CA_FILE;
+  }
+  return cfg;
+}
+var ReplyParser = class {
+  buf = Buffer.alloc(0);
+  push(chunk) {
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+  }
+  /** Returns [value] for one complete reply, or null when more bytes are needed. Error replies come back as RedisReplyError values. */
+  next() {
+    const r = this.read(0);
+    if (!r) return null;
+    this.buf = this.buf.subarray(r[1]);
+    return [r[0]];
+  }
+  line(at) {
+    const end = this.buf.indexOf("\r\n", at);
+    if (end < 0) return null;
+    return [this.buf.toString("utf8", at, end), end + 2];
+  }
+  read(at) {
+    if (at >= this.buf.length) return null;
+    const type = String.fromCharCode(this.buf[at]);
+    const l = this.line(at + 1);
+    if (!l) return null;
+    const [text, after] = l;
+    switch (type) {
+      case "+":
+        return [text, after];
+      case "-":
+        return [new RedisReplyError(text), after];
+      case ":":
+        return [Number(text), after];
+      case "$": {
+        const len = Number(text);
+        if (len < 0) return [null, after];
+        if (this.buf.length < after + len + 2) return null;
+        return [this.buf.toString("utf8", after, after + len), after + len + 2];
+      }
+      case "*": {
+        const n = Number(text);
+        if (n < 0) return [null, after];
+        const out = [];
+        let pos = after;
+        for (let i = 0; i < n; i++) {
+          const item = this.read(pos);
+          if (!item) return null;
+          out.push(item[0] instanceof RedisReplyError ? item[0].message : item[0]);
+          pos = item[1];
+        }
+        return [out, pos];
+      }
+      default:
+        throw new RedisUnavailableError("redis_protocol", `unexpected reply type from Redis`);
+    }
+  }
+};
+function encode(args) {
+  const parts = [Buffer.from(`*${args.length}\r
+`)];
+  for (const a of args) {
+    const b = Buffer.from(String(a), "utf8");
+    parts.push(Buffer.from(`$${b.length}\r
+`), b, Buffer.from("\r\n"));
+  }
+  return Buffer.concat(parts);
+}
+var BACKOFF_MIN_MS = 250;
+var BACKOFF_MAX_MS = 3e4;
+var Redis = class {
+  constructor(cfg, onEvent = () => {
+  }) {
+    this.cfg = cfg;
+    this.onEvent = onEvent;
+  }
+  cfg;
+  onEvent;
+  socket = null;
+  connecting = null;
+  /** Each connection has its own reply queue and parser, so a dying old connection never touches a new one. */
+  conns = /* @__PURE__ */ new Map();
+  closed = false;
+  failures = 0;
+  retryAt = 0;
+  lastError = null;
+  /** Host and port only, for logs and the health view. Never includes credentials. */
+  get target() {
+    return `${this.cfg.tls ? "rediss" : "redis"}://${this.cfg.host}:${this.cfg.port}/${this.cfg.db}`;
+  }
+  get connected() {
+    return this.socket !== null && !this.socket.destroyed;
+  }
+  get lastFailure() {
+    return this.lastError;
+  }
+  /** Sends one command. Connects (or reconnects) first when needed; fails fast during the backoff window. */
+  async command(...args) {
+    const socket = await this.ensure();
+    return this.send(socket, args);
+  }
+  async ping() {
+    const t = Date.now();
+    const r = await this.command("PING");
+    if (r !== "PONG") throw new RedisUnavailableError("redis_bad_reply", "Redis did not answer PING");
+    return Date.now() - t;
+  }
+  /** Graceful shutdown: QUIT, then close. Pending commands are rejected. */
+  async close() {
+    this.closed = true;
+    const s = this.socket;
+    if (!s || s.destroyed) return;
+    try {
+      await Promise.race([this.send(s, ["QUIT"]), new Promise((r) => setTimeout(r, 1e3).unref())]);
+    } catch {
+    }
+    s.destroy();
+    this.socket = null;
+  }
+  send(socket, args) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fail(socket, new RedisUnavailableError("redis_timeout", `Redis did not answer within ${this.cfg.commandTimeoutMs} ms`));
+      }, this.cfg.commandTimeoutMs);
+      timer.unref();
+      const conn = this.conns.get(socket);
+      if (!conn || socket.destroyed) {
+        clearTimeout(timer);
+        reject(new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
+        return;
+      }
+      conn.pending.push({ resolve, reject, timer });
+      socket.write(encode(args));
+    });
+  }
+  ensure() {
+    if (this.closed) return Promise.reject(new RedisUnavailableError("redis_closed", "the Redis client is shut down"));
+    if (this.socket && !this.socket.destroyed) return Promise.resolve(this.socket);
+    if (this.connecting) return this.connecting;
+    const now = Date.now();
+    if (now < this.retryAt) {
+      return Promise.reject(new RedisUnavailableError("redis_unavailable", `Redis is unavailable (${this.lastError ?? "connection failed"}); retrying in ${Math.ceil((this.retryAt - now) / 1e3)} s`));
+    }
+    this.connecting = this.open().then(
+      (s) => {
+        if (this.failures > 0) this.onEvent("info", "redis reconnected", { target: this.target });
+        this.failures = 0;
+        this.retryAt = 0;
+        this.lastError = null;
+        this.connecting = null;
+        return s;
+      },
+      (e) => {
+        this.failures += 1;
+        const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** (this.failures - 1));
+        this.retryAt = Date.now() + delay;
+        this.lastError = e.message;
+        this.connecting = null;
+        this.onEvent("error", "redis connection failed", { target: this.target, reason: e.message, retryInMs: delay });
+        throw e instanceof RedisUnavailableError ? e : new RedisUnavailableError("redis_unavailable", e.message);
+      }
+    );
+    return this.connecting;
+  }
+  open() {
+    return new Promise((resolve, reject) => {
+      const c = this.cfg;
+      const socket = c.tls ? tls.connect({ host: c.host, port: c.port, servername: net.isIP(c.host) ? void 0 : c.host, ca: c.caFile ? fs2.readFileSync(c.caFile) : void 0 }) : net.connect({ host: c.host, port: c.port });
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 3e4);
+      let settled = false;
+      const timer = setTimeout(() => done(new RedisUnavailableError("redis_timeout", `could not connect to Redis within ${c.connectTimeoutMs} ms`)), c.connectTimeoutMs);
+      timer.unref();
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) {
+          socket.destroy();
+          reject(err);
+        } else resolve(socket);
+      };
+      this.conns.set(socket, { pending: [], parser: new ReplyParser() });
+      socket.on("data", (chunk) => this.onData(socket, chunk));
+      socket.on("error", (e) => {
+        const err = new RedisUnavailableError("redis_unavailable", e.code ? `network error ${e.code}` : "network error");
+        if (!settled) done(err);
+        else this.fail(socket, err);
+      });
+      socket.on("close", () => {
+        if (!settled) done(new RedisUnavailableError("redis_unavailable", "the connection closed during setup"));
+        else this.fail(socket, new RedisUnavailableError("redis_unavailable", "the Redis connection closed"));
+      });
+      socket.once(c.tls ? "secureConnect" : "connect", async () => {
+        try {
+          if (c.password !== null) {
+            const args = c.username ? ["AUTH", c.username, c.password] : ["AUTH", c.password];
+            await this.send(socket, args).catch((e) => {
+              throw authError(e);
+            });
+          }
+          if (c.db)
+            await this.send(socket, ["SELECT", c.db]).catch((e) => {
+              throw authError(e);
+            });
+          await this.send(socket, ["PING"]).catch((e) => {
+            throw authError(e);
+          });
+          this.socket = socket;
+          done(null);
+        } catch (e) {
+          done(e instanceof Error ? e : new Error(String(e)));
+        }
+      });
+    });
+  }
+  onData(socket, chunk) {
+    const conn = this.conns.get(socket);
+    if (!conn) return;
+    conn.parser.push(chunk);
+    for (; ; ) {
+      let r;
+      try {
+        r = conn.parser.next();
+      } catch (e) {
+        this.fail(socket, e);
+        return;
+      }
+      if (!r) return;
+      const p = conn.pending.shift();
+      if (!p) continue;
+      clearTimeout(p.timer);
+      if (r[0] instanceof RedisReplyError) p.reject(r[0]);
+      else p.resolve(r[0]);
+    }
+  }
+  fail(socket, err) {
+    if (this.socket === socket) {
+      this.socket = null;
+      if (!this.closed) {
+        this.lastError = err.message;
+        this.onEvent("warn", "redis connection lost", { target: this.target, reason: err.message });
+      }
+    }
+    socket.destroy();
+    const pending = this.conns.get(socket)?.pending ?? [];
+    this.conns.delete(socket);
+    for (const p of pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+  }
+};
+function authError(e) {
+  const m = e instanceof Error ? e.message : "";
+  if (/NOAUTH/i.test(m)) return new RedisUnavailableError("redis_auth_required", "Redis requires a password; put it in REDIS_URL (redis://default:PASSWORD@host:6379/0)");
+  if (/WRONGPASS|invalid password|invalid username/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "Redis rejected the username or password in REDIS_URL");
+  if (/AUTH.*no password is set|without any password configured/i.test(m)) return new RedisUnavailableError("redis_auth_failed", "REDIS_URL has a password but this Redis server has none set");
+  return e instanceof Error ? e : new Error(String(e));
+}
+
+// src/modules/accounts.ts
+import crypto5 from "node:crypto";
+var INSTALL_ID2 = /^[A-Za-z0-9_-]{16,64}$/;
+var HANDOFF_SECONDS = 10 * 60;
+var RESULT_SECONDS = 60;
+var WINDOW = 15 * 60;
+function pb(deps) {
+  if (!deps.pocketbase) fail(503, "accounts_not_configured", "Devora accounts are not set up on this server");
+  return deps.pocketbase;
+}
+async function limit(ctx, key, max, windowSeconds = WINDOW) {
+  const r = await ctx.deps.limits.hit(key, max, windowSeconds);
+  if (!r.allowed) fail(429, "rate_limited", "too many attempts; try again later", { "retry-after": String(r.retryAfterSeconds) });
+}
+function pbFail(e, what = "the sign-in is not valid or has expired") {
+  if (e instanceof PbError && e.status === 0) fail(503, "accounts_unavailable", "the account service is temporarily unavailable; try again shortly", { "retry-after": "15" });
+  if (e instanceof PbError && e.status >= 500) fail(503, "accounts_unavailable", "the account service is temporarily unavailable; try again shortly", { "retry-after": "15" });
+  if (e instanceof PbError) fail(401, "invalid_credentials", what);
+  throw e;
+}
+function publicUser(u) {
+  return { id: u.id, email: u.email, name: u.name, verified: u.verified };
+}
+async function signIn(ctx, user, installId, deviceName) {
+  if (!user.verified) fail(403, "email_not_verified", "verify your email address first: open the link PocketBase emailed to you");
+  const proof = bearerToken(ctx);
+  const bound = await bindDevice(ctx.deps.db, { userId: user.id, installId, deviceName, proofHash: proof ? sha256Hex(proof) : null });
+  log("info", "device signed in", { deviceId: bound.deviceId, claimed: bound.claimed });
+  return { deviceId: bound.deviceId, token: bound.token, tokenExpiresAt: bound.expiresAt, claimed: bound.claimed, user: publicUser(user) };
+}
+async function authConfig(ctx) {
+  const p = ctx.deps.pocketbase;
+  const loginRequired = await requireLoginForCentralAi(ctx.deps.db);
+  if (!p) {
+    sendJson(ctx.res, 200, { enabled: false, loginRequired, pocketbaseUrl: null, usersCollection: null, providers: [] });
+    return;
+  }
+  let providers = [];
+  let available = true;
+  try {
+    if (ctx.deps.config.publicApiOrigin) providers = (await p.providers()).map((x) => ({ name: x.name, displayName: x.displayName }));
+  } catch {
+    available = false;
+  }
+  sendJson(ctx.res, 200, { enabled: true, available, loginRequired, pocketbaseUrl: p.cfg.url, usersCollection: p.cfg.usersCollection, providers });
+}
+async function createSession(ctx) {
+  const p = pb(ctx.deps);
+  await limit(ctx, `auth:session:ip:${ctx.ip}`, 30);
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["pbToken", "installId", "deviceName"]);
+  const pbToken = str(body, "pbToken", { min: 20, max: 4096 });
+  const installId = str(body, "installId", { min: 16, max: 64 });
+  if (!INSTALL_ID2.test(installId)) fail(400, "invalid_request", "installId must be 16 to 64 letters, digits, _ or -");
+  const deviceName = str(body, "deviceName", { min: 1, max: 80 });
+  let user;
+  try {
+    const fromToken = await p.verifyUserToken(pbToken);
+    const current = await p.getUser(fromToken.id);
+    if (!current) fail(401, "invalid_credentials", "the sign-in is not valid or has expired");
+    user = current;
+  } catch (e) {
+    pbFail(e);
+  }
+  sendJson(ctx.res, 200, await signIn(ctx, user, installId, deviceName));
+}
+async function oauthStart(ctx) {
+  const deps = ctx.deps;
+  const p = pb(deps);
+  await limit(ctx, `auth:oauth:start:ip:${ctx.ip}`, 30);
+  if (!deps.config.publicApiOrigin) fail(503, "oauth_not_configured", "browser sign-in needs PUBLIC_API_ORIGIN on the server");
+  if (deps.config.keyring.size === 0) fail(503, "oauth_not_configured", "browser sign-in needs DEVORA_SECRET_KEYS on the server");
+  const body = requireObject(await readJson(ctx.req, 16 * 1024));
+  rejectUnknown(body, ["provider", "purpose", "loopbackPort", "loopbackNonce", "pbToken"]);
+  const providerName = str(body, "provider", { min: 1, max: 40, pattern: /^[a-z0-9_]+$/ });
+  const purpose = body.purpose ?? "login";
+  if (purpose !== "login" && purpose !== "link" && purpose !== "reauth") fail(400, "invalid_request", "purpose must be login, link or reauth");
+  const loopbackPort = int(body, "loopbackPort", { min: 1024, max: 65535 });
+  const loopbackNonce = str(body, "loopbackNonce", { min: 16, max: 64, pattern: /^[A-Za-z0-9_-]+$/ });
+  let deviceId = null;
+  let expectedUserId = null;
+  let userToken = null;
+  if (purpose !== "login") {
+    const device = await authenticateDevice(ctx, { central: false });
+    if (!device.userId) fail(403, "not_signed_in", "sign in first");
+    deviceId = device.deviceId;
+    expectedUserId = device.userId;
+    if (purpose === "link") {
+      userToken = str(body, "pbToken", { min: 20, max: 4096 });
+      try {
+        const u = await p.verifyUserToken(userToken);
+        if (u.id !== expectedUserId) fail(403, "account_mismatch", "this sign-in belongs to a different account");
+      } catch (e) {
+        pbFail(e);
+      }
+    }
+  } else if (body.pbToken !== void 0) fail(400, "invalid_request", "pbToken is only used for linking");
+  let providers;
+  try {
+    providers = await p.providers();
+  } catch (e) {
+    pbFail(e);
+  }
+  const provider = providers.find((x) => x.name === providerName);
+  if (!provider) fail(404, "provider_not_enabled", "this sign-in method is not enabled");
+  if (provider.codeChallengeMethod && provider.codeChallengeMethod !== "S256") fail(503, "oauth_not_configured", "this provider is not configured for PKCE S256");
+  if (!provider.authURL.endsWith("redirect_uri=")) fail(502, "oauth_not_configured", "the account service returned an unexpected sign-in address");
+  const authUrlBase = new URL(provider.authURL);
+  if (deps.config.env === "production" && authUrlBase.protocol !== "https:") fail(502, "oauth_not_configured", "the provider sign-in address must use https");
+  if (authUrlBase.searchParams.get("state") !== provider.state) fail(502, "oauth_not_configured", "the account service returned an inconsistent sign-in state");
+  const redirectUri = `${deps.config.publicApiOrigin}/v1/auth/oauth/callback`;
+  const id = crypto5.randomUUID();
+  const secret = randomToken(32);
+  const sealed = userToken ? sealJson(deps, sealSecret(deps.config.keyring, userToken, `auth_handoff:${id}`)) : null;
+  await deps.db.query(
+    `INSERT INTO auth_handoffs (id, purpose, provider, state_hash, secret_hash, code_verifier, redirect_uri, loopback_port, loopback_nonce,
+                                device_id, expected_user_id, user_token_sealed, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now() + make_interval(secs => $13))`,
+    [id, purpose, provider.name, sha256Hex(provider.state), sha256Hex(secret), provider.codeVerifier, redirectUri, loopbackPort, loopbackNonce, deviceId, expectedUserId, sealed, HANDOFF_SECONDS]
+  );
+  sendJson(ctx.res, 200, { authUrl: provider.authURL + encodeURIComponent(redirectUri), handoffSecret: secret, expiresIn: HANDOFF_SECONDS, provider: provider.name });
+}
+function sealJson(_deps, s) {
+  return { k: s.keyVersion, iv: s.iv.toString("base64"), c: s.ciphertext.toString("base64"), t: s.tag.toString("base64") };
+}
+function openJson(deps, v, id) {
+  return openSecret(deps.config.keyring, { keyVersion: v.k, iv: Buffer.from(v.iv, "base64"), ciphertext: Buffer.from(v.c, "base64"), tag: Buffer.from(v.t, "base64") }, `auth_handoff:${id}`);
+}
+var PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+function page(ctx, status, title, text) {
+  const esc = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#000;color:#fff;font:15px/1.5 system-ui,sans-serif}main{max-width:420px;padding:24px;text-align:center}h1{font-size:20px;margin:0 0 8px}p{color:#a1a1aa;margin:0}</style>
+<main><h1>${esc(title)}</h1><p>${esc(text)}</p></main>`;
+  ctx.res.writeHead(status, { "content-type": "text/html; charset=utf-8", "content-security-policy": PAGE_CSP, "cache-control": "no-store" });
+  ctx.res.end(html);
+}
+async function oauthCallback(ctx) {
+  const deps = ctx.deps;
+  await limit(ctx, `auth:oauth:callback:ip:${ctx.ip}`, 60);
+  const q = ctx.url.searchParams;
+  const state = q.get("state") ?? "";
+  if (!/^[A-Za-z0-9_.~-]{8,200}$/.test(state)) return page(ctx, 400, "Sign-in failed", "This sign-in link is not valid. Start again from the Devora app.");
+  const { rows } = await deps.db.query(
+    `UPDATE auth_handoffs SET status = 'failed', error_code = 'in_progress'
+      WHERE state_hash = $1 AND status = 'pending' AND expires_at > now()
+      RETURNING id, purpose, provider, code_verifier, redirect_uri, loopback_port, loopback_nonce, expected_user_id, user_token_sealed`,
+    [sha256Hex(state)]
+  );
+  const h = rows[0];
+  if (!h) return page(ctx, 400, "Sign-in expired", "This sign-in was already used or has expired. Start again from the Devora app.");
+  const back = (params) => {
+    const u = new URL(`http://127.0.0.1:${h.loopback_port}/devora-auth`);
+    u.searchParams.set("nonce", h.loopback_nonce);
+    for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+    ctx.res.writeHead(302, { location: u.toString(), "cache-control": "no-store", "referrer-policy": "no-referrer" });
+    ctx.res.end();
+  };
+  const failWith = async (code2) => {
+    await deps.db.query("UPDATE auth_handoffs SET status = 'failed', error_code = $2, user_token_sealed = NULL WHERE id = $1", [h.id, code2]);
+    back({ error: code2 });
+  };
+  const code = q.get("code") ?? "";
+  if (q.get("error") || !code || code.length > 2048) return failWith(q.get("error") === "access_denied" ? "cancelled" : "provider_error");
+  let userToken;
+  try {
+    if (h.user_token_sealed) userToken = openJson(deps, h.user_token_sealed, h.id);
+  } catch {
+    return failWith("server_error");
+  }
+  let user;
+  let pbToken;
+  try {
+    const r = await pb(deps).finishOAuth({ provider: h.provider, code, codeVerifier: h.code_verifier, redirectUrl: h.redirect_uri, userToken });
+    user = r.user;
+    pbToken = r.token;
+    const current = await pb(deps).getUser(user.id);
+    if (!current) return failWith("invalid_account");
+    user = current;
+  } catch (e) {
+    log("warn", "oauth sign-in failed", { reason: e instanceof PbError ? e.status : "error" });
+    return failWith(e instanceof PbError && e.status === 0 ? "accounts_unavailable" : "sign_in_failed");
+  }
+  if (h.expected_user_id && user.id !== h.expected_user_id) return failWith(h.purpose === "link" ? "identity_in_use" : "account_mismatch");
+  if (h.purpose === "login" && !user.verified) return failWith("email_not_verified");
+  const resultCode = randomToken(32);
+  const sealed = h.purpose === "login" ? sealJson(deps, sealSecret(deps.config.keyring, pbToken, `auth_handoff:${h.id}`)) : null;
+  await deps.db.query(
+    `UPDATE auth_handoffs SET status = 'completed', error_code = NULL, user_id = $2, result_code_hash = $3,
+            result_expires_at = now() + make_interval(secs => $4), user_token_sealed = $5
+      WHERE id = $1`,
+    [h.id, user.id, sha256Hex(resultCode), RESULT_SECONDS, sealed]
+  );
+  back({ code: resultCode });
+}
+async function consumeHandoff(ctx, code, secret, purpose) {
   const { rows } = await ctx.deps.db.query(
-    `SELECT d.id, d.name, d.status, d.created_at, d.last_seen_at, d.revoked_at, d.model_access, d.registered_via, d.app_version,
-            (SELECT count(*)::int FROM device_models dm WHERE dm.device_id = d.id) AS granted,
-            (SELECT count(*)::int FROM memory_entries me WHERE me.device_id = d.id AND me.deleted = false) AS memories
-       FROM devices d ORDER BY d.created_at DESC LIMIT 500`
+    `UPDATE auth_handoffs h SET status = 'consumed', consumed_at = now(), user_token_sealed = NULL
+       FROM (SELECT id, user_token_sealed FROM auth_handoffs WHERE result_code_hash = $1 FOR UPDATE) old
+      WHERE h.id = old.id AND h.status = 'completed' AND h.result_expires_at > now()
+      RETURNING h.id, h.purpose, h.provider, h.secret_hash, h.user_id, h.device_id, old.user_token_sealed AS sealed_before`,
+    [sha256Hex(code)]
+  );
+  const h = rows[0];
+  if (!h || h.secret_hash !== sha256Hex(secret) || h.purpose !== purpose) fail(400, "invalid_code", "this sign-in code is not valid or has expired; start again");
+  return h;
+}
+async function exchange(ctx) {
+  const deps = ctx.deps;
+  pb(deps);
+  await limit(ctx, `auth:exchange:ip:${ctx.ip}`, 30);
+  const body = requireObject(await readJson(ctx.req, 8 * 1024));
+  rejectUnknown(body, ["code", "handoffSecret", "installId", "deviceName"]);
+  const code = str(body, "code", { min: 20, max: 128 });
+  const secret = str(body, "handoffSecret", { min: 20, max: 128 });
+  const kind = await deps.db.query("SELECT purpose FROM auth_handoffs WHERE result_code_hash = $1 AND status = 'completed'", [sha256Hex(code)]);
+  const purpose = kind.rows[0]?.purpose;
+  if (purpose === "link") {
+    const device = await authenticateDevice(ctx, { central: false });
+    const h2 = await consumeHandoff(ctx, code, secret, "link");
+    if (h2.device_id !== device.deviceId || h2.user_id !== device.userId) fail(400, "invalid_code", "this sign-in code is not valid or has expired; start again");
+    sendJson(ctx.res, 200, { linked: true, provider: h2.provider });
+    return;
+  }
+  const installId = str(body, "installId", { min: 16, max: 64 });
+  if (!INSTALL_ID2.test(installId)) fail(400, "invalid_request", "installId must be 16 to 64 letters, digits, _ or -");
+  const deviceName = str(body, "deviceName", { min: 1, max: 80 });
+  const h = await consumeHandoff(ctx, code, secret, "login");
+  let pbToken = null;
+  try {
+    pbToken = h.sealed_before ? openJson(deps, h.sealed_before, h.id) : null;
+  } catch {
+    pbToken = null;
+  }
+  let user;
+  try {
+    user = await pb(deps).getUser(h.user_id);
+  } catch (e) {
+    pbFail(e);
+  }
+  if (!user) fail(401, "invalid_credentials", "the sign-in is not valid or has expired");
+  sendJson(ctx.res, 200, { ...await signIn(ctx, user, installId, deviceName), pbToken });
+}
+async function signedIn(ctx) {
+  const device = await authenticateDevice(ctx, { central: false });
+  if (!device.userId) fail(403, "not_signed_in", "this computer is not signed in to a Devora account");
+  return device;
+}
+async function refresh(ctx) {
+  const device = await signedIn(ctx);
+  await limit(ctx, `auth:refresh:dev:${device.deviceId}`, 30, 3600);
+  const t = await rotateToken(ctx.deps.db, device.deviceId, device.tokenHash);
+  sendJson(ctx.res, 200, { token: t.token, tokenExpiresAt: t.expiresAt });
+}
+async function logout2(ctx) {
+  const token = bearerToken(ctx);
+  if (!token) fail(401, "unauthenticated", "a device token is required");
+  const { rows } = await ctx.deps.db.query("SELECT id, user_id FROM devices WHERE token_hash = $1 OR prev_token_hash = $1", [sha256Hex(token)]);
+  if (rows[0]?.user_id) await endSession(ctx.deps.db, rows[0].id, "logout");
+  sendJson(ctx.res, 200, { signedOut: true });
+}
+async function account(ctx) {
+  const device = await signedIn(ctx);
+  const p = pb(ctx.deps);
+  let user;
+  let identities;
+  try {
+    user = await p.getUser(device.userId);
+    identities = user ? await p.externalAuths(user.id) : [];
+  } catch (e) {
+    pbFail(e);
+  }
+  if (!user) fail(401, "account_deleted", "this account has been deleted");
+  const { rows } = await ctx.deps.db.query(
+    `SELECT id, name, created_at, last_seen_at, app_version, signed_out_at FROM devices
+      WHERE user_id = $1 ORDER BY (signed_out_at IS NULL) DESC, last_seen_at DESC NULLS LAST LIMIT 50`,
+    [device.userId]
   );
   sendJson(ctx.res, 200, {
-    devices: rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      status: r.status,
-      createdAt: r.created_at,
-      lastSeenAt: r.last_seen_at,
-      revokedAt: r.revoked_at,
-      modelAccess: r.model_access,
-      registeredVia: r.registered_via,
-      grantedModels: r.granted,
-      memories: r.memories,
-      appVersion: r.app_version ?? null
-    }))
+    user: { ...publicUser(user), created: user.created, hasAvatar: !!user.avatar },
+    identities,
+    tokenExpiresAt: device.tokenExpiresAt,
+    devices: rows.map((r) => ({ id: r.id, name: r.name, createdAt: r.created_at, lastSeenAt: r.last_seen_at, appVersion: r.app_version, signedIn: !r.signed_out_at, current: r.id === device.deviceId }))
   });
 }
-async function revokeDevice(ctx) {
-  await guardOwner(ctx, { write: true, sensitive: true });
+async function signOutDevice(ctx) {
+  const device = await signedIn(ctx);
   const id = uuidParam(ctx.params.id);
-  const body = requireObject(await readJson(ctx.req, 4 * 1024));
-  rejectUnknown(body, ["confirmName"]);
-  const confirm = str(body, "confirmName", { max: 80, optional: true });
-  const { rows } = await ctx.deps.db.query("SELECT name, status FROM devices WHERE id = $1", [id]);
-  if (!rows[0]) fail(404, "not_found", "device not found");
-  if (confirm !== rows[0].name) fail(400, "confirmation_mismatch", "type the device name exactly to block it");
-  if (rows[0].status === "revoked") fail(409, "already_revoked", "this device is already blocked");
-  await ctx.deps.db.query("UPDATE devices SET status = 'revoked', revoked_at = now() WHERE id = $1", [id]);
-  sendJson(ctx.res, 200, { id, status: "revoked" });
+  const { rows } = await ctx.deps.db.query("SELECT user_id, signed_out_at FROM devices WHERE id = $1", [id]);
+  if (!rows[0] || rows[0].user_id !== device.userId) fail(404, "not_found", "device not found");
+  if (!rows[0].signed_out_at) await endSession(ctx.deps.db, id, "signed_out_remotely");
+  sendJson(ctx.res, 200, { id, signedIn: false });
 }
-async function unblockDevice(ctx) {
-  await guardOwner(ctx, { write: true, sensitive: true });
-  const id = uuidParam(ctx.params.id);
-  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
-  if (!rows[0]) fail(404, "not_found", "device not found");
-  if (rows[0].status === "active") fail(409, "not_blocked", "this device is not blocked");
-  await ctx.deps.db.query("UPDATE devices SET status = 'active', revoked_at = NULL, token_hash = $2 WHERE id = $1", [id, sha256Hex(randomToken(32))]);
-  sendJson(ctx.res, 200, { id, status: "active" });
-}
-async function getDeviceModels(ctx) {
-  await guardOwner(ctx, { write: false });
-  const id = uuidParam(ctx.params.id);
-  const { rows } = await ctx.deps.db.query("SELECT model_access FROM devices WHERE id = $1", [id]);
-  if (!rows[0]) fail(404, "not_found", "device not found");
-  const granted = await ctx.deps.db.query("SELECT model_id FROM device_models WHERE device_id = $1 ORDER BY created_at", [id]);
-  sendJson(ctx.res, 200, { modelAccess: rows[0].model_access, modelIds: granted.rows.map((r) => r.model_id) });
-}
-async function putDeviceModels(ctx) {
-  await guardOwner(ctx, { write: true });
-  const id = uuidParam(ctx.params.id);
-  const body = requireObject(await readJson(ctx.req, 64 * 1024));
-  rejectUnknown(body, ["modelAccess", "modelIds"]);
-  const access = body.modelAccess;
-  if (access !== "all" && access !== "selected") fail(400, "invalid_request", "modelAccess must be all or selected");
-  const raw = body.modelIds ?? [];
-  if (!Array.isArray(raw) || raw.length > 1e3) fail(400, "invalid_request", "modelIds must be a list of model ids");
-  const modelIds = [...new Set(raw.map((v) => uuidParam(typeof v === "string" ? v : "")))];
-  const { rows } = await ctx.deps.db.query("SELECT status FROM devices WHERE id = $1", [id]);
-  if (!rows[0]) fail(404, "not_found", "device not found");
-  if (modelIds.length) {
-    const found = await ctx.deps.db.query("SELECT count(*)::int AS n FROM models WHERE id IN (SELECT (jsonb_array_elements_text($1::jsonb))::uuid)", [modelIds]);
-    if (found.rows[0].n !== modelIds.length) fail(400, "invalid_request", "one or more models do not exist");
+async function deleteAccount(ctx) {
+  const deps = ctx.deps;
+  const device = await signedIn(ctx);
+  const p = pb(deps);
+  await limit(ctx, `account:delete:dev:${device.deviceId}`, 5, 3600);
+  const body = requireObject(await readJson(ctx.req, 8 * 1024));
+  rejectUnknown(body, ["password", "code", "handoffSecret"]);
+  if (typeof body.password === "string") {
+    const password = str(body, "password", { min: 1, max: 200, trim: false });
+    try {
+      const u = await p.getUser(device.userId);
+      if (!u) fail(401, "account_deleted", "this account has been deleted");
+      const checked = await p.checkPassword(u.email, password);
+      if (checked.id !== device.userId) fail(401, "invalid_credentials", "the password is not correct");
+    } catch (e) {
+      pbFail(e, "the password is not correct");
+    }
+  } else {
+    const code = str(body, "code", { min: 20, max: 128 });
+    const secret = str(body, "handoffSecret", { min: 20, max: 128 });
+    const h = await consumeHandoff(ctx, code, secret, "reauth");
+    if (h.user_id !== device.userId || h.device_id !== device.deviceId) fail(400, "invalid_code", "this sign-in code is not valid or has expired; start again");
   }
-  await setDeviceAccess(ctx.deps.db, id, access, access === "selected" ? modelIds : []);
-  sendJson(ctx.res, 200, { modelAccess: access, modelIds: access === "selected" ? modelIds : [] });
+  await markDeleted(deps.db, device.userId, "devices");
+  const status = await runDeletion(deps, device.userId);
+  log("info", "account deletion requested", { status });
+  sendJson(ctx.res, status === "done" ? 200 : 202, { status });
+}
+var USER_ID = /^[A-Za-z0-9_]{1,64}$/;
+function userParam(v) {
+  if (!v || !USER_ID.test(v)) fail(400, "invalid_request", "invalid user id");
+  return v;
+}
+async function adminListUsers(ctx) {
+  await guardOwner(ctx, { write: false });
+  const p = ctx.deps.pocketbase;
+  if (!p) {
+    sendJson(ctx.res, 200, { configured: false, users: [], total: 0, page: 1, perPage: 50 });
+    return;
+  }
+  const page2 = Math.max(1, Math.min(1e3, Number(ctx.url.searchParams.get("page") ?? 1) || 1));
+  const search = (ctx.url.searchParams.get("search") ?? "").slice(0, 100);
+  let list;
+  try {
+    list = await p.listUsers({ page: page2, perPage: 50, search });
+  } catch (e) {
+    pbFail(e);
+  }
+  const ids = list.items.map((u) => u.id);
+  const state = ids.length ? await ctx.deps.db.query(
+    `SELECT u.user_id, u.status, u.last_login_at, u.deletion_step, u.deletion_error,
+                (SELECT count(*)::int FROM devices d WHERE d.user_id = u.user_id AND d.signed_out_at IS NULL) AS devices
+           FROM app_users u WHERE u.user_id IN (SELECT jsonb_array_elements_text($1::jsonb))`,
+    [ids]
+  ) : { rows: [] };
+  const byId = new Map(state.rows.map((r) => [r.user_id, r]));
+  sendJson(ctx.res, 200, {
+    configured: true,
+    page: page2,
+    perPage: 50,
+    total: list.total,
+    users: list.items.map((u) => {
+      const s = byId.get(u.id);
+      return {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        verified: u.verified,
+        createdAt: u.created,
+        status: s?.status ?? "active",
+        lastLoginAt: s?.last_login_at ?? null,
+        signedInDevices: s?.devices ?? 0,
+        deletionError: s?.deletion_error ?? null
+      };
+    })
+  });
+}
+async function adminGetUser(ctx) {
+  await guardOwner(ctx, { write: false });
+  const id = userParam(ctx.params.id);
+  const p = pb(ctx.deps);
+  let user;
+  let identities;
+  try {
+    user = await p.getUser(id);
+    identities = user ? await p.externalAuths(id) : [];
+  } catch (e) {
+    pbFail(e);
+  }
+  const s = await ctx.deps.db.query("SELECT status, first_seen_at, last_login_at, deletion_step, deletion_error, deleted_at FROM app_users WHERE user_id = $1", [id]);
+  if (!user && !s.rows[0]) fail(404, "not_found", "user not found");
+  const devices = await ctx.deps.db.query(
+    `SELECT id, name, status, created_at, last_seen_at, app_version, signed_out_at, signed_out_reason FROM devices WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`,
+    [id]
+  );
+  sendJson(ctx.res, 200, {
+    user: user ? { id: user.id, email: user.email, name: user.name, verified: user.verified, createdAt: user.created } : null,
+    state: s.rows[0] ?? null,
+    identities,
+    devices: devices.rows.map((r) => ({ id: r.id, name: r.name, status: r.status, createdAt: r.created_at, lastSeenAt: r.last_seen_at, appVersion: r.app_version, signedIn: !r.signed_out_at, signedOutReason: r.signed_out_reason }))
+  });
+}
+async function adminUserAction(ctx) {
+  const action = ctx.params.action;
+  if (!["block", "unblock", "sign-out", "delete"].includes(action)) fail(404, "not_found", "not found");
+  const sensitive = action !== "sign-out";
+  await guardOwner(ctx, { write: true, sensitive });
+  const id = userParam(ctx.params.id);
+  const db = ctx.deps.db;
+  if (action === "sign-out") {
+    const n = await db.transaction((q) => endUserSessions(q, id, "signed_out_by_owner"));
+    sendJson(ctx.res, 200, { signedOutDevices: n });
+    return;
+  }
+  if (action === "block" || action === "unblock") {
+    const n = await db.transaction(async (q) => {
+      const r = await q.query(
+        `INSERT INTO app_users (user_id, status, blocked_at) VALUES ($1, $2, CASE WHEN $2 = 'blocked' THEN now() END)
+         ON CONFLICT (user_id) DO UPDATE SET status = EXCLUDED.status, blocked_at = EXCLUDED.blocked_at
+         WHERE app_users.status IN ('active', 'blocked') RETURNING status`,
+        [id, action === "block" ? "blocked" : "active"]
+      );
+      if (!r.rows[0]) fail(409, "account_deleted", "this account is being deleted");
+      return action === "block" ? endUserSessions(q, id, "blocked_by_owner") : 0;
+    });
+    sendJson(ctx.res, 200, { status: action === "block" ? "blocked" : "active", signedOutDevices: n });
+    return;
+  }
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ["confirmEmail"]);
+  const confirm = str(body, "confirmEmail", { max: 320, optional: true }) ?? "";
+  let user = null;
+  try {
+    user = ctx.deps.pocketbase ? await ctx.deps.pocketbase.getUser(id) : null;
+  } catch (e) {
+    pbFail(e);
+  }
+  const existing = await db.query("SELECT status FROM app_users WHERE user_id = $1", [id]);
+  if (!user && !existing.rows[0]) fail(404, "not_found", "user not found");
+  if (user && confirm.toLowerCase() !== user.email.toLowerCase()) fail(400, "confirmation_mismatch", "type the user's email exactly to delete the account");
+  await markDeleted(db, id, "devices");
+  const status = await runDeletion(ctx.deps, id);
+  sendJson(ctx.res, status === "done" ? 200 : 202, { status });
 }
 
 // src/modules/models.ts
@@ -2100,7 +2929,7 @@ async function callUpstream(deps, url, body, key, timeoutMs, retries, stream, co
   }
 }
 var timeoutFlag = /* @__PURE__ */ new WeakMap();
-async function readLimited(res, limit) {
+async function readLimited(res, limit2) {
   const reader = res.body?.getReader();
   if (!reader) return "";
   const chunks = [];
@@ -2109,7 +2938,7 @@ async function readLimited(res, limit) {
     const { done, value } = await reader.read();
     if (done) break;
     size += value.byteLength;
-    if (size > limit) {
+    if (size > limit2) {
       await reader.cancel().catch(() => void 0);
       throw new UpstreamError("bad_response", "response too large");
     }
@@ -2283,8 +3112,8 @@ function parseChange(raw, index) {
 }
 async function syncMemories(ctx) {
   const auth = await authenticateDevice(ctx);
-  const limit = await ctx.deps.limits.hit(`memory:sync:${auth.deviceId}`, SYNC_PER_DEVICE, SYNC_WINDOW_SECONDS);
-  if (!limit.allowed) fail(429, "rate_limited", "too many memory syncs; try again shortly", { "retry-after": String(limit.retryAfterSeconds) });
+  const limit2 = await ctx.deps.limits.hit(`memory:sync:${auth.deviceId}`, SYNC_PER_DEVICE, SYNC_WINDOW_SECONDS);
+  if (!limit2.allowed) fail(429, "rate_limited", "too many memory syncs; try again shortly", { "retry-after": String(limit2.retryAfterSeconds) });
   const body = requireObject(await readJson(ctx.req, BODY_LIMIT2));
   rejectUnknown(body, ["changes", "since"]);
   const rawChanges = body.changes ?? [];
@@ -2400,7 +3229,7 @@ function memoryFilter(ctx) {
 async function adminListMemory(ctx) {
   await guardOwner(ctx, { write: false });
   const limitRaw = Number(ctx.url.searchParams.get("limit") ?? 100);
-  const limit = Number.isInteger(limitRaw) && limitRaw >= 1 && limitRaw <= ADMIN_LIMIT ? limitRaw : 100;
+  const limit2 = Number.isInteger(limitRaw) && limitRaw >= 1 && limitRaw <= ADMIN_LIMIT ? limitRaw : 100;
   const offsetRaw = Number(ctx.url.searchParams.get("offset") ?? 0);
   const offset = Number.isInteger(offsetRaw) && offsetRaw >= 0 && offsetRaw <= 1e6 ? offsetRaw : 0;
   const f = memoryFilter(ctx);
@@ -2408,7 +3237,7 @@ async function adminListMemory(ctx) {
     `SELECT count(*)::int AS total, count(*) FILTER (WHERE m.deleted = false)::int AS active FROM memory_entries m ${f.where}`,
     f.params
   );
-  const listParams = [...f.params, limit, offset];
+  const listParams = [...f.params, limit2, offset];
   const { rows } = await ctx.deps.db.query(
     `SELECT m.id, m.device_id, m.scope, m.project_key, m.kind, m.content, m.tags, m.source, m.confidence,
             m.verified, m.pinned, m.hits, m.deleted, m.created_at, m.updated_at, d.name AS device_name
@@ -2523,7 +3352,7 @@ async function usage(ctx) {
 async function logs(ctx) {
   await guardOwner(ctx, { write: false });
   const q = ctx.url.searchParams;
-  const limit = Math.min(200, Math.max(1, Number(q.get("limit") ?? 50) || 50));
+  const limit2 = Math.min(200, Math.max(1, Number(q.get("limit") ?? 50) || 50));
   const where = [];
   const params = [];
   if (q.get("status") && ["ok", "error", "cancelled"].includes(q.get("status"))) {
@@ -2540,16 +3369,16 @@ async function logs(ctx) {
     params.push(c);
     where.push(`r.id < $${params.length}`);
   }
-  params.push(limit + 1);
+  params.push(limit2 + 1);
   const sql = `SELECT r.id, r.created_at, d.name AS device_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
                       r.stream, r.latency_ms, r.ttft_ms, r.prompt_tokens, r.completion_tokens, r.usage_source
                  FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id
                 ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
                 ORDER BY r.id DESC LIMIT $${params.length}`;
   const { rows } = await ctx.deps.db.query(sql, params);
-  const page = rows.slice(0, limit);
+  const page2 = rows.slice(0, limit2);
   sendJson(ctx.res, 200, {
-    logs: page.map((r) => ({
+    logs: page2.map((r) => ({
       id: Number(r.id),
       createdAt: r.created_at,
       deviceName: r.device_name ?? null,
@@ -2565,12 +3394,12 @@ async function logs(ctx) {
       completionTokens: r.completion_tokens,
       usageSource: r.usage_source
     })),
-    nextCursor: rows.length > limit ? String(page[page.length - 1].id) : null
+    nextCursor: rows.length > limit2 ? String(page2[page2.length - 1].id) : null
   });
 }
 async function getSettings(ctx) {
   await guardOwner(ctx, { write: false });
-  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+  sendJson(ctx.res, 200, { ...await currentSettings(ctx.deps.db), accountsConfigured: !!ctx.deps.pocketbase });
 }
 async function currentSettings(db) {
   const s = await readSettings(db);
@@ -2579,7 +3408,8 @@ async function currentSettings(db) {
     maxConcurrentPerDevice: Number(s.max_concurrent_per_device ?? 2),
     maxOutputTokens: Number(s.max_output_tokens ?? 8192),
     allowDirectProvider: s.allow_direct_provider === true,
-    allowAutoRegistration: s.allow_auto_registration !== false
+    allowAutoRegistration: s.allow_auto_registration !== false,
+    requireLoginForCentralAi: s.require_login_for_central_ai === true
   };
 }
 var SETTING_KEYS = {
@@ -2587,7 +3417,8 @@ var SETTING_KEYS = {
   maxConcurrentPerDevice: "max_concurrent_per_device",
   maxOutputTokens: "max_output_tokens",
   allowDirectProvider: "allow_direct_provider",
-  allowAutoRegistration: "allow_auto_registration"
+  allowAutoRegistration: "allow_auto_registration",
+  requireLoginForCentralAi: "require_login_for_central_ai"
 };
 async function patchSettings(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -2607,6 +3438,12 @@ async function patchSettings(ctx) {
   }
   const autoReg = bool(body, "allowAutoRegistration", { optional: true });
   if (autoReg !== void 0) changes.push(["allow_auto_registration", autoReg]);
+  const requireLogin = bool(body, "requireLoginForCentralAi", { optional: true });
+  if (requireLogin !== void 0) {
+    requireReauth(session);
+    if (requireLogin && !ctx.deps.pocketbase) fail(409, "accounts_not_configured", "set POCKETBASE_URL and the PocketBase superuser on the server first");
+    changes.push(["require_login_for_central_ai", requireLogin]);
+  }
   if (changes.length === 0) fail(400, "invalid_request", "no settings were given");
   await ctx.deps.db.transaction(async (q) => {
     for (const [k, v] of changes) {
@@ -2617,7 +3454,8 @@ async function patchSettings(ctx) {
     }
     if (changes.some(([k]) => k === "max_output_tokens" || k === "allow_direct_provider")) await bumpCatalogue(q);
   });
-  sendJson(ctx.res, 200, await currentSettings(ctx.deps.db));
+  forgetLoginSetting(ctx.deps.db);
+  sendJson(ctx.res, 200, { ...await currentSettings(ctx.deps.db), accountsConfigured: !!ctx.deps.pocketbase });
 }
 async function pruneLogs(db, days) {
   const { rowCount } = await db.query("DELETE FROM request_logs WHERE created_at < now() - make_interval(days => $1)", [days]);
@@ -2683,10 +3521,12 @@ async function adminHealth(ctx) {
 }
 
 // src/modules/releases.ts
-import crypto5 from "node:crypto";
+import crypto6 from "node:crypto";
 var CHUNK_BYTES = 4 * 1024 * 1024;
 var MAX_RELEASE_BYTES = 600 * 1024 * 1024;
 var MAX_CHUNKS = Math.ceil(MAX_RELEASE_BYTES / CHUNK_BYTES);
+var CHECKS_PER_HOUR = 60;
+var DOWNLOADS_PER_HOUR = 6;
 var VERSION = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/;
 var SHA256 = /^[0-9a-f]{64}$/;
 var FILE_NAME = /^[A-Za-z0-9 ._()+-]{1,200}$/;
@@ -2829,7 +3669,7 @@ async function completeUpload(ctx) {
   rows.forEach((c, i) => {
     if (c.seq !== i) fail(400, "upload_incomplete", `piece ${i} is missing; upload it again`);
   });
-  const hash = crypto5.createHash("sha256");
+  const hash = crypto6.createHash("sha256");
   let total = 0;
   for (const c of rows) {
     const part = await ctx.deps.db.query("SELECT data FROM desktop_release_chunks WHERE release_id = $1 AND seq = $2", [id, c.seq]);
@@ -2879,7 +3719,9 @@ async function deleteRelease(ctx) {
   sendJson(ctx.res, 200, { deleted: true });
 }
 async function checkForUpdate(ctx) {
-  await authenticateDevice(ctx);
+  const device = await authenticateDevice(ctx, { central: false });
+  const rl = await ctx.deps.limits.hit(`updates:check:${device.deviceId}`, CHECKS_PER_HOUR, 3600);
+  if (!rl.allowed) fail(429, "rate_limited", "too many update checks; try again later", { "retry-after": String(rl.retryAfterSeconds) });
   const current = ctx.url.searchParams.get("current") ?? "";
   if (!VERSION.test(current)) fail(400, "invalid_request", "current must be the installed version, for example 1.2.3");
   const { latest, mandatory } = await latestPublished(ctx.deps.db, current);
@@ -2902,7 +3744,9 @@ async function checkForUpdate(ctx) {
   });
 }
 async function downloadUpdate(ctx) {
-  await authenticateDevice(ctx);
+  const device = await authenticateDevice(ctx, { central: false });
+  const rl = await ctx.deps.limits.hit(`updates:download:${device.deviceId}`, DOWNLOADS_PER_HOUR, 3600);
+  if (!rl.allowed) fail(429, "rate_limited", "too many update downloads from this computer; try again later", { "retry-after": String(rl.retryAfterSeconds) });
   const id = uuidParam(ctx.params.id);
   const r = await getRelease(ctx.deps.db, id);
   if (r.status !== "published" || !r.upload_complete) fail(404, "not_found", "release not found");
@@ -2982,6 +3826,16 @@ var routes = [
   R("POST", "/v1/chat/completions", chatCompletions),
   R("POST", "/v1/memory/sync", syncMemories),
   R("GET", "/v1/updates/check", checkForUpdate),
+  R("GET", "/v1/auth/config", authConfig),
+  R("POST", "/v1/auth/session", createSession),
+  R("POST", "/v1/auth/oauth/start", oauthStart),
+  R("GET", "/v1/auth/oauth/callback", oauthCallback),
+  R("POST", "/v1/auth/exchange", exchange),
+  R("POST", "/v1/auth/refresh", refresh),
+  R("POST", "/v1/auth/logout", logout2),
+  R("GET", "/v1/account", account),
+  R("POST", "/v1/account/devices/:id/sign-out", signOutDevice),
+  R("POST", "/v1/account/delete", deleteAccount),
   R("GET", "/v1/updates/:id/download", downloadUpdate),
   R("POST", "/admin/api/auth/login", login),
   R("GET", "/admin/api/auth/session", sessionInfo),
@@ -3018,6 +3872,9 @@ var routes = [
   R("POST", "/admin/api/releases/:id/complete", completeUpload),
   R("PATCH", "/admin/api/releases/:id", updateRelease),
   R("DELETE", "/admin/api/releases/:id", deleteRelease),
+  R("GET", "/admin/api/users", adminListUsers),
+  R("GET", "/admin/api/users/:id", adminGetUser),
+  R("POST", "/admin/api/users/:id/:action", adminUserAction),
   R("GET", "/admin/api/settings", getSettings),
   R("PATCH", "/admin/api/settings", patchSettings)
 ];
@@ -3084,9 +3941,14 @@ function applyCors(req, res, deps) {
   return true;
 }
 function createHandler(input) {
-  const deps = { ...input, limits: input.limits ?? new DatabaseLimitStore(input.db), redis: input.redis ?? null };
+  const deps = {
+    ...input,
+    limits: input.limits ?? new DatabaseLimitStore(input.db),
+    redis: input.redis ?? null,
+    pocketbase: input.pocketbase !== void 0 ? input.pocketbase : input.config.pocketbase ? new PocketBase(input.config.pocketbase, input.fetch) : null
+  };
   return async (req, res) => {
-    const requestId = crypto6.randomUUID();
+    const requestId = crypto7.randomUUID();
     const started = Date.now();
     let routeName = "unmatched";
     res.setHeader("x-request-id", requestId);
@@ -3153,7 +4015,7 @@ function createServer(deps) {
 
 // src/config.ts
 import fs3 from "node:fs";
-import crypto7 from "node:crypto";
+import crypto8 from "node:crypto";
 function bool2(v, fallback) {
   if (v === void 0 || v === "") return fallback;
   if (["1", "true", "yes", "on"].includes(v.toLowerCase())) return true;
@@ -3221,7 +4083,7 @@ function instanceId(env, keyring) {
   }
   const first = [...keyring.keys.keys()].sort((a, b) => a - b)[0];
   if (first === void 0) return "development";
-  return crypto7.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
+  return crypto8.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
 }
 function parseDatabase(env, production) {
   const sslDefault = production ? "require" : "disable";
@@ -3268,6 +4130,29 @@ function parseDatabase(env, production) {
   }
   return cfg;
 }
+function pocketbase(env, production) {
+  const raw = (env.POCKETBASE_URL ?? "").trim();
+  const email = (env.POCKETBASE_ADMIN_EMAIL ?? "").trim();
+  const password = env.POCKETBASE_ADMIN_PASSWORD ?? "";
+  if (!raw) {
+    if (email || password) throw new Error("POCKETBASE_ADMIN_EMAIL/POCKETBASE_ADMIN_PASSWORD are set but POCKETBASE_URL is not");
+    return null;
+  }
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("POCKETBASE_URL must be a URL such as https://pocketbase.YOUR_DOMAIN");
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error("POCKETBASE_URL must start with https://");
+  if (u.username || u.password || u.search || u.hash) throw new Error("POCKETBASE_URL must not contain credentials, a query or a fragment");
+  if (production && u.protocol !== "https:") throw new Error("POCKETBASE_URL must use https in production");
+  if (!email || !password) throw new Error("POCKETBASE_URL needs POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD (a superuser dedicated to this server)");
+  if (production && password.length < 12) throw new Error("POCKETBASE_ADMIN_PASSWORD is too short for production");
+  const usersCollection = (env.POCKETBASE_USERS_COLLECTION ?? "").trim() || "users";
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(usersCollection)) throw new Error("POCKETBASE_USERS_COLLECTION must be a collection name");
+  return { url: u.toString().replace(/\/+$/, ""), usersCollection, adminEmail: email, adminPassword: password };
+}
 function redisPrefix(v) {
   if (v === void 0 || v === "") return "devora";
   if (!/^[A-Za-z0-9_.-]{1,40}$/.test(v)) throw new Error("REDIS_KEY_PREFIX may contain only letters, digits, _ . - (up to 40)");
@@ -3311,13 +4196,15 @@ function loadConfig(env = process.env) {
       downloadUrl: httpsUrl(env.DEVORA_DESKTOP_DOWNLOAD_URL, "DEVORA_DESKTOP_DOWNLOAD_URL"),
       statusMessage
     },
-    instanceId: instanceId(env, keyring)
+    instanceId: instanceId(env, keyring),
+    pocketbase: pocketbase(env, production)
   };
 }
 function configWarnings(c) {
   const out = [...c.ignoredSettings];
   if (c.env === "production" && !c.publicApiOrigin) out.push("PUBLIC_API_ORIGIN is not set: desktop apps cannot be moved to a new API domain automatically");
   if (c.env === "production" && !c.trustProxy) out.push("TRUST_PROXY is false: behind Dokploy/Traefik every request appears to come from the proxy");
+  if (c.pocketbase && !c.publicApiOrigin) out.push("PUBLIC_API_ORIGIN is not set: Google/GitHub sign-in is off because it needs the public callback address");
   if (c.env === "production" && !c.redis) out.push("REDIS_URL is not set: rate limits use PostgreSQL and there is no cache");
   return out;
 }
@@ -3334,12 +4221,13 @@ function redactedConfig(c) {
     encryptionKeys: c.keyring.size,
     redis: c.redis ? `${c.redis.host}:${c.redis.port}/${c.redis.db}${c.redis.tls ? " (tls)" : ""}` : null,
     requestTimeoutMs: c.requestTimeoutMs,
-    desktopMinVersion: c.desktop.minVersion
+    desktopMinVersion: c.desktop.minVersion,
+    pocketbase: c.pocketbase ? `${c.pocketbase.url} (collection ${c.pocketbase.usersCollection})` : null
   };
 }
 
 // src/db/pg-wire.ts
-import crypto8 from "node:crypto";
+import crypto9 from "node:crypto";
 import net2 from "node:net";
 import tls2 from "node:tls";
 import fs4 from "node:fs";
@@ -3425,7 +4313,7 @@ function parseError(body) {
   return new PgError(fields.M ?? "database error", fields.C ?? "", fields.D);
 }
 function hmac(key, data) {
-  return crypto8.createHmac("sha256", key).update(data).digest();
+  return crypto9.createHmac("sha256", key).update(data).digest();
 }
 var PgConnection = class _PgConnection {
   socket;
@@ -3534,7 +4422,7 @@ var PgConnection = class _PgConnection {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
   async scram(password) {
-    const nonce = crypto8.randomBytes(18).toString("base64");
+    const nonce = crypto9.randomBytes(18).toString("base64");
     const clientFirstBare = `n=,r=${nonce}`;
     const initial = Buffer.from(`n,,${clientFirstBare}`, "utf8");
     this.socket.write(frame("p", Buffer.concat([cstr("SCRAM-SHA-256"), int32(initial.length), initial])));
@@ -3547,10 +4435,10 @@ var PgConnection = class _PgConnection {
     const iterations = Number(attrs.i);
     if (!Number.isInteger(iterations) || iterations < 4096 || iterations > 1e6) throw new PgError("unacceptable SCRAM iteration count");
     const salted = await new Promise(
-      (resolve, reject) => crypto8.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
+      (resolve, reject) => crypto9.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
     );
     const clientKey = hmac(salted, "Client Key");
-    const storedKey = crypto8.createHash("sha256").update(clientKey).digest();
+    const storedKey = crypto9.createHash("sha256").update(clientKey).digest();
     const clientFinalNoProof = `c=biws,r=${attrs.r}`;
     const authMessage = `${clientFirstBare},${serverFirst},${clientFinalNoProof}`;
     const signature = hmac(storedKey, authMessage);
@@ -3796,7 +4684,8 @@ async function serve() {
     limits = new RedisLimitStore(redis, config.redisKeyPrefix);
   }
   log("info", "runtime state store", { store: limits.kind, redis: redis?.target ?? null });
-  const server = createServer({ db, config, limits, redis, fetch: globalThis.fetch });
+  const pocketbase2 = config.pocketbase ? new PocketBase(config.pocketbase, globalThis.fetch) : null;
+  const server = createServer({ db, config, limits, redis, fetch: globalThis.fetch, pocketbase: pocketbase2 });
   await new Promise((resolve) => server.listen(config.port, config.host, resolve));
   log("info", "devora backend listening", { port: config.port, env: config.env, schemaVersion: status.currentVersion });
   const prune = async () => {
@@ -3819,7 +4708,11 @@ async function serve() {
   };
   const countersTimer = setInterval(pruneCounters, HOUR);
   countersTimer.unref();
-  const deps = { db, config, limits, redis, fetch: globalThis.fetch };
+  const deps = { db, config, limits, redis, fetch: globalThis.fetch, pocketbase: pocketbase2 };
+  const accountJob = () => limits.withLock("account-maintenance", 5 * 6e4, () => accountMaintenance(deps)).catch((e) => log("error", "account maintenance failed", { error: e instanceof Error ? e.name : "unknown" }));
+  const accountTimer = setInterval(accountJob, 10 * 6e4);
+  accountTimer.unref();
+  setTimeout(accountJob, 3e4).unref();
   const discover = () => scheduledDiscovery(deps).catch((e) => log("error", "scheduled discovery failed", { error: e instanceof Error ? e.name : "unknown" }));
   let discoveryTimer = null;
   let firstDiscovery = null;
@@ -3833,6 +4726,7 @@ async function serve() {
     log("info", "shutting down", { signal });
     clearInterval(timer);
     clearInterval(countersTimer);
+    clearInterval(accountTimer);
     if (discoveryTimer) clearInterval(discoveryTimer);
     if (firstDiscovery) clearTimeout(firstDiscovery);
     const closed = new Promise((r) => server.close(() => r()));

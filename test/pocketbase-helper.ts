@@ -28,6 +28,8 @@ export interface TestPocketBase {
   api(method: string, p: string, body?: unknown, token?: string): Promise<{ status: number; body: any }>;
   createUser(email: string, password: string, opts?: { verified?: boolean; name?: string }): Promise<string>;
   passwordToken(email: string, password: string): Promise<string>;
+  /** Waits for a one-time sign-in code sent to `to` after `since` mails, and returns it. */
+  waitForOtp(to: string, since: number): Promise<string>;
   /** Waits for the next mail to `to` and returns the first token-looking path segment in it (verification/reset). */
   waitForMailToken(to: string, kind: 'confirm-verification' | 'confirm-password-reset'): Promise<string>;
   stop(): Promise<void>;
@@ -142,6 +144,9 @@ export async function startPocketBase(): Promise<TestPocketBase | null> {
     smtp: { enabled: true, host: '127.0.0.1', port: smtp.port, username: '', password: '', tls: false, authMethod: 'PLAIN', localName: '' },
   });
   if (s.status !== 200) throw new Error(`pocketbase settings failed: ${JSON.stringify(s.body)}`);
+  // Email codes on, as Devora's sign-in expects (Collections › users › Options › OTP in the dashboard).
+  const o = await su('PATCH', '/api/collections/users', { otp: { enabled: true, duration: 300, length: 8 } });
+  if (o.status !== 200) throw new Error(`pocketbase otp settings failed: ${JSON.stringify(o.body)}`);
   return {
     url,
     adminEmail,
@@ -159,6 +164,18 @@ export async function startPocketBase(): Promise<TestPocketBase | null> {
       const r = await call('POST', '/api/collections/users/auth-with-password', { identity: email, password });
       if (r.status !== 200) throw new Error(`password sign-in failed: ${r.status}`);
       return r.body.token as string;
+    },
+    async waitForOtp(to, since) {
+      for (let i = 0; i < 100; i++) {
+        const m = mails.slice(since).find((x) => x.to.includes(to.toLowerCase()) && /one-time password/i.test(x.raw.replace(/=\r\n/g, '')));
+        if (m) {
+          const body = m.raw.replace(/=\r\n/g, '').split('\r\n\r\n').slice(1).join('\n');
+          const c = /<strong>(\d{4,12})<\/strong>/.exec(body.replace(/=3D/g, '=')) ?? /\b(\d{8})\b/.exec(body);
+          if (c) return c[1];
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`no code mail for ${to}`);
     },
     async waitForMailToken(to, kind) {
       for (let i = 0; i < 100; i++) {

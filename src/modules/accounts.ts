@@ -42,6 +42,7 @@ async function limit(ctx: Ctx, key: string, max: number, windowSeconds = WINDOW)
 function pbFail(e: unknown, what = 'the sign-in is not valid or has expired'): never {
   if (e instanceof PbError && e.status === 0) fail(503, 'accounts_unavailable', 'the account service is temporarily unavailable; try again shortly', { 'retry-after': '15' });
   if (e instanceof PbError && e.status >= 500) fail(503, 'accounts_unavailable', 'the account service is temporarily unavailable; try again shortly', { 'retry-after': '15' });
+  if (e instanceof PbError && e.status === 429) fail(429, 'too_many_attempts', 'too many wrong codes; request a new code and try again in a few minutes');
   if (e instanceof PbError) fail(401, 'invalid_credentials', what);
   throw e;
 }
@@ -368,7 +369,7 @@ export async function signOutDevice(ctx: Ctx): Promise<void> {
 }
 
 /**
- * POST /v1/account/delete { password } or { code, handoffSecret } (a browser re-authentication, purpose "reauth").
+ * POST /v1/account/delete { otpId, otpCode } (email code), { password }, or { code, handoffSecret } (a browser re-authentication, purpose "reauth").
  * Re-authenticates, then records the deletion and ends every session before anything is removed; the remaining steps are
  * resumed by the background job if they cannot finish now.
  */
@@ -378,8 +379,18 @@ export async function deleteAccount(ctx: Ctx): Promise<void> {
   const p = pb(deps);
   await limit(ctx, `account:delete:dev:${device.deviceId}`, 5, 3600);
   const body = requireObject(await readJson(ctx.req, 8 * 1024));
-  rejectUnknown(body, ['password', 'code', 'handoffSecret']);
-  if (typeof body.password === 'string') {
+  rejectUnknown(body, ['password', 'code', 'handoffSecret', 'otpId', 'otpCode']);
+  if (typeof body.otpId === 'string') {
+    // Email code: the server checks it with PocketBase itself, so the re-authentication is fresh and proven here.
+    const otpId = str(body, 'otpId', { min: 1, max: 64 })!;
+    const otpCode = str(body, 'otpCode', { min: 4, max: 12 })!;
+    try {
+      const checked = await p.checkOtp(otpId, otpCode);
+      if (checked.id !== device.userId) fail(401, 'invalid_credentials', 'the code is not correct');
+    } catch (e) {
+      pbFail(e, 'the code is not correct');
+    }
+  } else if (typeof body.password === 'string') {
     const password = str(body, 'password', { min: 1, max: 200, trim: false })!;
     try {
       const u = await p.getUser(device.userId);

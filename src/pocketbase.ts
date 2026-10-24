@@ -171,6 +171,16 @@ export class PocketBase {
     return this.user(r.body?.record);
   }
 
+  /** Checks an email one-time code (PocketBase OTP) for re-authentication. The OTP is single use. */
+  async checkOtp(otpId: string, code: string): Promise<PbUser> {
+    if (!/^[A-Za-z0-9]{1,64}$/.test(otpId) || !/^[0-9]{4,12}$/.test(code)) throw new PbError(401, 'the code is not correct');
+    const r = await this.call('POST', `/api/collections/${this.col()}/auth-with-otp`, { body: { otpId, password: code } });
+    // PocketBase limits wrong guesses itself (429 "Too many attempts"): keep that answer, it means "ask for a new code".
+    if (r.status === 429) throw new PbError(429, 'too many attempts; request a new code');
+    if (r.status !== 200) throw new PbError(r.status === 0 ? 0 : 401, 'the code is not correct');
+    return this.user(r.body?.record);
+  }
+
   /** The user's current record, read as superuser. Null when the account no longer exists. */
   async getUser(id: string): Promise<PbUser | null> {
     if (!ID.test(id)) return null;
