@@ -1104,6 +1104,14 @@ async function readSettings(db) {
   const { rows } = await db.query("SELECT key, value FROM settings");
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }
+async function orgSkillsVersion(db) {
+  try {
+    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'skills_version'");
+    return rows[0]?.v ?? 0;
+  } catch {
+    return 0;
+  }
+}
 async function webSearchReady(db) {
   try {
     const { rows } = await db.query(
@@ -1141,7 +1149,9 @@ async function buildCatalogue(db) {
       allowDirectProvider: settings.allow_direct_provider === true,
       maxOutputTokens: Number(settings.max_output_tokens ?? 8192),
       // At least one web search provider is ready (desktops offer the agent's web_search tool only then).
-      webSearch: await webSearchReady(db)
+      webSearch: await webSearchReady(db),
+      // Organization skills: desktops download /v1/skills again when this changes.
+      skillsVersion: await orgSkillsVersion(db)
     }
   };
 }
@@ -2440,6 +2450,49 @@ async function adminUserAction(ctx) {
   const status = await runDeletion(ctx.deps, id);
   sendJson(ctx.res, status === "done" ? 200 : 202, { status });
 }
+async function adminUserActivity(ctx) {
+  await guardOwner(ctx, { write: false });
+  const id = userParam(ctx.params.id);
+  const days = Math.min(90, Math.max(1, Number(ctx.url.searchParams.get("days") ?? 30) || 30));
+  const db = ctx.deps.db;
+  const devices = `(SELECT id FROM devices WHERE user_id = $1)`;
+  const [byModel, recent, totals, memories, searches] = await Promise.all([
+    db.query(
+      `SELECT model_name, count(*)::int AS requests, count(*) FILTER (WHERE status = 'error')::int AS failed,
+              coalesce(sum(prompt_tokens), 0)::int AS prompt_tokens, coalesce(sum(completion_tokens), 0)::int AS completion_tokens,
+              coalesce(round(avg(latency_ms)), 0)::int AS avg_ms
+         FROM request_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)
+        GROUP BY model_name ORDER BY requests DESC LIMIT 50`,
+      [id, days]
+    ),
+    db.query(
+      `SELECT l.created_at, l.model_name, l.provider_name, l.status, l.http_status, l.error_code, l.latency_ms, l.prompt_tokens, l.completion_tokens, d.name AS device_name
+         FROM request_logs l LEFT JOIN devices d ON d.id = l.device_id
+        WHERE l.device_id IN ${devices} ORDER BY l.created_at DESC LIMIT 50`,
+      [id]
+    ),
+    db.query(
+      `SELECT count(*)::int AS requests, count(*) FILTER (WHERE status = 'error')::int AS failed,
+              coalesce(sum(prompt_tokens), 0)::int AS prompt_tokens, coalesce(sum(completion_tokens), 0)::int AS completion_tokens
+         FROM request_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)`,
+      [id, days]
+    ),
+    db.query(
+      `SELECT count(*) FILTER (WHERE NOT deleted)::int AS active,
+              coalesce(json_agg(json_build_object('id', id, 'kind', kind, 'scope', scope, 'content', content, 'pinned', pinned, 'updatedAt', updated_at) ORDER BY updated_at DESC) FILTER (WHERE NOT deleted), '[]') AS items
+         FROM (SELECT * FROM memory_entries WHERE device_id IN ${devices} ORDER BY updated_at DESC LIMIT 500) m`,
+      [id]
+    ),
+    db.query(`SELECT count(*)::int AS n FROM search_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)`, [id, days]).catch(() => ({ rows: [{ n: 0 }] }))
+  ]);
+  sendJson(ctx.res, 200, {
+    days,
+    totals: { ...totals.rows[0], searches: searches.rows[0]?.n ?? 0 },
+    byModel: byModel.rows.map((r) => ({ model: r.model_name, requests: r.requests, failed: r.failed, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens, avgMs: r.avg_ms })),
+    recent: recent.rows.map((r) => ({ at: r.created_at, model: r.model_name, provider: r.provider_name, status: r.status, httpStatus: r.http_status, error: r.error_code, latencyMs: r.latency_ms, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens, device: r.device_name })),
+    brain: { active: memories.rows[0]?.active ?? 0, latest: (memories.rows[0]?.items ?? []).slice(0, 30) }
+  });
+}
 
 // src/modules/search.ts
 var SEARCH_KINDS = ["tavily", "brave", "serper", "exa", "google_cse", "searxng"];
@@ -2783,6 +2836,134 @@ ${query.toLowerCase()}`)}`;
 async function pruneSearchLogs(db, days) {
   const { rowCount } = await db.query("DELETE FROM search_logs WHERE created_at < now() - make_interval(days => $1)", [days]);
   return rowCount;
+}
+
+// src/modules/skills.ts
+var LIMITS = { name: 80, description: 1024, trigger: 40, triggers: 20, instructions: 12e3, examples: 8e3 };
+function slugify(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "skill";
+}
+function readTriggers(v) {
+  const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : v === void 0 ? [] : null;
+  if (!list) fail(400, "invalid_request", "triggers must be a list of words or a comma-separated string");
+  const out = [...new Set(list.map((t) => String(t).trim().toLowerCase()).filter(Boolean))];
+  if (out.length > LIMITS.triggers) fail(400, "invalid_request", `at most ${LIMITS.triggers} triggers`);
+  if (out.some((t) => t.length > LIMITS.trigger || /[\r\n]/.test(t))) fail(400, "invalid_request", `each trigger is one line of at most ${LIMITS.trigger} characters`);
+  return out;
+}
+function view2(r) {
+  return {
+    id: r.id,
+    slug: r.slug,
+    name: r.name,
+    description: r.description,
+    triggers: r.triggers ?? [],
+    instructions: r.instructions,
+    examples: r.examples,
+    enabled: r.enabled,
+    revision: r.revision,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  };
+}
+async function bumpSkills(q) {
+  await q.query("UPDATE settings SET value = to_jsonb((value::text::int) + 1), updated_at = now() WHERE key = 'skills_version'");
+  await bumpCatalogue(q);
+}
+async function skillsVersion(db) {
+  try {
+    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'skills_version'");
+    return rows[0]?.v ?? 0;
+  } catch {
+    return 0;
+  }
+}
+function readSkill(body, partial) {
+  const name = str(body, "name", { min: 1, max: LIMITS.name, optional: partial });
+  if (name !== void 0 && /[\r\n]/.test(name)) fail(400, "invalid_request", "the name must be a single line");
+  const description = str(body, "description", { min: 1, max: LIMITS.description, optional: partial });
+  const instructions = str(body, "instructions", { min: 1, max: LIMITS.instructions, optional: partial, trim: false });
+  const examples = str(body, "examples", { max: LIMITS.examples, optional: true, trim: false });
+  const triggers = body.triggers === void 0 ? void 0 : readTriggers(body.triggers);
+  const enabled = bool(body, "enabled", { optional: true });
+  return { name, description, instructions: instructions?.trim(), examples: examples?.trim(), triggers, enabled };
+}
+async function listOrgSkills(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills ORDER BY name");
+  sendJson(ctx.res, 200, { skills: rows.map(view2), version: await skillsVersion(ctx.deps.db), limits: LIMITS });
+}
+async function createOrgSkill(ctx) {
+  await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["name", "description", "triggers", "instructions", "examples", "enabled"]);
+  const s = readSkill(body, false);
+  const id = await ctx.deps.db.transaction(async (q) => {
+    let slug = slugify(s.name);
+    for (let i = 2; (await q.query("SELECT 1 FROM org_skills WHERE slug = $1", [slug])).rows.length; i++) slug = `${slugify(s.name).slice(0, 55)}-${i}`;
+    const { rows: rows2 } = await q.query(
+      `INSERT INTO org_skills (slug, name, description, triggers, instructions, examples, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [slug, s.name, s.description, JSON.stringify(s.triggers ?? []), s.instructions, s.examples ?? "", s.enabled ?? true]
+    );
+    await bumpSkills(q);
+    return rows2[0].id;
+  });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills WHERE id = $1", [id]);
+  sendJson(ctx.res, 201, { skill: view2(rows[0]) });
+}
+async function updateOrgSkill(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["name", "description", "triggers", "instructions", "examples", "enabled"]);
+  const s = readSkill(body, true);
+  const sets = [];
+  const vals = [id];
+  const add = (col, v) => {
+    vals.push(v);
+    sets.push(`${col} = $${vals.length}`);
+  };
+  if (s.name !== void 0) add("name", s.name);
+  if (s.description !== void 0) add("description", s.description);
+  if (s.instructions !== void 0) add("instructions", s.instructions);
+  if (s.examples !== void 0) add("examples", s.examples);
+  if (s.triggers !== void 0) add("triggers", JSON.stringify(s.triggers));
+  if (s.enabled !== void 0) add("enabled", s.enabled);
+  if (!sets.length) fail(400, "invalid_request", "nothing to change");
+  await ctx.deps.db.transaction(async (q) => {
+    const { rowCount } = await q.query(`UPDATE org_skills SET ${sets.join(", ")}, revision = revision + 1, updated_at = now() WHERE id = $1`, vals);
+    if (!rowCount) fail(404, "not_found", "skill not found");
+    await bumpSkills(q);
+  });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills WHERE id = $1", [id]);
+  sendJson(ctx.res, 200, { skill: view2(rows[0]) });
+}
+async function deleteOrgSkill(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  await ctx.deps.db.transaction(async (q) => {
+    const { rowCount } = await q.query("DELETE FROM org_skills WHERE id = $1", [id]);
+    if (!rowCount) fail(404, "not_found", "skill not found");
+    await bumpSkills(q);
+  });
+  sendJson(ctx.res, 200, { deleted: true });
+}
+async function desktopSkills(ctx) {
+  await authenticateDevice(ctx);
+  const version2 = await skillsVersion(ctx.deps.db);
+  const etag = `"skills-${version2}"`;
+  if (ctx.req.headers["if-none-match"] === etag) {
+    ctx.res.writeHead(304, { etag, "cache-control": "no-store" });
+    ctx.res.end();
+    return;
+  }
+  const { rows } = await ctx.deps.db.query("SELECT slug, name, description, triggers, instructions, examples, revision, updated_at FROM org_skills WHERE enabled ORDER BY name");
+  sendJson(
+    ctx.res,
+    200,
+    { version: version2, skills: rows.map((r) => ({ slug: r.slug, name: r.name, description: r.description, triggers: r.triggers ?? [], instructions: r.instructions, examples: r.examples, revision: r.revision, updatedAt: r.updated_at })) },
+    { etag }
+  );
 }
 
 // src/modules/models.ts
@@ -3626,6 +3807,11 @@ function memoryFilter(ctx) {
     params.push(deviceId);
     where.push(`m.device_id = $${params.length}`);
   }
+  const userId = sp.get("userId") ?? "";
+  if (/^[A-Za-z0-9_]{1,64}$/.test(userId)) {
+    params.push(userId);
+    where.push(`m.device_id IN (SELECT id FROM devices WHERE user_id = $${params.length})`);
+  }
   return { where: where.length ? `WHERE ${where.join(" AND ")}` : "", params };
 }
 async function adminListMemory(ctx) {
@@ -3949,7 +4135,7 @@ function compareVersions(a, b) {
   if (!y.pre) return -1;
   return x.pre < y.pre ? -1 : 1;
 }
-function view2(r) {
+function view3(r) {
   return {
     id: r.id,
     version: r.version,
@@ -3991,7 +4177,7 @@ async function listReleases(ctx) {
     `SELECT coalesce(app_version, 'unknown') AS version, count(*)::int AS devices
        FROM devices WHERE status = 'active' GROUP BY 1 ORDER BY 2 DESC LIMIT 50`
   );
-  const list = rows.map(view2).sort((a, b) => compareVersions(b.version, a.version));
+  const list = rows.map(view3).sort((a, b) => compareVersions(b.version, a.version));
   sendJson(ctx.res, 200, {
     releases: list,
     adoption: adoption.rows,
@@ -4028,7 +4214,7 @@ async function createRelease(ctx) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [version2, notes, mandatory, externalUrl ? "url" : "upload", externalUrl, sha256, fileName, fileSize, !!externalUrl]
     );
-    sendJson(ctx.res, 201, { release: view2(await getRelease(ctx.deps.db, rows[0].id)), chunkBytes: CHUNK_BYTES });
+    sendJson(ctx.res, 201, { release: view3(await getRelease(ctx.deps.db, rows[0].id)), chunkBytes: CHUNK_BYTES });
   } catch (e) {
     if (/duplicate key|unique/i.test(e.message)) fail(409, "version_exists", `version ${version2} already exists`);
     throw e;
@@ -4090,7 +4276,7 @@ async function completeUpload(ctx) {
   const magic = head.rows[0]?.h?.toString("latin1") ?? "";
   if (magic !== "MZ") fail(400, "not_an_installer", "this file is not a Windows installer (.exe)");
   await ctx.deps.db.query("UPDATE desktop_releases SET sha256 = $2, file_size = $3, upload_complete = true WHERE id = $1", [id, sha256, total]);
-  sendJson(ctx.res, 200, { release: view2(await getRelease(ctx.deps.db, id)) });
+  sendJson(ctx.res, 200, { release: view3(await getRelease(ctx.deps.db, id)) });
 }
 async function updateRelease(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -4113,7 +4299,7 @@ async function updateRelease(ctx) {
     [id, notes ?? null, mandatory ?? null, status ?? null]
   );
   forgetPublishedVersions();
-  sendJson(ctx.res, 200, { release: view2(await getRelease(ctx.deps.db, id)) });
+  sendJson(ctx.res, 200, { release: view3(await getRelease(ctx.deps.db, id)) });
 }
 async function deleteRelease(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -4232,6 +4418,7 @@ var routes = [
   R("POST", "/v1/chat/completions", chatCompletions),
   R("POST", "/v1/memory/sync", syncMemories),
   R("POST", "/v1/search", search),
+  R("GET", "/v1/skills", desktopSkills),
   R("GET", "/v1/updates/check", checkForUpdate),
   R("GET", "/v1/auth/config", authConfig),
   R("POST", "/v1/auth/session", createSession),
@@ -4287,7 +4474,12 @@ var routes = [
   R("PUT", "/admin/api/search-providers/:id/api-key", setSearchProviderKey),
   R("DELETE", "/admin/api/search-providers/:id/api-key", clearSearchProviderKey),
   R("POST", "/admin/api/search-providers/:id/test", testSearchProvider),
+  R("GET", "/admin/api/skills", listOrgSkills),
+  R("POST", "/admin/api/skills", createOrgSkill),
+  R("PATCH", "/admin/api/skills/:id", updateOrgSkill),
+  R("DELETE", "/admin/api/skills/:id", deleteOrgSkill),
   R("GET", "/admin/api/users", adminListUsers),
+  R("GET", "/admin/api/users/:id/activity", adminUserActivity),
   R("GET", "/admin/api/users/:id", adminGetUser),
   R("POST", "/admin/api/users/:id/:action", adminUserAction),
   R("GET", "/admin/api/settings", getSettings),

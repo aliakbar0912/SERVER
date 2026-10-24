@@ -567,3 +567,53 @@ export async function adminUserAction(ctx: Ctx): Promise<void> {
   const status = await runDeletion(ctx.deps, id);
   sendJson(ctx.res, status === 'done' ? 200 : 202, { status });
 }
+
+/**
+ * GET /admin/api/users/:id/activity?days=30: one account's usage across its devices: requests per model, recent
+ * requests (metadata only: Devora never stores prompts or answers), web searches, and the newest memories (its brain).
+ */
+export async function adminUserActivity(ctx: Ctx): Promise<void> {
+  await guardOwner(ctx, { write: false });
+  const id = userParam(ctx.params.id);
+  const days = Math.min(90, Math.max(1, Number(ctx.url.searchParams.get('days') ?? 30) || 30));
+  const db = ctx.deps.db;
+  const devices = `(SELECT id FROM devices WHERE user_id = $1)`;
+  const [byModel, recent, totals, memories, searches] = await Promise.all([
+    db.query(
+      `SELECT model_name, count(*)::int AS requests, count(*) FILTER (WHERE status = 'error')::int AS failed,
+              coalesce(sum(prompt_tokens), 0)::int AS prompt_tokens, coalesce(sum(completion_tokens), 0)::int AS completion_tokens,
+              coalesce(round(avg(latency_ms)), 0)::int AS avg_ms
+         FROM request_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)
+        GROUP BY model_name ORDER BY requests DESC LIMIT 50`,
+      [id, days],
+    ),
+    db.query(
+      `SELECT l.created_at, l.model_name, l.provider_name, l.status, l.http_status, l.error_code, l.latency_ms, l.prompt_tokens, l.completion_tokens, d.name AS device_name
+         FROM request_logs l LEFT JOIN devices d ON d.id = l.device_id
+        WHERE l.device_id IN ${devices} ORDER BY l.created_at DESC LIMIT 50`,
+      [id],
+    ),
+    db.query(
+      `SELECT count(*)::int AS requests, count(*) FILTER (WHERE status = 'error')::int AS failed,
+              coalesce(sum(prompt_tokens), 0)::int AS prompt_tokens, coalesce(sum(completion_tokens), 0)::int AS completion_tokens
+         FROM request_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)`,
+      [id, days],
+    ),
+    db.query(
+      `SELECT count(*) FILTER (WHERE NOT deleted)::int AS active,
+              coalesce(json_agg(json_build_object('id', id, 'kind', kind, 'scope', scope, 'content', content, 'pinned', pinned, 'updatedAt', updated_at) ORDER BY updated_at DESC) FILTER (WHERE NOT deleted), '[]') AS items
+         FROM (SELECT * FROM memory_entries WHERE device_id IN ${devices} ORDER BY updated_at DESC LIMIT 500) m`,
+      [id],
+    ),
+    db
+      .query(`SELECT count(*)::int AS n FROM search_logs WHERE device_id IN ${devices} AND created_at > now() - make_interval(days => $2)`, [id, days])
+      .catch(() => ({ rows: [{ n: 0 }] })),
+  ]);
+  sendJson(ctx.res, 200, {
+    days,
+    totals: { ...totals.rows[0], searches: searches.rows[0]?.n ?? 0 },
+    byModel: byModel.rows.map((r) => ({ model: r.model_name, requests: r.requests, failed: r.failed, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens, avgMs: r.avg_ms })),
+    recent: recent.rows.map((r) => ({ at: r.created_at, model: r.model_name, provider: r.provider_name, status: r.status, httpStatus: r.http_status, error: r.error_code, latencyMs: r.latency_ms, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens, device: r.device_name })),
+    brain: { active: memories.rows[0]?.active ?? 0, latest: (memories.rows[0]?.items ?? []).slice(0, 30) },
+  });
+}

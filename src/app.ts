@@ -9,6 +9,7 @@ import { RedisUnavailableError } from './redis.ts';
 import { PocketBase } from './pocketbase.ts';
 import * as accounts from './modules/accounts.ts';
 import * as search from './modules/search.ts';
+import * as skills from './modules/skills.ts';
 import * as auth from './modules/auth.ts';
 import * as devices from './modules/devices.ts';
 import * as catalogue from './modules/catalogue.ts';
@@ -43,6 +44,7 @@ const routes: Route[] = [
   R('POST', '/v1/chat/completions', chat.chatCompletions),
   R('POST', '/v1/memory/sync', memory.syncMemories),
   R('POST', '/v1/search', search.search),
+  R('GET', '/v1/skills', skills.desktopSkills),
   R('GET', '/v1/updates/check', releases.checkForUpdate),
   R('GET', '/v1/auth/config', accounts.authConfig),
   R('POST', '/v1/auth/session', accounts.createSession),
@@ -104,7 +106,12 @@ const routes: Route[] = [
   R('PUT', '/admin/api/search-providers/:id/api-key', search.setSearchProviderKey),
   R('DELETE', '/admin/api/search-providers/:id/api-key', search.clearSearchProviderKey),
   R('POST', '/admin/api/search-providers/:id/test', search.testSearchProvider),
+  R('GET', '/admin/api/skills', skills.listOrgSkills),
+  R('POST', '/admin/api/skills', skills.createOrgSkill),
+  R('PATCH', '/admin/api/skills/:id', skills.updateOrgSkill),
+  R('DELETE', '/admin/api/skills/:id', skills.deleteOrgSkill),
   R('GET', '/admin/api/users', accounts.adminListUsers),
+  R('GET', '/admin/api/users/:id/activity', accounts.adminUserActivity),
   R('GET', '/admin/api/users/:id', accounts.adminGetUser),
   R('POST', '/admin/api/users/:id/:action', accounts.adminUserAction),
   R('GET', '/admin/api/settings', data.getSettings),

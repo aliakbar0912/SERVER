@@ -233,6 +233,12 @@ function memoryFilter(ctx: Ctx): MemoryFilter {
     params.push(deviceId);
     where.push(`m.device_id = $${params.length}`);
   }
+  // A Devora account's brain: the memories of every device signed in as that user.
+  const userId = sp.get('userId') ?? '';
+  if (/^[A-Za-z0-9_]{1,64}$/.test(userId)) {
+    params.push(userId);
+    where.push(`m.device_id IN (SELECT id FROM devices WHERE user_id = $${params.length})`);
+  }
   return { where: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 

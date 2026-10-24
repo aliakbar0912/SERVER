@@ -19,15 +19,18 @@ test('migrations apply once, revert, and re-apply', { skip: false }, async (t) =
   if (!tdb) return t.skip(SKIP_NO_PG);
   try {
     const first = await migrateUp(tdb.db, loadMigrations(repoMigrations));
-    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql', '0004_auto_registration.sql', '0005_memory.sql', '0006_desktop_releases.sql', '0007_accounts.sql', '0008_web_search.sql']);
+    assert.deepEqual(first, ['0001_initial.sql', '0002_operations.sql', '0003_model_registry.sql', '0004_auto_registration.sql', '0005_memory.sql', '0006_desktop_releases.sql', '0007_accounts.sql', '0008_web_search.sql', '0009_org_skills.sql']);
     const again = await migrateUp(tdb.db, loadMigrations(repoMigrations));
     assert.deepEqual(again, []);
     const status = await migrationStatus(tdb.db, loadMigrations(repoMigrations));
-    assert.equal(status.currentVersion, 8);
+    assert.equal(status.currentVersion, 9);
     assert.equal(status.pending.length, 0);
     const { rows } = await tdb.db.query("SELECT count(*)::int AS n FROM settings WHERE key = 'catalogue_version'");
     assert.equal(rows[0].n, 1);
 
+    // 0009 reverts cleanly: organization skills go.
+    await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));
+    assert.equal((await tdb.db.query("SELECT to_regclass('public.org_skills') AS t")).rows[0].t, null);
     // 0008 reverts cleanly: the web search tables and setting go.
     await migrateDown(tdb.db, 1, loadMigrations(repoMigrations));
     assert.equal((await tdb.db.query("SELECT to_regclass('public.search_providers') AS t")).rows[0].t, null);
@@ -117,7 +120,7 @@ test('0007 keeps every existing device, token, memory and log untouched', async 
     );
     await tdb.db.query("INSERT INTO request_logs (device_id, model_name, provider_name, status, http_status, latency_ms) VALUES ($1, 'm', 'p', 'ok', 200, 5)", [id]);
     const before = (await tdb.db.query('SELECT * FROM devices WHERE id = $1', [id])).rows[0];
-    assert.deepEqual(await migrateUp(tdb.db, all), ['0007_accounts.sql', '0008_web_search.sql']);
+    assert.deepEqual(await migrateUp(tdb.db, all), ['0007_accounts.sql', '0008_web_search.sql', '0009_org_skills.sql']);
     const after = (await tdb.db.query('SELECT * FROM devices WHERE id = $1', [id])).rows[0];
     for (const k of Object.keys(before)) assert.deepEqual(after[k], before[k], k);
     assert.equal(after.user_id, null);

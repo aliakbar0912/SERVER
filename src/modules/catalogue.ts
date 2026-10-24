@@ -66,6 +66,15 @@ export interface CatalogueModel {
   capabilities: Capabilities;
 }
 
+async function orgSkillsVersion(db: Db): Promise<number> {
+  try {
+    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'skills_version'");
+    return rows[0]?.v ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Mirrors search.ts `usable`: enabled, with a key (SearXNG: with an address). Kept here to avoid an import cycle. */
 async function webSearchReady(db: Db): Promise<boolean> {
   try {
@@ -106,6 +115,8 @@ export async function buildCatalogue(db: Db): Promise<{ version: number; generat
       maxOutputTokens: Number(settings.max_output_tokens ?? 8192),
       // At least one web search provider is ready (desktops offer the agent's web_search tool only then).
       webSearch: await webSearchReady(db),
+      // Organization skills: desktops download /v1/skills again when this changes.
+      skillsVersion: await orgSkillsVersion(db),
     },
   };
 }
