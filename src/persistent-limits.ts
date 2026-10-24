@@ -37,7 +37,10 @@ export async function pruneRates(q: Queryer): Promise<number> {
 export type SlotResult = 'ok' | 'busy' | 'duplicate';
 
 export interface SlotRequest {
-  deviceId: string;
+  /** The device holding the slot. Exactly one of deviceId / apiKeyId is set. */
+  deviceId: string | null;
+  /** The API key holding the slot (requests authenticated with an owner API key). */
+  apiKeyId?: string | null;
   requestId: string;
   clientRequestId: string | null;
   maxConcurrent: number;
@@ -50,25 +53,27 @@ export interface SlotRequest {
  * A client request id that already has a lease or a completed log row is reported as 'duplicate' and no upstream call is made.
  */
 export async function acquireSlot(db: Db, r: SlotRequest): Promise<SlotResult> {
+  const ownerCol = r.apiKeyId ? 'api_key_id' : 'device_id';
+  const ownerId = r.apiKeyId ?? r.deviceId;
   return db.transaction(async (q) => {
-    await q.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`device-slot:${r.deviceId}`]);
-    await q.query('DELETE FROM device_request_leases WHERE device_id = $1 AND expires_at <= now()', [r.deviceId]);
+    await q.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [r.apiKeyId ? `key-slot:${r.apiKeyId}` : `device-slot:${r.deviceId}`]);
+    await q.query(`DELETE FROM device_request_leases WHERE ${ownerCol} = $1 AND expires_at <= now()`, [ownerId]);
     if (r.clientRequestId) {
       const seen = await q.query(
-        `SELECT 1 FROM device_request_leases WHERE device_id = $1 AND client_request_id = $2
+        `SELECT 1 FROM device_request_leases WHERE ${ownerCol} = $1 AND client_request_id = $2
          UNION ALL
-         SELECT 1 FROM request_logs WHERE device_id = $1 AND client_request_id = $2
+         SELECT 1 FROM request_logs WHERE ${ownerCol} = $1 AND client_request_id = $2
          LIMIT 1`,
-        [r.deviceId, r.clientRequestId],
+        [ownerId, r.clientRequestId],
       );
       if (seen.rows.length) return 'duplicate';
     }
-    const { rows } = await q.query('SELECT count(*)::int AS n FROM device_request_leases WHERE device_id = $1', [r.deviceId]);
+    const { rows } = await q.query(`SELECT count(*)::int AS n FROM device_request_leases WHERE ${ownerCol} = $1`, [ownerId]);
     if (rows[0].n >= r.maxConcurrent) return 'busy';
     await q.query(
-      `INSERT INTO device_request_leases (device_id, request_id, client_request_id, expires_at)
+      `INSERT INTO device_request_leases (${ownerCol}, request_id, client_request_id, expires_at)
        VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
-      [r.deviceId, r.requestId, r.clientRequestId, r.leaseSeconds],
+      [ownerId, r.requestId, r.clientRequestId, r.leaseSeconds],
     );
     return 'ok';
   });

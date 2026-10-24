@@ -8,6 +8,7 @@ import { openSecret, sealSecret, sha256Hex } from '../crypto.ts';
 import { bool, fail, int, log, readJson, rejectUnknown, requireObject, sendJson, str, uuidParam } from '../http/util.ts';
 import { guardOwner } from './auth.ts';
 import { authenticateDevice } from './devices.ts';
+import { readDesktopConfigCached } from './desktop-config.ts';
 import { bumpCatalogue } from './catalogue.ts';
 import { normalizeBaseUrl } from './upstream.ts';
 
@@ -379,6 +380,10 @@ async function perMinute(db: Queryer): Promise<number> {
  * default provider, then the other ready providers in priority order. Identical searches are cached for 10 minutes.
  */
 export async function search(ctx: Ctx): Promise<void> {
+  // Maintenance pauses server-side web search together with central chat (the desktop side hides the tool too).
+  if ((await readDesktopConfigCached(ctx.deps.db)).maintenance) {
+    fail(503, 'maintenance', 'web search is briefly under maintenance; try again soon', { 'retry-after': '60' });
+  }
   const device = await authenticateDevice(ctx);
   const { db, limits } = ctx.deps;
   const rl = await limits.hit(`search:dev:${device.deviceId}`, await perMinute(db), 60);
