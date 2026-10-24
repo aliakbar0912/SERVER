@@ -17,6 +17,7 @@ import { Db } from './db/pg-wire.ts';
 import { loadMigrations, migrateDown, migrateUp, migrationStatus } from './db/migrate.ts';
 import { log } from './http/util.ts';
 import { pruneLogs } from './modules/admin-data.ts';
+import { pruneSearchLogs } from './modules/search.ts';
 import { pruneRates } from './persistent-limits.ts';
 import { DatabaseLimitStore, RedisLimitStore, type LimitStore } from './limits.ts';
 import { Redis } from './redis.ts';
@@ -82,7 +83,7 @@ async function serve(): Promise<void> {
   // With several replicas, a Redis lock lets only one of them run each clean-up. The jobs are idempotent either way.
   const prune = async () => {
     try {
-      const n = await limits.withLock('prune-logs', 10 * 60_000, () => pruneLogs(db, config.logRetentionDays));
+      const n = await limits.withLock('prune-logs', 10 * 60_000, async () => (await pruneLogs(db, config.logRetentionDays)) + (await pruneSearchLogs(db, config.logRetentionDays)));
       if (n) log('info', 'pruned old request logs', { deleted: n, retentionDays: config.logRetentionDays });
     } catch (e) {
       log('error', 'log pruning failed', { error: e instanceof Error ? e.name : 'unknown' });

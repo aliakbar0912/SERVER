@@ -365,8 +365,8 @@ export async function account(ctx: Ctx): Promise<void> {
   let user: PbUser | null;
   let identities;
   try {
-    user = await p.getUser(device.userId);
-    identities = user ? await p.externalAuths(user.id) : [];
+    // Both PocketBase reads in parallel with the device list (this page is opened often).
+    [user, identities] = await Promise.all([p.getUser(device.userId), p.externalAuths(device.userId)]);
   } catch (e) {
     pbFail(e);
   }

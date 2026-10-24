@@ -66,6 +66,20 @@ export interface CatalogueModel {
   capabilities: Capabilities;
 }
 
+/** Mirrors search.ts `usable`: enabled, with a key (SearXNG: with an address). Kept here to avoid an import cycle. */
+async function webSearchReady(db: Db): Promise<boolean> {
+  try {
+    const { rows } = await db.query(
+      `SELECT 1 FROM search_providers p LEFT JOIN search_provider_secrets s ON s.provider_id = p.id
+        WHERE p.enabled AND ((p.kind = 'searxng' AND p.base_url IS NOT NULL) OR (p.kind <> 'searxng' AND s.provider_id IS NOT NULL)
+          AND (p.kind <> 'google_cse' OR coalesce(p.options->>'cx', '') <> '')) LIMIT 1`,
+    );
+    return rows.length > 0;
+  } catch {
+    return false; // before migration 8
+  }
+}
+
 export async function buildCatalogue(db: Db): Promise<{ version: number; generatedAt: string; models: CatalogueModel[]; policy: Record<string, unknown> }> {
   const settings = await readSettings(db);
   const { rows } = await db.query(
@@ -90,6 +104,8 @@ export async function buildCatalogue(db: Db): Promise<{ version: number; generat
     policy: {
       allowDirectProvider: settings.allow_direct_provider === true,
       maxOutputTokens: Number(settings.max_output_tokens ?? 8192),
+      // At least one web search provider is ready (desktops offer the agent's web_search tool only then).
+      webSearch: await webSearchReady(db),
     },
   };
 }

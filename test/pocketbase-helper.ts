@@ -167,10 +167,11 @@ export async function startPocketBase(): Promise<TestPocketBase | null> {
     },
     async waitForOtp(to, since) {
       for (let i = 0; i < 100; i++) {
-        const m = mails.slice(since).find((x) => x.to.includes(to.toLowerCase()) && /one-time password/i.test(x.raw.replace(/=\r\n/g, '')));
+        const m = mails.slice(since).find((x) => x.to.includes(to.toLowerCase()) && /one-time password|sign-in code/i.test(x.raw.replace(/=\r\n/g, '')));
         if (m) {
           const body = m.raw.replace(/=\r\n/g, '').split('\r\n\r\n').slice(1).join('\n');
-          const c = /<strong>(\d{4,12})<\/strong>/.exec(body.replace(/=3D/g, '=')) ?? /\b(\d{8})\b/.exec(body);
+          const subject = /^Subject: .*?(\d{4,12})\s*$/im.exec(m.raw);
+          const c = subject ?? /<strong>(\d{4,12})<\/strong>/.exec(body.replace(/=3D/g, '=')) ?? /\b(\d{8})\b/.exec(body);
           if (c) return c[1];
         }
         await new Promise((r) => setTimeout(r, 100));

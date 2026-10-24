@@ -8,6 +8,7 @@ import { DatabaseLimitStore } from './limits.ts';
 import { RedisUnavailableError } from './redis.ts';
 import { PocketBase } from './pocketbase.ts';
 import * as accounts from './modules/accounts.ts';
+import * as search from './modules/search.ts';
 import * as auth from './modules/auth.ts';
 import * as devices from './modules/devices.ts';
 import * as catalogue from './modules/catalogue.ts';
@@ -41,6 +42,7 @@ const routes: Route[] = [
   R('GET', '/v1/usage', catalogue.deviceUsageRoute),
   R('POST', '/v1/chat/completions', chat.chatCompletions),
   R('POST', '/v1/memory/sync', memory.syncMemories),
+  R('POST', '/v1/search', search.search),
   R('GET', '/v1/updates/check', releases.checkForUpdate),
   R('GET', '/v1/auth/config', accounts.authConfig),
   R('POST', '/v1/auth/session', accounts.createSession),
@@ -95,6 +97,13 @@ const routes: Route[] = [
   R('POST', '/admin/api/releases/:id/complete', releases.completeUpload),
   R('PATCH', '/admin/api/releases/:id', releases.updateRelease),
   R('DELETE', '/admin/api/releases/:id', releases.deleteRelease),
+  R('GET', '/admin/api/search-providers', search.listSearchProviders),
+  R('POST', '/admin/api/search-providers', search.createSearchProvider),
+  R('PATCH', '/admin/api/search-providers/:id', search.updateSearchProvider),
+  R('DELETE', '/admin/api/search-providers/:id', search.deleteSearchProvider),
+  R('PUT', '/admin/api/search-providers/:id/api-key', search.setSearchProviderKey),
+  R('DELETE', '/admin/api/search-providers/:id/api-key', search.clearSearchProviderKey),
+  R('POST', '/admin/api/search-providers/:id/test', search.testSearchProvider),
   R('GET', '/admin/api/users', accounts.adminListUsers),
   R('GET', '/admin/api/users/:id', accounts.adminGetUser),
   R('POST', '/admin/api/users/:id/:action', accounts.adminUserAction),

@@ -202,6 +202,7 @@ test('desktop: email-code signup and sign-in claims the existing registration, t
   assert.equal(left.body.items.length, 0);
   const ended = (await tdb!.db.query('SELECT signed_out_reason FROM devices WHERE id = $1', [deviceId])).rows[0];
   assert.equal(ended.signed_out_reason, 'logout');
+  await d.core.centralRefresh(); // reconnecting happens in the background after sign-out
   assert.ok(d.core.centralStatus().enrolled, 'central access continues without an account while sign-in is optional');
 });
 
@@ -258,4 +259,43 @@ test('desktop: when sign-in is required, local status says so; after sign-in Dev
   } finally {
     await tdb!.db.query("UPDATE settings SET value = 'false' WHERE key = 'require_login_for_central_ai'");
   }
+});
+
+test('desktop: two people on one computer never see or sync each other\'s memory', async (t) => {
+  if (skip(t)) return;
+  await pbt!.createUser('person-a@example.test', 'person-a-pass1', { name: 'Person A' });
+  await pbt!.createUser('person-b@example.test', 'person-b-pass1', { name: 'Person B' });
+  const d = desktop();
+  await d.core.centralRefresh();
+  await d.call('account:config');
+  // The computer's own (signed-out) memory.
+  d.core.memory.save({ scope: 'global', kind: 'fact', text: 'computer owner likes dark themes', source: 'user' } as any);
+
+  await d.call('account:signIn', { email: 'person-a@example.test', password: 'person-a-pass1' });
+  const fileA = d.core.memory.file;
+  assert.ok(fileA.includes(path.join('accounts')), 'signed-in memory lives in the account folder');
+  d.core.memory.save({ scope: 'global', kind: 'preference', text: 'person A secret preference', source: 'user' } as any);
+  await d.core.memorySync.syncNow('manual');
+  const aRows = await tdb!.db.query(`SELECT m.content FROM memory_entries m JOIN devices dv ON dv.id = m.device_id JOIN app_users u ON u.user_id = dv.user_id WHERE m.content = 'person A secret preference'`);
+  assert.equal(aRows.rows.length, 1, "A's memory reached A's account");
+  await d.call('account:signOut');
+
+  await d.call('account:signIn', { email: 'person-b@example.test', password: 'person-b-pass1' });
+  assert.notEqual(d.core.memory.file, fileA);
+  const seen = d.core.memory.all().map((e) => e.text);
+  assert.ok(!seen.includes('person A secret preference'), 'B does not see A');
+  assert.ok(!seen.includes('computer owner likes dark themes'), "B does not get the computer's signed-out memory");
+  await d.core.memorySync.syncNow('manual');
+  const bUser = (await d.call('account:status')).user.id;
+  const leaked = await tdb!.db.query(
+    `SELECT m.content FROM memory_entries m JOIN devices dv ON dv.id = m.device_id WHERE dv.user_id = $1`,
+    [bUser],
+  );
+  assert.deepEqual(leaked.rows.map((r) => r.content), [], "nothing of A (or the computer) was synced into B's account");
+  await d.call('account:signOut');
+
+  // Signed out again: the computer's own memory is back. A signing in again gets A's memory back.
+  assert.ok(d.core.memory.all().some((e) => e.text === 'computer owner likes dark themes'));
+  await d.call('account:signIn', { email: 'person-a@example.test', password: 'person-a-pass1' });
+  assert.ok(d.core.memory.all().some((e) => e.text === 'person A secret preference'));
 });

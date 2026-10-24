@@ -18,5 +18,5 @@
     "verbatimModuleSyntax": false
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["test/desktop-account.test.ts"]
+  "exclude": ["test/desktop-account.test.ts", "test/desktop-search.test.ts"]
 }

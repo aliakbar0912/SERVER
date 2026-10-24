@@ -140,6 +140,7 @@ export async function currentSettings(db: Queryer) {
     allowDirectProvider: s.allow_direct_provider === true,
     allowAutoRegistration: s.allow_auto_registration !== false,
     requireLoginForCentralAi: s.require_login_for_central_ai === true,
+    searchPerMinute: Number(s.search_per_minute ?? 20),
   };
 }
 
@@ -150,6 +151,7 @@ const SETTING_KEYS: Record<string, string> = {
   allowDirectProvider: 'allow_direct_provider',
   allowAutoRegistration: 'allow_auto_registration',
   requireLoginForCentralAi: 'require_login_for_central_ai',
+  searchPerMinute: 'search_per_minute',
 };
 
 export async function patchSettings(ctx: Ctx): Promise<void> {
@@ -170,6 +172,8 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
   }
   const autoReg = bool(body, 'allowAutoRegistration', { optional: true });
   if (autoReg !== undefined) changes.push(['allow_auto_registration', autoReg]);
+  const searchRate = int(body, 'searchPerMinute', { min: 1, max: 120, optional: true });
+  if (searchRate !== undefined) changes.push(['search_per_minute', searchRate]);
   const requireLogin = bool(body, 'requireLoginForCentralAi', { optional: true });
   if (requireLogin !== undefined) {
     // Changes who may use central AI: password confirmation, and only when accounts are configured on this server.
