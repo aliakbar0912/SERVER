@@ -14,10 +14,8 @@ import { providerApiKey } from './providers.ts';
 export type ModelAccess = 'all' | 'selected';
 
 /** The set of model ids a device may use, or null when it may use every enabled model. Read fresh on every call. */
-export async function allowedModelIds(db: Queryer, deviceId: string | null, access: ModelAccess): Promise<Set<string> | null> {
+export async function allowedModelIds(db: Queryer, deviceId: string, access: ModelAccess): Promise<Set<string> | null> {
   if (access === 'all') return null;
-  // 'selected' is only used by devices; a caller without a device id (API keys use 'all') gets nothing.
-  if (!deviceId) return new Set();
   const { rows } = await db.query('SELECT model_id FROM device_models WHERE device_id = $1', [deviceId]);
   return new Set(rows.map((r) => r.model_id as string));
 }

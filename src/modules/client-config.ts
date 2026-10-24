@@ -8,7 +8,6 @@ import type { Config } from '../config.ts';
 import type { Queryer } from '../db/pg-wire.ts';
 import { sendJson } from '../http/util.ts';
 import { compareVersions, latestPublished } from './releases.ts';
-import { readDesktopConfig, type DesktopConfig } from './desktop-config.ts';
 
 export const CLIENT_CONFIG_SCHEMA = 1;
 /** How long a desktop app may keep using this response when the server cannot be reached. */
@@ -22,30 +21,19 @@ export interface PublishedVersions {
 
 const newest = (a: string | null, b: string | null) => (!a ? b : !b ? a : compareVersions(a, b) >= 0 ? a : b);
 
-export function clientConfigBody(
-  config: Config,
-  published: PublishedVersions = { latestVersion: null, minVersion: null },
-  overrides: DesktopConfig = { statusMessage: '', minVersion: '', downloadUrl: '', maintenance: false },
-): Record<string, unknown> {
+export function clientConfigBody(config: Config, published: PublishedVersions = { latestVersion: null, minVersion: null }): Record<string, unknown> {
   return {
     schema: CLIENT_CONFIG_SCHEMA,
     instanceId: config.instanceId,
     apiOrigin: config.publicApiOrigin,
     apiVersions: ['v1'],
     desktop: {
-      // The admin site's overrides win over both the environment and the published releases.
-      minVersion: newest(config.desktop.minVersion, newest(published.minVersion, overrides.minVersion || null)),
+      minVersion: newest(config.desktop.minVersion, published.minVersion),
       latestVersion: newest(config.desktop.latestVersion, published.latestVersion),
-      downloadUrl: overrides.downloadUrl || config.desktop.downloadUrl,
+      downloadUrl: config.desktop.downloadUrl,
     },
-    status: {
-      // The admin site's notice replaces the environment notice (a non-empty override wins; both empty = none).
-      message: overrides.statusMessage || config.desktop.statusMessage,
-    },
-    features: {
-      // Understood by desktops since the admin-features update: a short maintenance notice in the app.
-      maintenance: overrides.maintenance === true,
-    },
+    status: { message: config.desktop.statusMessage },
+    features: {},
     maxAgeSeconds: CLIENT_CONFIG_MAX_AGE_SECONDS,
   };
 }
@@ -53,11 +41,7 @@ export function clientConfigBody(
 export async function clientConfigRoute(ctx: Ctx): Promise<void> {
   // Short shared caching is fine: the body is the same for everyone and contains no secrets.
   ctx.res.setHeader('cache-control', 'public, max-age=300');
-  sendJson(
-    ctx.res,
-    200,
-    clientConfigBody(ctx.deps.config, await publishedVersions(ctx.deps.db), await readDesktopConfig(ctx.deps.db)),
-  );
+  sendJson(ctx.res, 200, clientConfigBody(ctx.deps.config, await publishedVersions(ctx.deps.db)));
 }
 
 let cache: { at: number; value: PublishedVersions } | null = null;

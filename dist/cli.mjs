@@ -773,7 +773,6 @@ async function discoverModels(ctx) {
 // src/modules/registry.ts
 async function allowedModelIds(db, deviceId, access) {
   if (access === "all") return null;
-  if (!deviceId) return /* @__PURE__ */ new Set();
   const { rows } = await db.query("SELECT model_id FROM device_models WHERE device_id = $1", [deviceId]);
   return new Set(rows.map((r) => r.model_id));
 }
@@ -1067,152 +1066,6 @@ async function putDeviceModels(ctx) {
   sendJson(ctx.res, 200, { modelAccess: access, modelIds: access === "selected" ? modelIds : [] });
 }
 
-// src/modules/api-keys.ts
-import crypto3 from "node:crypto";
-var KEY_PREFIX = "dvk_";
-var KEY_SCOPES = ["chat", "models"];
-var MAX_KEYS = 200;
-function view(r) {
-  return {
-    id: r.id,
-    name: r.name,
-    keyPrefix: r.key_prefix,
-    last4: r.last4,
-    scopes: (r.scopes ?? []).filter((s) => KEY_SCOPES.includes(s)),
-    enabled: r.enabled,
-    expiresAt: r.expires_at,
-    lastUsedAt: r.last_used_at,
-    requestCount: Number(r.request_count ?? 0),
-    createdAt: r.created_at,
-    updatedAt: r.updated_at
-  };
-}
-function readScopes(v) {
-  const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : v === void 0 ? ["chat"] : null;
-  if (!list) fail(400, "invalid_request", "scopes must be a list or a comma-separated string");
-  const out = [...new Set(list.map((s) => String(s).trim()).filter(Boolean))];
-  if (out.length === 0) fail(400, "invalid_request", "at least one scope is required");
-  for (const s of out) {
-    if (!KEY_SCOPES.includes(s)) fail(400, "invalid_request", `unknown scope "${s}"; known scopes: ${KEY_SCOPES.join(", ")}`);
-  }
-  return out;
-}
-function readExpiry(v) {
-  if (v === void 0 || v === null || v === "" || v === "never") return null;
-  const t = Date.parse(String(v));
-  if (!Number.isFinite(t)) fail(400, "invalid_request", 'expiresAt must be an ISO date or "never"');
-  const d = new Date(t);
-  if (d.getTime() < Date.now()) fail(400, "invalid_request", "expiresAt must be in the future");
-  if (d.getTime() > Date.now() + 10 * 365 * 24 * 3600 * 1e3) fail(400, "invalid_request", "expiresAt may be at most 10 years ahead");
-  return d.toISOString();
-}
-async function listApiKeys(ctx) {
-  await guardOwner(ctx, { write: false });
-  const { rows } = await ctx.deps.db.query("SELECT * FROM api_keys ORDER BY created_at DESC");
-  sendJson(ctx.res, 200, { keys: rows.map(view), scopes: KEY_SCOPES });
-}
-async function createApiKey(ctx) {
-  await guardOwner(ctx, { write: true });
-  const body = requireObject(await readJson(ctx.req, 16 * 1024));
-  rejectUnknown(body, ["name", "scopes", "expiresAt"]);
-  const name = str(body, "name", { min: 1, max: 80 });
-  if (/[\r\n]/.test(name)) fail(400, "invalid_request", "the name must be a single line");
-  const scopes = readScopes(body.scopes);
-  const expiresAt = readExpiry(body.expiresAt);
-  const secret = KEY_PREFIX + crypto3.randomBytes(24).toString("hex");
-  const hash = sha256Hex(secret);
-  const id = await ctx.deps.db.transaction(async (q) => {
-    const n = await q.query("SELECT count(*)::int AS n FROM api_keys");
-    if (n.rows[0].n >= MAX_KEYS) fail(409, "too_many_keys", `there are already ${MAX_KEYS} API keys; delete one first`);
-    const { rows: rows2 } = await q.query(
-      `INSERT INTO api_keys (name, key_hash, key_prefix, last4, scopes, enabled, expires_at) VALUES ($1, $2, $3, $4, $5, true, $6) RETURNING id`,
-      [name, hash, secret.slice(0, 8), secret.slice(-4), JSON.stringify(scopes), expiresAt]
-    );
-    return rows2[0].id;
-  });
-  log("info", "api key created", { keyId: id });
-  const { rows } = await ctx.deps.db.query("SELECT * FROM api_keys WHERE id = $1", [id]);
-  sendJson(ctx.res, 201, {
-    key: view(rows[0]),
-    secret,
-    authorizationHeader: `Bearer ${secret}`,
-    note: "Store this secret now. It is not stored in plain text and cannot be shown again."
-  });
-}
-async function updateApiKey(ctx) {
-  await guardOwner(ctx, { write: true });
-  const id = uuidParam(ctx.params.id);
-  const body = requireObject(await readJson(ctx.req, 16 * 1024));
-  rejectUnknown(body, ["name", "scopes", "enabled", "expiresAt"]);
-  const sets = [];
-  const vals = [id];
-  const add = (col, v) => {
-    vals.push(v);
-    sets.push(`${col} = $${vals.length}`);
-  };
-  const name = str(body, "name", { min: 1, max: 80, optional: true });
-  if (name !== void 0) {
-    if (/[\r\n]/.test(name)) fail(400, "invalid_request", "the name must be a single line");
-    add("name", name);
-  }
-  if (body.scopes !== void 0) add("scopes", JSON.stringify(readScopes(body.scopes)));
-  if (body.enabled !== void 0) {
-    if (typeof body.enabled !== "boolean") fail(400, "invalid_request", "enabled must be true or false");
-    add("enabled", body.enabled);
-  }
-  if (body.expiresAt !== void 0) add("expires_at", readExpiry(body.expiresAt));
-  if (!sets.length) fail(400, "invalid_request", "nothing to change");
-  const { rowCount } = await ctx.deps.db.query(`UPDATE api_keys SET ${sets.join(", ")}, updated_at = now() WHERE id = $1`, vals);
-  if (!rowCount) fail(404, "not_found", "key not found");
-  const { rows } = await ctx.deps.db.query("SELECT * FROM api_keys WHERE id = $1", [id]);
-  sendJson(ctx.res, 200, { key: view(rows[0]) });
-}
-async function deleteApiKey(ctx) {
-  await guardOwner(ctx, { write: true });
-  const id = uuidParam(ctx.params.id);
-  const { rowCount } = await ctx.deps.db.query("DELETE FROM api_keys WHERE id = $1", [id]);
-  if (!rowCount) fail(404, "not_found", "key not found");
-  sendJson(ctx.res, 200, { deleted: true });
-}
-async function authenticateApiKey(ctx, requiredScope) {
-  const m = /^Bearer\s+(\S{20,128})$/.exec(ctx.req.headers.authorization ?? "");
-  const token = m?.[1] ?? "";
-  if (!token.startsWith(KEY_PREFIX)) return null;
-  const hash = sha256Hex(token);
-  const { rows } = await ctx.deps.db.query(
-    `SELECT id, name, scopes, enabled, (expires_at IS NOT NULL AND expires_at <= now()) AS expired,
-            (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') AS touch
-       FROM api_keys WHERE key_hash = $1`,
-    [hash]
-  );
-  const row = rows[0];
-  if (!row) fail(401, "invalid_api_key", "this API key is not valid; it may have been deleted");
-  if (!row.enabled) fail(403, "api_key_disabled", "this API key has been turned off by the owner");
-  if (row.expired) fail(403, "api_key_expired", "this API key has expired; ask the owner for a new one");
-  const scopes = Array.isArray(row.scopes) ? row.scopes : [];
-  if (!scopes.includes(requiredScope)) {
-    fail(403, "missing_scope", `this API key is not allowed to use "${requiredScope}"; the owner must add that scope`);
-  }
-  try {
-    await ctx.deps.db.query(
-      `UPDATE api_keys SET request_count = request_count + 1${row.touch ? ", last_used_at = now()" : ""} WHERE id = $1`,
-      [row.id]
-    );
-  } catch (e) {
-    log("warn", "could not record API key usage", { error: e instanceof Error ? e.message : String(e) });
-  }
-  return { keyId: row.id, name: row.name, scopes };
-}
-async function apiKeyRateLimit(db) {
-  try {
-    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'api_key_rate_limit_per_minute'");
-    const v = Number(rows[0]?.v ?? 30);
-    return Number.isInteger(v) && v >= 1 && v <= 600 ? v : 30;
-  } catch {
-    return 30;
-  }
-}
-
 // src/modules/catalogue.ts
 var CAPABILITY_NAMES = ["streaming", "tools", "vision", "reasoning"];
 var CAPABILITY_SOURCES = ["unknown", "admin", "provider_reported", "test"];
@@ -1259,14 +1112,6 @@ async function orgSkillsVersion(db) {
     return 0;
   }
 }
-async function orgAgentsVersion(db) {
-  try {
-    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'agents_version'");
-    return rows[0]?.v ?? 0;
-  } catch {
-    return 0;
-  }
-}
 async function webSearchReady(db) {
   try {
     const { rows } = await db.query(
@@ -1306,9 +1151,7 @@ async function buildCatalogue(db) {
       // At least one web search provider is ready (desktops offer the agent's web_search tool only then).
       webSearch: await webSearchReady(db),
       // Organization skills: desktops download /v1/skills again when this changes.
-      skillsVersion: await orgSkillsVersion(db),
-      // Organization agents: desktops download /v1/agents again when this changes.
-      agentsVersion: await orgAgentsVersion(db)
+      skillsVersion: await orgSkillsVersion(db)
     }
   };
 }
@@ -1393,25 +1236,6 @@ async function deviceUsageRoute(ctx) {
   sendJson(ctx.res, 200, {
     days,
     models: rows.map((r) => ({ modelId: r.model_id, modelName: r.model_name, requests: r.requests, ok: r.ok, failed: r.failed, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens }))
-  });
-}
-async function apiModelsRoute(ctx) {
-  const key = await authenticateApiKey(ctx, "models");
-  if (!key) fail(401, "unauthenticated", "an API key with the models scope is required (Authorization: Bearer dvk_...)");
-  const cat = await cachedCatalogue(ctx);
-  const created = Math.floor(Date.parse(cat.generatedAt) / 1e3) || 0;
-  sendJson(ctx.res, 200, {
-    object: "list",
-    data: cat.models.map((m) => ({
-      id: m.id,
-      object: "model",
-      created,
-      owned_by: m.providerName,
-      display_name: m.displayName,
-      description: m.description,
-      context_window: m.contextWindow,
-      is_default: m.isDefault
-    }))
   });
 }
 
@@ -1596,10 +1420,10 @@ import http2 from "node:http";
 
 // src/app.ts
 import http from "node:http";
-import crypto8 from "node:crypto";
+import crypto7 from "node:crypto";
 
 // src/db/migrate.ts
-import crypto4 from "node:crypto";
+import crypto3 from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1628,7 +1452,7 @@ function loadMigrations(dir = defaultMigrationsDir()) {
       version: version2,
       name: m[2],
       file,
-      checksum: crypto4.createHash("sha256").update(text).digest("hex"),
+      checksum: crypto3.createHash("sha256").update(text).digest("hex"),
       up: text.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
       down: text.slice(downIdx + "-- migrate:down".length).trim()
     };
@@ -1720,7 +1544,7 @@ async function migrateDown(db, steps, files = loadMigrations()) {
 }
 
 // src/limits.ts
-import crypto5 from "node:crypto";
+import crypto4 from "node:crypto";
 
 // src/persistent-limits.ts
 async function hitRate(q, key, limit2, windowSeconds) {
@@ -1744,27 +1568,25 @@ async function pruneRates(q) {
   return rowCount;
 }
 async function acquireSlot(db, r) {
-  const ownerCol = r.apiKeyId ? "api_key_id" : "device_id";
-  const ownerId = r.apiKeyId ?? r.deviceId;
   return db.transaction(async (q) => {
-    await q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [r.apiKeyId ? `key-slot:${r.apiKeyId}` : `device-slot:${r.deviceId}`]);
-    await q.query(`DELETE FROM device_request_leases WHERE ${ownerCol} = $1 AND expires_at <= now()`, [ownerId]);
+    await q.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`device-slot:${r.deviceId}`]);
+    await q.query("DELETE FROM device_request_leases WHERE device_id = $1 AND expires_at <= now()", [r.deviceId]);
     if (r.clientRequestId) {
       const seen = await q.query(
-        `SELECT 1 FROM device_request_leases WHERE ${ownerCol} = $1 AND client_request_id = $2
+        `SELECT 1 FROM device_request_leases WHERE device_id = $1 AND client_request_id = $2
          UNION ALL
-         SELECT 1 FROM request_logs WHERE ${ownerCol} = $1 AND client_request_id = $2
+         SELECT 1 FROM request_logs WHERE device_id = $1 AND client_request_id = $2
          LIMIT 1`,
-        [ownerId, r.clientRequestId]
+        [r.deviceId, r.clientRequestId]
       );
       if (seen.rows.length) return "duplicate";
     }
-    const { rows } = await q.query(`SELECT count(*)::int AS n FROM device_request_leases WHERE ${ownerCol} = $1`, [ownerId]);
+    const { rows } = await q.query("SELECT count(*)::int AS n FROM device_request_leases WHERE device_id = $1", [r.deviceId]);
     if (rows[0].n >= r.maxConcurrent) return "busy";
     await q.query(
-      `INSERT INTO device_request_leases (${ownerCol}, request_id, client_request_id, expires_at)
+      `INSERT INTO device_request_leases (device_id, request_id, client_request_id, expires_at)
        VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
-      [ownerId, r.requestId, r.clientRequestId, r.leaseSeconds]
+      [r.deviceId, r.requestId, r.clientRequestId, r.leaseSeconds]
     );
     return "ok";
   });
@@ -1818,7 +1640,7 @@ var RedisLimitStore = class {
   }
   async withLock(name, ttlMs, fn) {
     const key = this.k("lock", name);
-    const token = crypto5.randomUUID();
+    const token = crypto4.randomUUID();
     const got = await this.redis.command("SET", key, token, "NX", "PX", ttlMs);
     if (got !== "OK") return null;
     try {
@@ -2163,7 +1985,7 @@ function authError(e) {
 }
 
 // src/modules/accounts.ts
-import crypto6 from "node:crypto";
+import crypto5 from "node:crypto";
 var INSTALL_ID2 = /^[A-Za-z0-9_-]{16,64}$/;
 var HANDOFF_SECONDS = 10 * 60;
 var RESULT_SECONDS = 60;
@@ -2294,7 +2116,7 @@ async function oauthStart(ctx) {
   if (deps.config.env === "production" && authUrlBase.protocol !== "https:") fail(502, "oauth_not_configured", "the provider sign-in address must use https");
   if (authUrlBase.searchParams.get("state") !== provider.state) fail(502, "oauth_not_configured", "the account service returned an inconsistent sign-in state");
   const redirectUri = `${deps.config.publicApiOrigin}/v1/auth/oauth/callback`;
-  const id = crypto6.randomUUID();
+  const id = crypto5.randomUUID();
   const secret = randomToken(32);
   const sealed = userToken ? sealJson(deps, sealSecret(deps.config.keyring, userToken, `auth_handoff:${id}`)) : null;
   await deps.db.query(
@@ -2672,94 +2494,6 @@ async function adminUserActivity(ctx) {
   });
 }
 
-// src/modules/desktop-config.ts
-var STATUS_MESSAGE_MAX = 200;
-var VERSION = /^\d+\.\d+\.\d+$/;
-async function readDesktopConfig(db) {
-  try {
-    const s = await readSettings(db);
-    return {
-      statusMessage: typeof s.desktop_status_message === "string" ? s.desktop_status_message : "",
-      minVersion: typeof s.desktop_min_version === "string" && VERSION.test(s.desktop_min_version) ? s.desktop_min_version : "",
-      downloadUrl: typeof s.desktop_download_url === "string" ? s.desktop_download_url : "",
-      maintenance: s.desktop_maintenance === true
-    };
-  } catch {
-    return { statusMessage: "", minVersion: "", downloadUrl: "", maintenance: false };
-  }
-}
-var configCache = null;
-var DESKTOP_CONFIG_CACHE_MS = 1e4;
-function forgetDesktopConfigCache() {
-  configCache = null;
-}
-async function readDesktopConfigCached(db) {
-  if (configCache && Date.now() - configCache.at < DESKTOP_CONFIG_CACHE_MS) return configCache.value;
-  const value = await readDesktopConfig(db);
-  configCache = { at: Date.now(), value };
-  return value;
-}
-function checkDownloadUrl(v) {
-  if (!v) return "";
-  let u;
-  try {
-    u = new URL(v);
-  } catch {
-    fail(400, "invalid_request", "downloadUrl must be an https URL");
-  }
-  if (u.protocol !== "https:" || u.username || u.password) fail(400, "invalid_request", "downloadUrl must be an https URL without credentials");
-  return u.toString();
-}
-async function getDesktopConfig(ctx) {
-  await guardOwner(ctx, { write: false });
-  const cfg = await readDesktopConfig(ctx.deps.db);
-  sendJson(ctx.res, 200, {
-    ...cfg,
-    environment: {
-      minVersion: ctx.deps.config.desktop.minVersion,
-      latestVersion: ctx.deps.config.desktop.latestVersion,
-      downloadUrl: ctx.deps.config.desktop.downloadUrl,
-      statusMessage: ctx.deps.config.desktop.statusMessage
-    }
-  });
-}
-async function patchDesktopConfig(ctx) {
-  const session = await guardOwner(ctx, { write: true });
-  const body = requireObject(await readJson(ctx.req, 16 * 1024));
-  rejectUnknown(body, ["statusMessage", "minVersion", "downloadUrl", "maintenance"]);
-  const changes = [];
-  if (body.statusMessage !== void 0) {
-    const msg = str(body, "statusMessage", { min: 0, max: STATUS_MESSAGE_MAX, optional: true }) ?? "";
-    if (/[\u0000-\u001f]/.test(msg)) fail(400, "invalid_request", "the status message may not contain control characters");
-    changes.push(["desktop_status_message", msg.trim()]);
-  }
-  if (body.minVersion !== void 0) {
-    const v = str(body, "minVersion", { min: 0, max: 20, optional: true }) ?? "";
-    if (v && !VERSION.test(v)) fail(400, "invalid_request", "minVersion must look like 1.2.3, or be empty to clear it");
-    if (v) requireReauth(session);
-    changes.push(["desktop_min_version", v]);
-  }
-  if (body.downloadUrl !== void 0) {
-    const v = str(body, "downloadUrl", { min: 0, max: 2048, optional: true }) ?? "";
-    changes.push(["desktop_download_url", checkDownloadUrl(v)]);
-  }
-  if (body.maintenance !== void 0) {
-    const m = bool(body, "maintenance", { optional: true });
-    if (m !== void 0) changes.push(["desktop_maintenance", m]);
-  }
-  if (!changes.length) fail(400, "invalid_request", "no settings were given");
-  await ctx.deps.db.transaction(async (q) => {
-    for (const [k, v] of changes) {
-      await q.query(
-        "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-        [k, JSON.stringify(v)]
-      );
-    }
-  });
-  forgetDesktopConfigCache();
-  sendJson(ctx.res, 200, await readDesktopConfig(ctx.deps.db));
-}
-
 // src/modules/search.ts
 var SEARCH_KINDS = ["tavily", "brave", "serper", "exa", "google_cse", "searxng"];
 var KIND_INFO = {
@@ -2874,7 +2608,7 @@ var SELECT = `SELECT p.id, p.name, p.kind, p.base_url, p.options, p.enabled, p.i
 function usable(p) {
   return p.enabled && (!KIND_INFO[p.kind].needsKey || p.has_key) && (!KIND_INFO[p.kind].needsBaseUrl || !!p.base_url);
 }
-function view2(r) {
+function view(r) {
   const info = KIND_INFO[r.kind];
   return {
     id: r.id,
@@ -2920,7 +2654,7 @@ async function listSearchProviders(ctx) {
   );
   const settings = await ctx.deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'search_per_minute'");
   sendJson(ctx.res, 200, {
-    providers: rows.map(view2),
+    providers: rows.map(view),
     kinds: SEARCH_KINDS.map((k) => ({ kind: k, ...KIND_INFO[k] })),
     last7Days: stats.rows[0],
     perMinute: settings.rows[0]?.v ?? 20
@@ -2948,7 +2682,7 @@ async function createSearchProvider(ctx) {
     await bumpCatalogue(q);
     return rows[0].id;
   });
-  sendJson(ctx.res, 201, { provider: view2(await load(ctx.deps.db, created)) });
+  sendJson(ctx.res, 201, { provider: view(await load(ctx.deps.db, created)) });
 }
 async function updateSearchProvider(ctx) {
   await guardOwner(ctx, { write: true });
@@ -2988,7 +2722,7 @@ async function updateSearchProvider(ctx) {
     }
     await bumpCatalogue(q);
   });
-  sendJson(ctx.res, 200, { provider: view2(await load(ctx.deps.db, id)) });
+  sendJson(ctx.res, 200, { provider: view(await load(ctx.deps.db, id)) });
 }
 async function deleteSearchProvider(ctx) {
   await guardOwner(ctx, { write: true, sensitive: true });
@@ -3061,9 +2795,6 @@ async function perMinute(db) {
   return rows[0]?.v ?? 20;
 }
 async function search(ctx) {
-  if ((await readDesktopConfigCached(ctx.deps.db)).maintenance) {
-    fail(503, "maintenance", "web search is briefly under maintenance; try again soon", { "retry-after": "60" });
-  }
   const device = await authenticateDevice(ctx);
   const { db, limits } = ctx.deps;
   const rl = await limits.hit(`search:dev:${device.deviceId}`, await perMinute(db), 60);
@@ -3120,7 +2851,7 @@ function readTriggers(v) {
   if (out.some((t) => t.length > LIMITS.trigger || /[\r\n]/.test(t))) fail(400, "invalid_request", `each trigger is one line of at most ${LIMITS.trigger} characters`);
   return out;
 }
-function view3(r) {
+function view2(r) {
   return {
     id: r.id,
     slug: r.slug,
@@ -3160,7 +2891,7 @@ function readSkill(body, partial) {
 async function listOrgSkills(ctx) {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills ORDER BY name");
-  sendJson(ctx.res, 200, { skills: rows.map(view3), version: await skillsVersion(ctx.deps.db), limits: LIMITS });
+  sendJson(ctx.res, 200, { skills: rows.map(view2), version: await skillsVersion(ctx.deps.db), limits: LIMITS });
 }
 async function createOrgSkill(ctx) {
   await guardOwner(ctx, { write: true });
@@ -3178,7 +2909,7 @@ async function createOrgSkill(ctx) {
     return rows2[0].id;
   });
   const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills WHERE id = $1", [id]);
-  sendJson(ctx.res, 201, { skill: view3(rows[0]) });
+  sendJson(ctx.res, 201, { skill: view2(rows[0]) });
 }
 async function updateOrgSkill(ctx) {
   await guardOwner(ctx, { write: true });
@@ -3205,7 +2936,7 @@ async function updateOrgSkill(ctx) {
     await bumpSkills(q);
   });
   const { rows } = await ctx.deps.db.query("SELECT * FROM org_skills WHERE id = $1", [id]);
-  sendJson(ctx.res, 200, { skill: view3(rows[0]) });
+  sendJson(ctx.res, 200, { skill: view2(rows[0]) });
 }
 async function deleteOrgSkill(ctx) {
   await guardOwner(ctx, { write: true });
@@ -3525,12 +3256,6 @@ function idempotencyKey(req) {
   }
   return raw;
 }
-function callerDevice(c) {
-  return c.kind === "device" ? c.deviceId : null;
-}
-function callerKey(c) {
-  return c.kind === "key" ? c.keyId : null;
-}
 async function policyNumber(deps, key, fallback) {
   const { rows } = await deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = $1", [key]);
   return rows[0]?.v ?? fallback;
@@ -3539,27 +3264,15 @@ async function chatCompletions(ctx) {
   const { res, deps } = ctx;
   let deviceId = null;
   try {
-    if ((await readDesktopConfigCached(deps.db)).maintenance) {
-      fail(503, "maintenance", "the service is briefly under maintenance; try again soon", { "retry-after": "60" });
-    }
-    const asKey = await authenticateApiKey(ctx, "chat");
-    let caller;
-    if (asKey) {
-      caller = { kind: "key", keyId: asKey.keyId, keyName: asKey.name };
-    } else {
-      const device = await authenticateDevice(ctx);
-      deviceId = device.deviceId;
-      caller = { kind: "device", deviceId: device.deviceId, modelAccess: device.modelAccess };
-    }
+    const device = await authenticateDevice(ctx);
+    deviceId = device.deviceId;
     const clientRequestId = idempotencyKey(ctx.req);
-    const rateKey = caller.kind === "key" ? `chat:key:${caller.keyId}` : `chat:dev:${caller.deviceId}`;
-    const perMinute2 = caller.kind === "key" ? await apiKeyRateLimit(deps.db) : await policyNumber(deps, "rate_limit_per_minute", 60);
-    const rl = await deps.limits.hit(rateKey, perMinute2, 60);
-    if (!rl.allowed) fail(429, "rate_limited", "too many requests; wait and try again", { "retry-after": String(rl.retryAfterSeconds) });
+    const perMinute2 = await policyNumber(deps, "rate_limit_per_minute", 60);
+    const rl = await deps.limits.hit(`chat:dev:${device.deviceId}`, perMinute2, 60);
+    if (!rl.allowed) fail(429, "rate_limited", "too many requests from this device; wait and try again", { "retry-after": String(rl.retryAfterSeconds) });
     const maxConcurrent = await policyNumber(deps, "max_concurrent_per_device", 2);
     const slot = await acquireSlot(deps.db, {
-      deviceId: callerDevice(caller),
-      apiKeyId: callerKey(caller),
+      deviceId: device.deviceId,
       requestId: ctx.requestId,
       clientRequestId,
       maxConcurrent,
@@ -3568,7 +3281,7 @@ async function chatCompletions(ctx) {
     if (slot === "duplicate") fail(409, "duplicate_request", "this request was already received; send a new Idempotency-Key for a new request");
     if (slot === "busy") fail(429, "too_many_requests", "this device already has requests running; wait for one to finish");
     try {
-      await handle(ctx, caller, clientRequestId);
+      await handle(ctx, device, clientRequestId);
     } finally {
       await releaseSlot(deps.db, ctx.requestId).catch((e) => log("error", "could not release request slot", { requestId: ctx.requestId, error: errText(e) }));
     }
@@ -3593,13 +3306,13 @@ async function chatCompletions(ctx) {
 function errText(e) {
   return e instanceof Error ? e.name + ": " + e.message.slice(0, 300) : "unknown error";
 }
-async function handle(ctx, caller, clientRequestId) {
+async function handle(ctx, device, clientRequestId) {
   const { deps, req } = ctx;
-  const deviceId = callerDevice(caller);
+  const deviceId = device.deviceId;
   const body = await readJson(req, BODY_LIMIT);
   const policy = await deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'max_output_tokens'");
   const parsed = parseChatRequest(body, policy.rows[0]?.v ?? 8192);
-  const allowed = await allowedModelIds(deps.db, deviceId, caller.kind === "device" ? caller.modelAccess : "all");
+  const allowed = await allowedModelIds(deps.db, deviceId, device.modelAccess);
   const m = await loadRoute(deps, parsed.model);
   if (!m || !isAllowed(allowed, m.id)) throw oa("model_not_found", "this model is not in the catalogue for this computer; refresh the model list", 404);
   if (!m.model_enabled || !m.provider_enabled) throw oa("model_disabled", "this model is currently disabled; choose another model", 403);
@@ -3610,7 +3323,7 @@ async function handle(ctx, caller, clientRequestId) {
     if (fb && fb.model_enabled && fb.provider_enabled && isAllowed(allowed, fb.id) && checkCompatible(fb, parsed, false)) chain.push(fb);
   }
   for (let i = 0; i < chain.length; i++) {
-    const done = await attempt(ctx, caller, clientRequestId, parsed, chain[i], { requested: m, canFallBack: i < chain.length - 1 });
+    const done = await attempt(ctx, deviceId, clientRequestId, parsed, chain[i], { requested: m, canFallBack: i < chain.length - 1 });
     if (done) return;
   }
 }
@@ -3641,10 +3354,8 @@ function checkCompatible(m, parsed, raise) {
 function shouldFallBack(e) {
   return e instanceof UpstreamError && ["auth", "rate_limited", "timeout", "unreachable", "server"].includes(e.kind);
 }
-async function attempt(ctx, caller, clientRequestId, parsed, m, route) {
+async function attempt(ctx, deviceId, clientRequestId, parsed, m, route) {
   const { deps, res } = ctx;
-  const deviceId = callerDevice(caller);
-  const apiKeyId = callerKey(caller);
   const isFallback = m.id !== route.requested.id;
   let key = null;
   if (m.auth_scheme === "bearer") {
@@ -3715,7 +3426,6 @@ async function attempt(ctx, caller, clientRequestId, parsed, m, route) {
       // The idempotency key belongs to the request, so only the attempt that answers carries it (the column is unique).
       clientRequestId: movedOn ? null : clientRequestId,
       deviceId,
-      apiKeyId,
       modelId: m.id,
       modelName: m.display_name,
       providerId: m.provider_id,
@@ -3868,7 +3578,7 @@ async function pipeStream(upstream, res, started, controller) {
     }
     res.end();
     return { status: "ok", http: 200, code: null, ttft, usage: usage3 };
-  } catch {
+  } catch (e) {
     clearTimeout(idle);
     await reader.cancel().catch(() => void 0);
     if (controller.signal.aborted && !timeoutFlag.get(controller)) {
@@ -3894,7 +3604,6 @@ async function writeLog(deps, r) {
   const reported = r.usage.p !== null || r.usage.c !== null;
   const params = [
     r.deviceId,
-    r.apiKeyId,
     r.modelId,
     r.modelName,
     r.providerId,
@@ -3911,8 +3620,8 @@ async function writeLog(deps, r) {
     r.requestId,
     r.clientRequestId
   ];
-  const sql = `INSERT INTO request_logs (device_id, api_key_id, model_id, model_name, provider_id, provider_name, status, http_status, error_code, stream, latency_ms, ttft_ms, prompt_tokens, completion_tokens, usage_source, request_id, client_request_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+  const sql = `INSERT INTO request_logs (device_id, model_id, model_name, provider_id, provider_name, status, http_status, error_code, stream, latency_ms, ttft_ms, prompt_tokens, completion_tokens, usage_source, request_id, client_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT DO NOTHING`;
   for (let attempt2 = 1; attempt2 <= 3; attempt2++) {
     try {
@@ -4171,9 +3880,7 @@ async function overview(ctx) {
       (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours') AS requests_24h,
       (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours' AND status <> 'ok') AS failed_24h,
       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p50_ms,
-      (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms,
-      (SELECT count(*)::int FROM api_keys WHERE enabled) AS api_keys_enabled,
-      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled`);
+      (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms`);
   const providers = await ctx.deps.db.query("SELECT name, enabled, last_test_ok, last_test_at, last_test_message FROM providers ORDER BY name");
   sendJson(ctx.res, 200, {
     ...toCamel(rows[0]),
@@ -4251,9 +3958,9 @@ async function logs(ctx) {
     where.push(`r.id < $${params.length}`);
   }
   params.push(limit2 + 1);
-  const sql = `SELECT r.id, r.created_at, d.name AS device_name, k.name AS api_key_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
+  const sql = `SELECT r.id, r.created_at, d.name AS device_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
                       r.stream, r.latency_ms, r.ttft_ms, r.prompt_tokens, r.completion_tokens, r.usage_source
-                 FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id LEFT JOIN api_keys k ON k.id = r.api_key_id
+                 FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id
                 ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
                 ORDER BY r.id DESC LIMIT $${params.length}`;
   const { rows } = await ctx.deps.db.query(sql, params);
@@ -4263,7 +3970,6 @@ async function logs(ctx) {
       id: Number(r.id),
       createdAt: r.created_at,
       deviceName: r.device_name ?? null,
-      apiKeyName: r.api_key_name ?? null,
       modelName: r.model_name,
       providerName: r.provider_name,
       status: r.status,
@@ -4292,8 +3998,7 @@ async function currentSettings(db) {
     allowDirectProvider: s.allow_direct_provider === true,
     allowAutoRegistration: s.allow_auto_registration !== false,
     requireLoginForCentralAi: s.require_login_for_central_ai === true,
-    searchPerMinute: Number(s.search_per_minute ?? 20),
-    apiKeyRateLimitPerMinute: Number(s.api_key_rate_limit_per_minute ?? 30)
+    searchPerMinute: Number(s.search_per_minute ?? 20)
   };
 }
 var SETTING_KEYS = {
@@ -4303,8 +4008,7 @@ var SETTING_KEYS = {
   allowDirectProvider: "allow_direct_provider",
   allowAutoRegistration: "allow_auto_registration",
   requireLoginForCentralAi: "require_login_for_central_ai",
-  searchPerMinute: "search_per_minute",
-  apiKeyRateLimitPerMinute: "api_key_rate_limit_per_minute"
+  searchPerMinute: "search_per_minute"
 };
 async function patchSettings(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -4326,8 +4030,6 @@ async function patchSettings(ctx) {
   if (autoReg !== void 0) changes.push(["allow_auto_registration", autoReg]);
   const searchRate = int(body, "searchPerMinute", { min: 1, max: 120, optional: true });
   if (searchRate !== void 0) changes.push(["search_per_minute", searchRate]);
-  const apiKeyRate = int(body, "apiKeyRateLimitPerMinute", { min: 1, max: 600, optional: true });
-  if (apiKeyRate !== void 0) changes.push(["api_key_rate_limit_per_minute", apiKeyRate]);
   const requireLogin = bool(body, "requireLoginForCentralAi", { optional: true });
   if (requireLogin !== void 0) {
     requireReauth(session);
@@ -4411,13 +4113,13 @@ async function adminHealth(ctx) {
 }
 
 // src/modules/releases.ts
-import crypto7 from "node:crypto";
+import crypto6 from "node:crypto";
 var CHUNK_BYTES = 4 * 1024 * 1024;
 var MAX_RELEASE_BYTES = 600 * 1024 * 1024;
 var MAX_CHUNKS = Math.ceil(MAX_RELEASE_BYTES / CHUNK_BYTES);
 var CHECKS_PER_HOUR = 60;
 var DOWNLOADS_PER_HOUR = 6;
-var VERSION2 = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/;
+var VERSION = /^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$/;
 var SHA256 = /^[0-9a-f]{64}$/;
 var FILE_NAME = /^[A-Za-z0-9 ._()+-]{1,200}$/;
 function compareVersions(a, b) {
@@ -4433,7 +4135,7 @@ function compareVersions(a, b) {
   if (!y.pre) return -1;
   return x.pre < y.pre ? -1 : 1;
 }
-function view4(r) {
+function view3(r) {
   return {
     id: r.id,
     version: r.version,
@@ -4475,7 +4177,7 @@ async function listReleases(ctx) {
     `SELECT coalesce(app_version, 'unknown') AS version, count(*)::int AS devices
        FROM devices WHERE status = 'active' GROUP BY 1 ORDER BY 2 DESC LIMIT 50`
   );
-  const list = rows.map(view4).sort((a, b) => compareVersions(b.version, a.version));
+  const list = rows.map(view3).sort((a, b) => compareVersions(b.version, a.version));
   sendJson(ctx.res, 200, {
     releases: list,
     adoption: adoption.rows,
@@ -4487,7 +4189,7 @@ async function createRelease(ctx) {
   await guardOwner(ctx, { write: true });
   const body = requireObject(await readJson(ctx.req, 32 * 1024));
   rejectUnknown(body, ["version", "notes", "mandatory", "externalUrl", "sha256", "fileName", "fileSize"]);
-  const version2 = str(body, "version", { min: 5, max: 40, pattern: VERSION2 });
+  const version2 = str(body, "version", { min: 5, max: 40, pattern: VERSION });
   const notes = str(body, "notes", { max: 1e4, optional: true }) ?? "";
   const mandatory = bool(body, "mandatory", { def: false });
   const externalUrl = str(body, "externalUrl", { max: 2e3, optional: true }) || null;
@@ -4512,7 +4214,7 @@ async function createRelease(ctx) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [version2, notes, mandatory, externalUrl ? "url" : "upload", externalUrl, sha256, fileName, fileSize, !!externalUrl]
     );
-    sendJson(ctx.res, 201, { release: view4(await getRelease(ctx.deps.db, rows[0].id)), chunkBytes: CHUNK_BYTES });
+    sendJson(ctx.res, 201, { release: view3(await getRelease(ctx.deps.db, rows[0].id)), chunkBytes: CHUNK_BYTES });
   } catch (e) {
     if (/duplicate key|unique/i.test(e.message)) fail(409, "version_exists", `version ${version2} already exists`);
     throw e;
@@ -4559,7 +4261,7 @@ async function completeUpload(ctx) {
   rows.forEach((c, i) => {
     if (c.seq !== i) fail(400, "upload_incomplete", `piece ${i} is missing; upload it again`);
   });
-  const hash = crypto7.createHash("sha256");
+  const hash = crypto6.createHash("sha256");
   let total = 0;
   for (const c of rows) {
     const part = await ctx.deps.db.query("SELECT data FROM desktop_release_chunks WHERE release_id = $1 AND seq = $2", [id, c.seq]);
@@ -4574,7 +4276,7 @@ async function completeUpload(ctx) {
   const magic = head.rows[0]?.h?.toString("latin1") ?? "";
   if (magic !== "MZ") fail(400, "not_an_installer", "this file is not a Windows installer (.exe)");
   await ctx.deps.db.query("UPDATE desktop_releases SET sha256 = $2, file_size = $3, upload_complete = true WHERE id = $1", [id, sha256, total]);
-  sendJson(ctx.res, 200, { release: view4(await getRelease(ctx.deps.db, id)) });
+  sendJson(ctx.res, 200, { release: view3(await getRelease(ctx.deps.db, id)) });
 }
 async function updateRelease(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -4597,7 +4299,7 @@ async function updateRelease(ctx) {
     [id, notes ?? null, mandatory ?? null, status ?? null]
   );
   forgetPublishedVersions();
-  sendJson(ctx.res, 200, { release: view4(await getRelease(ctx.deps.db, id)) });
+  sendJson(ctx.res, 200, { release: view3(await getRelease(ctx.deps.db, id)) });
 }
 async function deleteRelease(ctx) {
   const session = await guardOwner(ctx, { write: true });
@@ -4613,7 +4315,7 @@ async function checkForUpdate(ctx) {
   const rl = await ctx.deps.limits.hit(`updates:check:${device.deviceId}`, CHECKS_PER_HOUR, 3600);
   if (!rl.allowed) fail(429, "rate_limited", "too many update checks; try again later", { "retry-after": String(rl.retryAfterSeconds) });
   const current = ctx.url.searchParams.get("current") ?? "";
-  if (!VERSION2.test(current)) fail(400, "invalid_request", "current must be the installed version, for example 1.2.3");
+  if (!VERSION.test(current)) fail(400, "invalid_request", "current must be the installed version, for example 1.2.3");
   const { latest, mandatory } = await latestPublished(ctx.deps.db, current);
   if (!latest || compareVersions(latest.version, current) <= 0) {
     sendJson(ctx.res, 200, { update: null });
@@ -4666,36 +4368,25 @@ async function downloadUpdate(ctx) {
 var CLIENT_CONFIG_SCHEMA = 1;
 var CLIENT_CONFIG_MAX_AGE_SECONDS = 7 * 24 * 3600;
 var newest = (a, b) => !a ? b : !b ? a : compareVersions(a, b) >= 0 ? a : b;
-function clientConfigBody(config, published = { latestVersion: null, minVersion: null }, overrides = { statusMessage: "", minVersion: "", downloadUrl: "", maintenance: false }) {
+function clientConfigBody(config, published = { latestVersion: null, minVersion: null }) {
   return {
     schema: CLIENT_CONFIG_SCHEMA,
     instanceId: config.instanceId,
     apiOrigin: config.publicApiOrigin,
     apiVersions: ["v1"],
     desktop: {
-      // The admin site's overrides win over both the environment and the published releases.
-      minVersion: newest(config.desktop.minVersion, newest(published.minVersion, overrides.minVersion || null)),
+      minVersion: newest(config.desktop.minVersion, published.minVersion),
       latestVersion: newest(config.desktop.latestVersion, published.latestVersion),
-      downloadUrl: overrides.downloadUrl || config.desktop.downloadUrl
+      downloadUrl: config.desktop.downloadUrl
     },
-    status: {
-      // The admin site's notice replaces the environment notice (a non-empty override wins; both empty = none).
-      message: overrides.statusMessage || config.desktop.statusMessage
-    },
-    features: {
-      // Understood by desktops since the admin-features update: a short maintenance notice in the app.
-      maintenance: overrides.maintenance === true
-    },
+    status: { message: config.desktop.statusMessage },
+    features: {},
     maxAgeSeconds: CLIENT_CONFIG_MAX_AGE_SECONDS
   };
 }
 async function clientConfigRoute(ctx) {
   ctx.res.setHeader("cache-control", "public, max-age=300");
-  sendJson(
-    ctx.res,
-    200,
-    clientConfigBody(ctx.deps.config, await publishedVersions(ctx.deps.db), await readDesktopConfig(ctx.deps.db))
-  );
+  sendJson(ctx.res, 200, clientConfigBody(ctx.deps.config, await publishedVersions(ctx.deps.db)));
 }
 var cache = null;
 async function publishedVersions(db) {
@@ -4712,143 +4403,6 @@ function forgetPublishedVersions() {
   cache = null;
 }
 
-// src/modules/agents.ts
-var LIMITS2 = { name: 80, description: 1024, instructions: 8e3, suggestedModel: 200 };
-var ACCESS_LEVELS = ["read", "commands", "docs", "write", "write_commands"];
-function slugify2(name) {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "agent";
-}
-function view5(r) {
-  return {
-    id: r.id,
-    slug: r.slug,
-    name: r.name,
-    description: r.description,
-    instructions: r.instructions,
-    access: r.access,
-    suggestedModel: r.suggested_model,
-    enabled: r.enabled,
-    revision: r.revision,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at
-  };
-}
-async function bumpAgents(q) {
-  await q.query("UPDATE settings SET value = to_jsonb((value::text::int) + 1), updated_at = now() WHERE key = 'agents_version'");
-  await bumpCatalogue(q);
-}
-async function agentsVersion(db) {
-  try {
-    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'agents_version'");
-    return rows[0]?.v ?? 0;
-  } catch {
-    return 0;
-  }
-}
-function readAgent(body, partial) {
-  const name = str(body, "name", { min: 1, max: LIMITS2.name, optional: partial });
-  if (name !== void 0 && /[\r\n]/.test(name)) fail(400, "invalid_request", "the name must be a single line");
-  const description = str(body, "description", { min: 1, max: LIMITS2.description, optional: partial });
-  const instructions = str(body, "instructions", { min: 1, max: LIMITS2.instructions, optional: partial, trim: false });
-  const access = body.access === void 0 ? void 0 : readAccess(body.access);
-  let suggestedModel;
-  if (body.suggestedModel !== void 0) {
-    if (body.suggestedModel === null || body.suggestedModel === "") suggestedModel = null;
-    else suggestedModel = str(body, "suggestedModel", { min: 1, max: LIMITS2.suggestedModel });
-  }
-  const enabled = bool(body, "enabled", { optional: true });
-  return { name, description, instructions: instructions?.trim(), access, suggestedModel, enabled };
-}
-function readAccess(v) {
-  if (typeof v !== "string" || !ACCESS_LEVELS.includes(v)) {
-    fail(400, "invalid_request", `access must be one of: ${ACCESS_LEVELS.join(", ")}`);
-  }
-  return v;
-}
-async function listOrgAgents(ctx) {
-  await guardOwner(ctx, { write: false });
-  const { rows } = await ctx.deps.db.query("SELECT * FROM org_agents ORDER BY name");
-  sendJson(ctx.res, 200, { agents: rows.map(view5), version: await agentsVersion(ctx.deps.db), limits: LIMITS2, accessLevels: ACCESS_LEVELS });
-}
-async function createOrgAgent(ctx) {
-  await guardOwner(ctx, { write: true });
-  const body = requireObject(await readJson(ctx.req, 64 * 1024));
-  rejectUnknown(body, ["name", "description", "instructions", "access", "suggestedModel", "enabled"]);
-  const a = readAgent(body, false);
-  if (a.access === void 0) fail(400, "invalid_request", "access is required");
-  const id = await ctx.deps.db.transaction(async (q) => {
-    let slug = slugify2(a.name);
-    for (let i = 2; (await q.query("SELECT 1 FROM org_agents WHERE slug = $1", [slug])).rows.length; i++) slug = `${slugify2(a.name).slice(0, 55)}-${i}`;
-    const { rows: rows2 } = await q.query(
-      `INSERT INTO org_agents (slug, name, description, instructions, access, suggested_model, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [slug, a.name, a.description, a.instructions, a.access, a.suggestedModel ?? null, a.enabled ?? true]
-    );
-    await bumpAgents(q);
-    return rows2[0].id;
-  });
-  const { rows } = await ctx.deps.db.query("SELECT * FROM org_agents WHERE id = $1", [id]);
-  sendJson(ctx.res, 201, { agent: view5(rows[0]) });
-}
-async function updateOrgAgent(ctx) {
-  await guardOwner(ctx, { write: true });
-  const id = uuidParam(ctx.params.id);
-  const body = requireObject(await readJson(ctx.req, 64 * 1024));
-  rejectUnknown(body, ["name", "description", "instructions", "access", "suggestedModel", "enabled"]);
-  const a = readAgent(body, true);
-  const sets = [];
-  const vals = [id];
-  const add = (col, v) => {
-    vals.push(v);
-    sets.push(`${col} = $${vals.length}`);
-  };
-  if (a.name !== void 0) add("name", a.name);
-  if (a.description !== void 0) add("description", a.description);
-  if (a.instructions !== void 0) add("instructions", a.instructions);
-  if (a.access !== void 0) add("access", a.access);
-  if (a.suggestedModel !== void 0) add("suggested_model", a.suggestedModel);
-  if (a.enabled !== void 0) add("enabled", a.enabled);
-  if (!sets.length) fail(400, "invalid_request", "nothing to change");
-  await ctx.deps.db.transaction(async (q) => {
-    const { rowCount } = await q.query(`UPDATE org_agents SET ${sets.join(", ")}, revision = revision + 1, updated_at = now() WHERE id = $1`, vals);
-    if (!rowCount) fail(404, "not_found", "agent not found");
-    await bumpAgents(q);
-  });
-  const { rows } = await ctx.deps.db.query("SELECT * FROM org_agents WHERE id = $1", [id]);
-  sendJson(ctx.res, 200, { agent: view5(rows[0]) });
-}
-async function deleteOrgAgent(ctx) {
-  await guardOwner(ctx, { write: true });
-  const id = uuidParam(ctx.params.id);
-  await ctx.deps.db.transaction(async (q) => {
-    const { rowCount } = await q.query("DELETE FROM org_agents WHERE id = $1", [id]);
-    if (!rowCount) fail(404, "not_found", "agent not found");
-    await bumpAgents(q);
-  });
-  sendJson(ctx.res, 200, { deleted: true });
-}
-async function desktopAgents(ctx) {
-  await authenticateDevice(ctx);
-  const version2 = await agentsVersion(ctx.deps.db);
-  const etag = `"agents-${version2}"`;
-  if (ctx.req.headers["if-none-match"] === etag) {
-    ctx.res.writeHead(304, { etag, "cache-control": "no-store" });
-    ctx.res.end();
-    return;
-  }
-  const { rows } = await ctx.deps.db.query(
-    "SELECT slug, name, description, instructions, access, suggested_model, revision, updated_at FROM org_agents WHERE enabled ORDER BY name"
-  );
-  sendJson(
-    ctx.res,
-    200,
-    {
-      version: version2,
-      agents: rows.map((r) => ({ slug: r.slug, name: r.name, description: r.description, instructions: r.instructions, access: r.access, suggestedModel: r.suggested_model, revision: r.revision, updatedAt: r.updated_at }))
-    },
-    { etag }
-  );
-}
-
 // src/app.ts
 var R = (method, path2, handler) => ({ method, parts: path2.split("/").filter(Boolean), handler });
 var routes = [
@@ -4862,11 +4416,9 @@ var routes = [
   R("GET", "/v1/models/:id", modelRoute),
   R("GET", "/v1/usage", deviceUsageRoute),
   R("POST", "/v1/chat/completions", chatCompletions),
-  R("GET", "/v1/models", apiModelsRoute),
   R("POST", "/v1/memory/sync", syncMemories),
   R("POST", "/v1/search", search),
   R("GET", "/v1/skills", desktopSkills),
-  R("GET", "/v1/agents", desktopAgents),
   R("GET", "/v1/updates/check", checkForUpdate),
   R("GET", "/v1/auth/config", authConfig),
   R("POST", "/v1/auth/session", createSession),
@@ -4931,17 +4483,7 @@ var routes = [
   R("GET", "/admin/api/users/:id", adminGetUser),
   R("POST", "/admin/api/users/:id/:action", adminUserAction),
   R("GET", "/admin/api/settings", getSettings),
-  R("PATCH", "/admin/api/settings", patchSettings),
-  R("GET", "/admin/api/api-keys", listApiKeys),
-  R("POST", "/admin/api/api-keys", createApiKey),
-  R("PATCH", "/admin/api/api-keys/:id", updateApiKey),
-  R("DELETE", "/admin/api/api-keys/:id", deleteApiKey),
-  R("GET", "/admin/api/agents", listOrgAgents),
-  R("POST", "/admin/api/agents", createOrgAgent),
-  R("PATCH", "/admin/api/agents/:id", updateOrgAgent),
-  R("DELETE", "/admin/api/agents/:id", deleteOrgAgent),
-  R("GET", "/admin/api/desktop-config", getDesktopConfig),
-  R("PATCH", "/admin/api/desktop-config", patchDesktopConfig)
+  R("PATCH", "/admin/api/settings", patchSettings)
 ];
 function match(route, pathname) {
   const segs = pathname.split("/").filter(Boolean);
@@ -5013,7 +4555,7 @@ function createHandler(input) {
     pocketbase: input.pocketbase !== void 0 ? input.pocketbase : input.config.pocketbase ? new PocketBase(input.config.pocketbase, input.fetch) : null
   };
   return async (req, res) => {
-    const requestId = crypto8.randomUUID();
+    const requestId = crypto7.randomUUID();
     const started = Date.now();
     let routeName = "unmatched";
     res.setHeader("x-request-id", requestId);
@@ -5080,7 +4622,7 @@ function createServer(deps) {
 
 // src/config.ts
 import fs3 from "node:fs";
-import crypto9 from "node:crypto";
+import crypto8 from "node:crypto";
 function bool2(v, fallback) {
   if (v === void 0 || v === "") return fallback;
   if (["1", "true", "yes", "on"].includes(v.toLowerCase())) return true;
@@ -5148,7 +4690,7 @@ function instanceId(env, keyring) {
   }
   const first = [...keyring.keys.keys()].sort((a, b) => a - b)[0];
   if (first === void 0) return "development";
-  return crypto9.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
+  return crypto8.createHmac("sha256", keyring.keys.get(first)).update("devora-instance-id").digest("hex").slice(0, 32);
 }
 function parseDatabase(env, production) {
   const sslDefault = production ? "require" : "disable";
@@ -5292,7 +4834,7 @@ function redactedConfig(c) {
 }
 
 // src/db/pg-wire.ts
-import crypto10 from "node:crypto";
+import crypto9 from "node:crypto";
 import net2 from "node:net";
 import tls2 from "node:tls";
 import fs4 from "node:fs";
@@ -5378,7 +4920,7 @@ function parseError(body) {
   return new PgError(fields.M ?? "database error", fields.C ?? "", fields.D);
 }
 function hmac(key, data) {
-  return crypto10.createHmac("sha256", key).update(data).digest();
+  return crypto9.createHmac("sha256", key).update(data).digest();
 }
 var PgConnection = class _PgConnection {
   socket;
@@ -5487,7 +5029,7 @@ var PgConnection = class _PgConnection {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
   async scram(password) {
-    const nonce = crypto10.randomBytes(18).toString("base64");
+    const nonce = crypto9.randomBytes(18).toString("base64");
     const clientFirstBare = `n=,r=${nonce}`;
     const initial = Buffer.from(`n,,${clientFirstBare}`, "utf8");
     this.socket.write(frame("p", Buffer.concat([cstr("SCRAM-SHA-256"), int32(initial.length), initial])));
@@ -5500,10 +5042,10 @@ var PgConnection = class _PgConnection {
     const iterations = Number(attrs.i);
     if (!Number.isInteger(iterations) || iterations < 4096 || iterations > 1e6) throw new PgError("unacceptable SCRAM iteration count");
     const salted = await new Promise(
-      (resolve, reject) => crypto10.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
+      (resolve, reject) => crypto9.pbkdf2(password, Buffer.from(attrs.s, "base64"), iterations, 32, "sha256", (e, k) => e ? reject(e) : resolve(k))
     );
     const clientKey = hmac(salted, "Client Key");
-    const storedKey = crypto10.createHash("sha256").update(clientKey).digest();
+    const storedKey = crypto9.createHash("sha256").update(clientKey).digest();
     const clientFinalNoProof = `c=biws,r=${attrs.r}`;
     const authMessage = `${clientFirstBare},${serverFirst},${clientFinalNoProof}`;
     const signature = hmac(storedKey, authMessage);

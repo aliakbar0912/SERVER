@@ -2,7 +2,6 @@
 import type { Ctx } from '../context.ts';
 import type { Queryer, Db } from '../db/pg-wire.ts';
 import { authenticateDevice } from './devices.ts';
-import { authenticateApiKey } from './api-keys.ts';
 import { requireLoginForCentralAi } from './sessions.ts';
 import { fail, sendJson, uuidParam } from '../http/util.ts';
 import { allowedModelIds, isAllowed, providerHealth } from './registry.ts';
@@ -76,15 +75,6 @@ async function orgSkillsVersion(db: Db): Promise<number> {
   }
 }
 
-async function orgAgentsVersion(db: Db): Promise<number> {
-  try {
-    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'agents_version'");
-    return rows[0]?.v ?? 0;
-  } catch {
-    return 0;
-  }
-}
-
 /** Mirrors search.ts `usable`: enabled, with a key (SearXNG: with an address). Kept here to avoid an import cycle. */
 async function webSearchReady(db: Db): Promise<boolean> {
   try {
@@ -127,8 +117,6 @@ export async function buildCatalogue(db: Db): Promise<{ version: number; generat
       webSearch: await webSearchReady(db),
       // Organization skills: desktops download /v1/skills again when this changes.
       skillsVersion: await orgSkillsVersion(db),
-      // Organization agents: desktops download /v1/agents again when this changes.
-      agentsVersion: await orgAgentsVersion(db),
     },
   };
 }
@@ -240,29 +228,5 @@ export async function deviceUsageRoute(ctx: Ctx): Promise<void> {
   sendJson(ctx.res, 200, {
     days,
     models: rows.map((r) => ({ modelId: r.model_id, modelName: r.model_name, requests: r.requests, ok: r.ok, failed: r.failed, promptTokens: r.prompt_tokens, completionTokens: r.completion_tokens })),
-  });
-}
-
-/**
- * GET /v1/models for API keys: the OpenAI-compatible model list an integration needs to pick a `model` id for
- * POST /v1/chat/completions. Device tokens are not accepted here (they use /v1/catalogue, which is richer).
- */
-export async function apiModelsRoute(ctx: Ctx): Promise<void> {
-  const key = await authenticateApiKey(ctx, 'models');
-  if (!key) fail(401, 'unauthenticated', 'an API key with the models scope is required (Authorization: Bearer dvk_...)');
-  const cat = await cachedCatalogue(ctx);
-  const created = Math.floor(Date.parse(cat.generatedAt) / 1000) || 0;
-  sendJson(ctx.res, 200, {
-    object: 'list',
-    data: cat.models.map((m) => ({
-      id: m.id,
-      object: 'model',
-      created,
-      owned_by: m.providerName,
-      display_name: m.displayName,
-      description: m.description,
-      context_window: m.contextWindow,
-      is_default: m.isDefault,
-    })),
   });
 }

@@ -21,9 +21,6 @@ import * as data from './modules/admin-data.ts';
 import * as health from './modules/health.ts';
 import * as clientConfig from './modules/client-config.ts';
 import * as releases from './modules/releases.ts';
-import * as apiKeys from './modules/api-keys.ts';
-import * as agents from './modules/agents.ts';
-import * as desktopConfig from './modules/desktop-config.ts';
 
 type Handler = (ctx: Ctx) => Promise<void>;
 interface Route {
@@ -45,11 +42,9 @@ const routes: Route[] = [
   R('GET', '/v1/models/:id', catalogue.modelRoute),
   R('GET', '/v1/usage', catalogue.deviceUsageRoute),
   R('POST', '/v1/chat/completions', chat.chatCompletions),
-  R('GET', '/v1/models', catalogue.apiModelsRoute),
   R('POST', '/v1/memory/sync', memory.syncMemories),
   R('POST', '/v1/search', search.search),
   R('GET', '/v1/skills', skills.desktopSkills),
-  R('GET', '/v1/agents', agents.desktopAgents),
   R('GET', '/v1/updates/check', releases.checkForUpdate),
   R('GET', '/v1/auth/config', accounts.authConfig),
   R('POST', '/v1/auth/session', accounts.createSession),
@@ -121,19 +116,6 @@ const routes: Route[] = [
   R('POST', '/admin/api/users/:id/:action', accounts.adminUserAction),
   R('GET', '/admin/api/settings', data.getSettings),
   R('PATCH', '/admin/api/settings', data.patchSettings),
-
-  R('GET', '/admin/api/api-keys', apiKeys.listApiKeys),
-  R('POST', '/admin/api/api-keys', apiKeys.createApiKey),
-  R('PATCH', '/admin/api/api-keys/:id', apiKeys.updateApiKey),
-  R('DELETE', '/admin/api/api-keys/:id', apiKeys.deleteApiKey),
-
-  R('GET', '/admin/api/agents', agents.listOrgAgents),
-  R('POST', '/admin/api/agents', agents.createOrgAgent),
-  R('PATCH', '/admin/api/agents/:id', agents.updateOrgAgent),
-  R('DELETE', '/admin/api/agents/:id', agents.deleteOrgAgent),
-
-  R('GET', '/admin/api/desktop-config', desktopConfig.getDesktopConfig),
-  R('PATCH', '/admin/api/desktop-config', desktopConfig.patchDesktopConfig),
 ];
 
 function match(route: Route, pathname: string): Record<string, string> | null {
