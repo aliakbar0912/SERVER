@@ -6,6 +6,7 @@ import { HttpError, fail, int, log, readJson, sendOpenAiError, UUID } from '../h
 import { REASONING_LEVELS, normalizeCapabilities } from './catalogue.ts';
 import { authenticateDevice } from './devices.ts';
 import { authenticateApiKey, apiKeyRateLimit } from './api-keys.ts';
+import { readDesktopConfigCached } from './desktop-config.ts';
 import { acquireSlot, releaseSlot } from '../persistent-limits.ts';
 import { providerApiKey } from './providers.ts';
 import { UpstreamError } from './upstream.ts';
@@ -201,6 +202,11 @@ export async function chatCompletions(ctx: Ctx): Promise<void> {
   const { res, deps } = ctx;
   let deviceId: string | null = null;
   try {
+    // While the owner has maintenance on, central AI is paused for devices and API keys alike;
+    // desktops also stop early on their side, so this is the backstop.
+    if ((await readDesktopConfigCached(deps.db)).maintenance) {
+      fail(503, 'maintenance', 'the service is briefly under maintenance; try again soon', { 'retry-after': '60' });
+    }
     // An owner API key (Bearer dvk_...) and a device token are distinguished by their prefix.
     const asKey = await authenticateApiKey(ctx, 'chat');
     let caller: Caller;

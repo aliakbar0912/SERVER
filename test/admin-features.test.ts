@@ -272,4 +272,29 @@ describe('desktop announcement', () => {
     const bad = await call('PATCH', '/admin/api/desktop-config', { session: true, body: { downloadUrl: 'http://www.example.test/download' } });
     assert.equal(bad.status, 400);
   });
+
+  test('while maintenance is on, chat answers 503 maintenance for keys and devices, and recovers when it ends', async (t) => {
+    if (!tdb) return t.skip(SKIP_NO_PG);
+    // Maintenance was switched on by an earlier test in this describe and is still on.
+    const cfg = await call('GET', '/v1/client-config');
+    assert.equal(cfg.json.features.maintenance, true);
+    const viaKey = await call('POST', '/v1/chat/completions', { key: keyChat, body: { model: modelId, messages: [{ role: 'user', content: 'during maintenance' }] } });
+    assert.equal(viaKey.status, 503, viaKey.text);
+    assert.equal(viaKey.json.error.code, 'maintenance');
+    assert.equal(viaKey.headers.get('retry-after'), '60');
+    const viaDevice = await call('POST', '/v1/chat/completions', { device: deviceToken, body: { model: modelId, messages: [{ role: 'user', content: 'during maintenance' }] } });
+    assert.equal(viaDevice.status, 503);
+    assert.equal(viaDevice.json.error.code, 'maintenance');
+    // Discovery endpoints stay up so desktops keep checking in and see the notice.
+    assert.equal((await call('GET', '/v1/client-config')).status, 200);
+    assert.equal((await call('GET', '/v1/catalogue', { device: deviceToken })).status, 200);
+
+    // The owner ends maintenance: chat works again (saving drops the gate cache, so no wait).
+    const off = await call('PATCH', '/admin/api/desktop-config', { session: true, body: { maintenance: false } });
+    assert.equal(off.status, 200, off.text);
+    assert.equal(off.json.maintenance, false);
+    const ok = await call('POST', '/v1/chat/completions', { key: keyChat, body: { model: modelId, messages: [{ role: 'user', content: 'after maintenance' }] } });
+    assert.equal(ok.status, 200, ok.text);
+    assert.equal(ok.json.choices[0].message.content, 'echo:after maintenance');
+  });
 });

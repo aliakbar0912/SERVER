@@ -38,6 +38,24 @@ export async function readDesktopConfig(db: Queryer): Promise<DesktopConfig> {
   }
 }
 
+// The per-request maintenance gate (chat, search) uses a very short cache so hot endpoints do not read the
+// settings table on every call. The admin site's own routes always read the live values.
+let configCache: { at: number; value: DesktopConfig } | null = null;
+const DESKTOP_CONFIG_CACHE_MS = 10_000;
+
+/** Tests call this so a saved announcement applies at once. */
+export function forgetDesktopConfigCache(): void {
+  configCache = null;
+}
+
+/** Cached readDesktopConfig for hot per-request checks; at most one settings read every 10 seconds. */
+export async function readDesktopConfigCached(db: Queryer): Promise<DesktopConfig> {
+  if (configCache && Date.now() - configCache.at < DESKTOP_CONFIG_CACHE_MS) return configCache.value;
+  const value = await readDesktopConfig(db);
+  configCache = { at: Date.now(), value };
+  return value;
+}
+
 function checkDownloadUrl(v: string): string {
   if (!v) return '';
   let u: URL;
@@ -98,5 +116,6 @@ export async function patchDesktopConfig(ctx: Ctx): Promise<void> {
       );
     }
   });
+  forgetDesktopConfigCache();
   sendJson(ctx.res, 200, await readDesktopConfig(ctx.deps.db));
 }
