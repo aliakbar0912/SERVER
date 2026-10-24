@@ -197,10 +197,24 @@ function applyCors(req: http.IncomingMessage, res: http.ServerResponse, deps: De
   res.setHeader('access-control-allow-credentials', 'true');
   if (req.method === 'OPTIONS') {
     res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE');
-    res.setHeader('access-control-allow-headers', 'content-type, x-csrf-token');
+    res.setHeader('access-control-allow-headers', 'content-type, x-csrf-token, x-api-key');
     res.setHeader('access-control-max-age', '600');
   }
   return true;
+}
+
+/** Paths reachable without the API key: health probes for the load balancer, and the OAuth callback the user's browser opens. */
+const KEYLESS_PATHS = new Set(['/healthz', '/readyz', '/v1/auth/oauth/callback']);
+
+/** True when the request carries the configured API access key (or none is configured). Constant-time comparison. */
+function hasApiKey(req: http.IncomingMessage, pathname: string, deps: Deps): boolean {
+  const expected = deps.config.apiAccessKey;
+  if (!expected || KEYLESS_PATHS.has(pathname)) return true;
+  const got = req.headers['x-api-key'];
+  if (typeof got !== 'string' || !got) return false;
+  const a = crypto.createHash('sha256').update(got).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
 }
 
 /** Deps as callers build them. `limits` defaults to the PostgreSQL store and `redis` to none. */
@@ -234,6 +248,7 @@ export function createHandler(input: DepsInput): http.RequestListener {
         }
         return;
       }
+      if (!hasApiKey(req, url.pathname, deps)) throw new HttpError(401, 'invalid_api_key', 'a valid API key is required');
       let matched: { route: Route; params: Record<string, string> } | null = null;
       let pathExists = false;
       for (const route of routes) {

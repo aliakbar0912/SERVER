@@ -14,6 +14,8 @@ export interface Config {
   poolSize: number;
   /** Exact origin of the admin website, for CORS with credentials. Null means no browser origin is allowed. */
   adminOrigin: string | null;
+  /** Shared secret every client (admin panel, desktop app) must send in the x-api-key header (API_ACCESS_KEY). null = off. */
+  apiAccessKey: string | null;
   cookieSecure: boolean;
   trustProxy: boolean;
   keyring: Keyring;
@@ -234,6 +236,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const ignoredSettings: string[] = [];
   const adminOrigin = origin(env.ADMIN_ORIGIN, 'ADMIN_ORIGIN', production, ignoredSettings);
   if (production && !adminOrigin) throw new Error('ADMIN_ORIGIN is required in production (the https address of the admin website)');
+  const apiAccessKey = (env.API_ACCESS_KEY ?? '').trim() || null;
+  if (production && !apiAccessKey) throw new Error('API_ACCESS_KEY is required in production (the secret key the admin panel and desktop app must send)');
+  if (apiAccessKey && apiAccessKey.length < 24) throw new Error('API_ACCESS_KEY must be at least 24 characters');
   const statusMessage = (env.DEVORA_STATUS_MESSAGE ?? '').trim();
   if (statusMessage.length > 200) throw new Error('DEVORA_STATUS_MESSAGE may be at most 200 characters');
   const headersTimeoutMs = int(env.HEADERS_TIMEOUT_MS, 30_000, 1_000, 120_000, 'HEADERS_TIMEOUT_MS');
@@ -246,6 +251,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     database: parseDatabase(env, production),
     poolSize: int(env.DATABASE_POOL_SIZE, 10, 1, 50, 'DATABASE_POOL_SIZE'),
     adminOrigin,
+    apiAccessKey,
     cookieSecure,
     trustProxy: bool(env.TRUST_PROXY, false),
     keyring,
