@@ -47,10 +47,10 @@ var PocketBase = class {
     } catch {
       throw new PbError(0, "the account service cannot be reached");
     }
-    const text = await res.text().catch(() => "");
+    const text2 = await res.text().catch(() => "");
     let body = null;
     try {
-      body = text ? JSON.parse(text) : null;
+      body = text2 ? JSON.parse(text2) : null;
     } catch {
       body = null;
     }
@@ -288,11 +288,11 @@ async function readJson(req, limit2) {
     }
     chunks.push(chunk);
   }
-  const text = Buffer.concat(chunks).toString("utf8");
-  if (!text.trim()) return {};
+  const text2 = Buffer.concat(chunks).toString("utf8");
+  if (!text2.trim()) return {};
   let value;
   try {
-    value = JSON.parse(text);
+    value = JSON.parse(text2);
   } catch {
     fail(400, "invalid_json", "the request body is not valid JSON");
   }
@@ -1620,17 +1620,17 @@ function loadMigrations(dir = defaultMigrationsDir()) {
     const version2 = Number(m[1]);
     if (seen.has(version2)) throw new Error(`duplicate migration version ${version2}`);
     seen.add(version2);
-    const text = fs.readFileSync(path.join(dir, file), "utf8");
-    const upIdx = text.indexOf("-- migrate:up");
-    const downIdx = text.indexOf("-- migrate:down");
+    const text2 = fs.readFileSync(path.join(dir, file), "utf8");
+    const upIdx = text2.indexOf("-- migrate:up");
+    const downIdx = text2.indexOf("-- migrate:down");
     if (upIdx < 0 || downIdx < 0 || downIdx < upIdx) throw new Error(`${file} must contain "-- migrate:up" followed by "-- migrate:down"`);
     return {
       version: version2,
       name: m[2],
       file,
-      checksum: crypto4.createHash("sha256").update(text).digest("hex"),
-      up: text.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
-      down: text.slice(downIdx + "-- migrate:down".length).trim()
+      checksum: crypto4.createHash("sha256").update(text2).digest("hex"),
+      up: text2.slice(upIdx + "-- migrate:up".length, downIdx).trim(),
+      down: text2.slice(downIdx + "-- migrate:down".length).trim()
     };
   });
 }
@@ -1797,8 +1797,8 @@ var RedisLimitStore = class {
   }
   async hit(key, limit2, windowSeconds) {
     const r = await this.redis.command("EVAL", HIT_SCRIPT, 1, this.k("rl", key), windowSeconds * 1e3);
-    const [count, ttlMs] = r;
-    if (count > limit2) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlMs / 1e3)) };
+    const [count2, ttlMs] = r;
+    if (count2 > limit2) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil(ttlMs / 1e3)) };
     return { allowed: true, retryAfterSeconds: 0 };
   }
   async clear(key) {
@@ -1882,7 +1882,7 @@ function parseRedisUrl(raw, env = {}) {
   if (!Number.isInteger(db) || db < 0 || db > 15) throw new Error("REDIS_URL database number must be 0 to 15");
   const port = u.port ? Number(u.port) : 6379;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("REDIS_URL port is invalid");
-  const num = (v, def, name) => {
+  const num2 = (v, def, name) => {
     if (v === void 0 || v === "") return def;
     const n = Number(v);
     if (!Number.isInteger(n) || n < 100 || n > 6e4) throw new Error(`${name} must be an integer from 100 to 60000`);
@@ -1895,8 +1895,8 @@ function parseRedisUrl(raw, env = {}) {
     password: u.password ? decodeURIComponent(u.password) : null,
     db,
     tls: u.protocol === "rediss:",
-    connectTimeoutMs: num(env.REDIS_CONNECT_TIMEOUT_MS, 5e3, "REDIS_CONNECT_TIMEOUT_MS"),
-    commandTimeoutMs: num(env.REDIS_COMMAND_TIMEOUT_MS, 2e3, "REDIS_COMMAND_TIMEOUT_MS")
+    connectTimeoutMs: num2(env.REDIS_CONNECT_TIMEOUT_MS, 5e3, "REDIS_CONNECT_TIMEOUT_MS"),
+    commandTimeoutMs: num2(env.REDIS_COMMAND_TIMEOUT_MS, 2e3, "REDIS_COMMAND_TIMEOUT_MS")
   };
   if (env.REDIS_TLS_CA_FILE) {
     if (!cfg.tls) throw new Error("REDIS_TLS_CA_FILE needs a rediss:// URL");
@@ -1927,22 +1927,22 @@ var ReplyParser = class {
     const type = String.fromCharCode(this.buf[at]);
     const l = this.line(at + 1);
     if (!l) return null;
-    const [text, after] = l;
+    const [text2, after] = l;
     switch (type) {
       case "+":
-        return [text, after];
+        return [text2, after];
       case "-":
-        return [new RedisReplyError(text), after];
+        return [new RedisReplyError(text2), after];
       case ":":
-        return [Number(text), after];
+        return [Number(text2), after];
       case "$": {
-        const len = Number(text);
+        const len = Number(text2);
         if (len < 0) return [null, after];
         if (this.buf.length < after + len + 2) return null;
         return [this.buf.toString("utf8", after, after + len), after + len + 2];
       }
       case "*": {
-        const n = Number(text);
+        const n = Number(text2);
         if (n < 0) return [null, after];
         const out = [];
         let pos = after;
@@ -2312,11 +2312,11 @@ function openJson(deps, v, id) {
   return openSecret(deps.config.keyring, { keyVersion: v.k, iv: Buffer.from(v.iv, "base64"), ciphertext: Buffer.from(v.c, "base64"), tag: Buffer.from(v.t, "base64") }, `auth_handoff:${id}`);
 }
 var PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-function page(ctx, status, title, text) {
+function page(ctx, status, title, text2) {
   const esc = (s) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#000;color:#fff;font:15px/1.5 system-ui,sans-serif}main{max-width:420px;padding:24px;text-align:center}h1{font-size:20px;margin:0 0 8px}p{color:#a1a1aa;margin:0}</style>
-<main><h1>${esc(title)}</h1><p>${esc(text)}</p></main>`;
+<main><h1>${esc(title)}</h1><p>${esc(text2)}</p></main>`;
   ctx.res.writeHead(status, { "content-type": "text/html; charset=utf-8", "content-security-policy": PAGE_CSP, "cache-control": "no-store" });
   ctx.res.end(html);
 }
@@ -2790,7 +2790,7 @@ function httpUrl(u) {
     return null;
   }
 }
-function normalize(items, count) {
+function normalize(items, count2) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
   for (const it of items) {
@@ -2798,7 +2798,7 @@ function normalize(items, count) {
     if (!url || seen.has(url)) continue;
     seen.add(url);
     out.push({ title: clean(it.title, 300) || url, url, snippet: clean(it.snippet, 1e3), published: it.published ? clean(it.published, 40) : null });
-    if (out.length >= count) break;
+    if (out.length >= count2) break;
   }
   return out;
 }
@@ -2819,46 +2819,46 @@ async function call(f, url, init) {
     throw new SearchError("bad_response", "the search provider sent an unexpected answer");
   }
 }
-async function runSearch(f, p, key, query, count) {
+async function runSearch(f, p, key, query, count2) {
   const json = (body) => JSON.stringify(body);
   switch (p.kind) {
     case "tavily": {
       const r = await call(f, "https://api.tavily.com/search", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-        body: json({ query, max_results: count, search_depth: "basic", include_answer: false })
+        body: json({ query, max_results: count2, search_depth: "basic", include_answer: false })
       });
-      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.content, published: x.published_date })), count);
+      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.content, published: x.published_date })), count2);
     }
     case "brave": {
-      const q = new URLSearchParams({ q: query, count: String(count) });
+      const q = new URLSearchParams({ q: query, count: String(count2) });
       const r = await call(f, `https://api.search.brave.com/res/v1/web/search?${q}`, { headers: { accept: "application/json", "x-subscription-token": key ?? "" } });
-      return normalize((r?.web?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.description, published: x.page_age ?? x.age })), count);
+      return normalize((r?.web?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.description, published: x.page_age ?? x.age })), count2);
     }
     case "serper": {
-      const r = await call(f, "https://google.serper.dev/search", { method: "POST", headers: { "content-type": "application/json", "x-api-key": key ?? "" }, body: json({ q: query, num: count }) });
-      return normalize((r?.organic ?? []).map((x) => ({ title: x.title, url: x.link, snippet: x.snippet, published: x.date })), count);
+      const r = await call(f, "https://google.serper.dev/search", { method: "POST", headers: { "content-type": "application/json", "x-api-key": key ?? "" }, body: json({ q: query, num: count2 }) });
+      return normalize((r?.organic ?? []).map((x) => ({ title: x.title, url: x.link, snippet: x.snippet, published: x.date })), count2);
     }
     case "exa": {
       const r = await call(f, "https://api.exa.ai/search", {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": key ?? "" },
-        body: json({ query, numResults: count, type: "auto", contents: { text: { maxCharacters: 600 } } })
+        body: json({ query, numResults: count2, type: "auto", contents: { text: { maxCharacters: 600 } } })
       });
-      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.text ?? (Array.isArray(x.highlights) ? x.highlights.join(" ") : ""), published: x.publishedDate })), count);
+      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.text ?? (Array.isArray(x.highlights) ? x.highlights.join(" ") : ""), published: x.publishedDate })), count2);
     }
     case "google_cse": {
       const cx = String(p.options?.cx ?? "");
       if (!cx) throw new SearchError("config", "set the search engine id (cx) for Google Programmable Search");
-      const q = new URLSearchParams({ key: key ?? "", cx, q: query, num: String(Math.min(count, 10)) });
+      const q = new URLSearchParams({ key: key ?? "", cx, q: query, num: String(Math.min(count2, 10)) });
       const r = await call(f, `https://www.googleapis.com/customsearch/v1?${q}`, { headers: { accept: "application/json" } });
-      return normalize((r?.items ?? []).map((x) => ({ title: x.title, url: x.link, snippet: x.snippet })), count);
+      return normalize((r?.items ?? []).map((x) => ({ title: x.title, url: x.link, snippet: x.snippet })), count2);
     }
     case "searxng": {
       if (!p.base_url) throw new SearchError("config", "set the SearXNG address");
       const q = new URLSearchParams({ q: query, format: "json" });
       const r = await call(f, `${p.base_url}/search?${q}`, { headers: { accept: "application/json", ...key ? { authorization: `Bearer ${key}` } : {} } });
-      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.content, published: x.publishedDate })), count);
+      return normalize((r?.results ?? []).map((x) => ({ title: x.title, url: x.url, snippet: x.content, published: x.publishedDate })), count2);
     }
   }
 }
@@ -3071,11 +3071,11 @@ async function search(ctx) {
   const body = requireObject(await readJson(ctx.req, 4 * 1024));
   rejectUnknown(body, ["query", "count"]);
   const query = str(body, "query", { min: 1, max: 400 });
-  const count = int(body, "count", { min: 1, max: 10, optional: true }) ?? 5;
+  const count2 = int(body, "count", { min: 1, max: 10, optional: true }) ?? 5;
   const { rows } = await db.query(`${SELECT} WHERE p.enabled ORDER BY p.is_default DESC, p.priority, p.created_at`);
   const providers = rows.filter(usable);
   if (!providers.length) fail(503, "search_not_configured", "web search is not set up on this server yet");
-  const cacheKey = `search:${sha256Hex(`${count}
+  const cacheKey = `search:${sha256Hex(`${count2}
 ${query.toLowerCase()}`)}`;
   const cached = await limits.cacheGet(cacheKey).catch(() => null);
   if (cached) {
@@ -3088,7 +3088,7 @@ ${query.toLowerCase()}`)}`;
     const started = Date.now();
     try {
       const key = await providerKey(ctx.deps, p.id);
-      const results = await runSearch(ctx.deps.fetch, p, key, query, count);
+      const results = await runSearch(ctx.deps.fetch, p, key, query, count2);
       await db.query("INSERT INTO search_logs (device_id, provider_id, provider_name, status, results, latency_ms) VALUES ($1, $2, $3, 'ok', $4, $5)", [device.deviceId, p.id, p.name, results.length, Date.now() - started]);
       await limits.cacheSet(cacheKey, { provider: p.name, results }, CACHE_SECONDS).catch(() => void 0);
       sendJson(ctx.res, 200, { provider: p.name, cached: false, results });
@@ -3462,14 +3462,14 @@ function parseChatRequest(body, maxOutputTokens) {
     else if (body.tool_choice?.type === "function" && typeof body.tool_choice.function?.name === "string") toolChoice = { type: "function", function: { name: body.tool_choice.function.name } };
     else throw oa("invalid_request", "tool_choice is not valid");
   }
-  const num = (k, min, max) => {
+  const num2 = (k, min, max) => {
     const v = body[k];
     if (v === void 0 || v === null) return void 0;
     if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) throw oa("invalid_request", `${k} must be a number from ${min} to ${max}`);
     return v;
   };
-  const temperature = num("temperature", 0, 2);
-  const topP = num("top_p", 0, 1);
+  const temperature = num2("temperature", 0, 2);
+  const topP = num2("top_p", 0, 1);
   let maxTokens;
   if (body.max_tokens !== void 0 && body.max_tokens !== null) {
     maxTokens = int({ max_tokens: body.max_tokens }, "max_tokens", { min: 1, max: maxOutputTokens });
@@ -3678,10 +3678,10 @@ async function attempt(ctx, caller, clientRequestId, parsed, m, route) {
   try {
     const upstream = await callUpstream(deps, url, upstreamBody, key, m.timeout_ms, m.max_retries > 0 ? 1 : 0, parsed.stream, controller);
     if (!parsed.stream) {
-      const text = await readLimited(upstream, UPSTREAM_BODY_LIMIT);
+      const text2 = await readLimited(upstream, UPSTREAM_BODY_LIMIT);
       let json;
       try {
-        json = JSON.parse(text);
+        json = JSON.parse(text2);
       } catch {
         throw new UpstreamError("bad_response", "malformed response");
       }
@@ -4849,6 +4849,196 @@ async function desktopAgents(ctx) {
   );
 }
 
+// src/modules/brain.ts
+var BEATS_PER_MINUTE = 20;
+var BODY_LIMIT3 = 32 * 1024;
+var ONLINE_SECONDS = 90;
+var EVENT_RETENTION_DAYS = 14;
+var EVENT_KINDS = /* @__PURE__ */ new Set(["task_started", "task_completed", "task_failed", "task_cancelled"]);
+var MODES = /* @__PURE__ */ new Set(["ask", "build", "plan"]);
+function text(v, max) {
+  return typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max) : "";
+}
+function count(v, max = 1e7) {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.min(Math.floor(v), max) : 0;
+}
+function obj(v) {
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+function time(v, now) {
+  const t = count(v, 8999999999999);
+  return t > now - 7 * 864e5 && t <= now + 3e5 ? t : now;
+}
+function parseBeat(body, now = Date.now()) {
+  const tasks = (Array.isArray(body.tasks) ? body.tasks : []).slice(0, 10).map((raw) => {
+    const t = obj(raw);
+    return {
+      title: text(t.title, 120),
+      mode: MODES.has(String(t.mode)) ? String(t.mode) : "",
+      status: text(t.status, 30),
+      iterations: count(t.iterations, 1e5),
+      toolCalls: count(t.toolCalls, 1e5),
+      startedAt: time(t.startedAt, now)
+    };
+  });
+  const s = obj(body.lastStep);
+  const lastStep = s.kind ? { kind: text(s.kind, 20), name: text(s.name, 80), status: text(s.status, 20), at: time(s.at, now) } : null;
+  const c = obj(body.counters);
+  const m = obj(body.memory);
+  const beat = {
+    state: body.state === "running" || tasks.length > 0 ? "running" : "idle",
+    appVersion: text(body.appVersion, 40),
+    tasks,
+    lastStep,
+    counters: {
+      tasksStarted: count(c.tasksStarted),
+      tasksCompleted: count(c.tasksCompleted),
+      tasksFailed: count(c.tasksFailed),
+      toolCalls: count(c.toolCalls),
+      uptimeSeconds: count(c.uptimeSeconds)
+    },
+    memory: {
+      total: count(m.total),
+      fact: count(m.fact),
+      preference: count(m.preference),
+      lesson: count(m.lesson),
+      decision: count(m.decision),
+      pinned: count(m.pinned),
+      verified: count(m.verified)
+    }
+  };
+  const events = (Array.isArray(body.events) ? body.events : []).slice(0, 30).map((raw) => {
+    const e = obj(raw);
+    return { kind: String(e.kind), title: text(e.title, 120), at: time(e.at, now) };
+  }).filter((e) => EVENT_KINDS.has(e.kind));
+  return { beat, events };
+}
+async function brainBeat(ctx) {
+  const auth = await authenticateDevice(ctx);
+  const limit2 = await ctx.deps.limits.hit(`brain:beat:${auth.deviceId}`, BEATS_PER_MINUTE, 60);
+  if (!limit2.allowed) fail(429, "rate_limited", "too many heartbeats; slow down", { "retry-after": String(limit2.retryAfterSeconds) });
+  const body = requireObject(await readJson(ctx.req, BODY_LIMIT3));
+  const { beat, events } = parseBeat(body);
+  const db = ctx.deps.db;
+  const { rows } = await db.query(
+    `WITH prev AS (SELECT beat_at FROM devices WHERE id = $1)
+     UPDATE devices SET beat_at = now(), beat_state = $2, beat = $3::jsonb WHERE id = $1
+     RETURNING (SELECT beat_at FROM prev) AS prev_beat_at`,
+    [auth.deviceId, beat.state, JSON.stringify(beat)]
+  );
+  const prev = rows[0]?.prev_beat_at ? new Date(rows[0].prev_beat_at).getTime() : 0;
+  if (!prev || Date.now() - prev > ONLINE_SECONDS * 1e3) {
+    await db.query(`INSERT INTO brain_events (device_id, kind, title) VALUES ($1, 'online', '')`, [auth.deviceId]);
+  }
+  for (const e of events) {
+    await db.query("INSERT INTO brain_events (device_id, kind, title, created_at) VALUES ($1, $2, $3, to_timestamp($4 / 1000.0))", [auth.deviceId, e.kind, e.title, e.at]);
+  }
+  if (Math.random() < 0.02) {
+    await db.query("DELETE FROM brain_events WHERE created_at < now() - make_interval(days => $1)", [EVENT_RETENTION_DAYS]);
+  }
+  sendJson(ctx.res, 200, { ok: true, intervalSeconds: 30 });
+}
+var num = (v) => Number(v) || 0;
+async function adminBrain(ctx) {
+  await guardOwner(ctx, { write: false });
+  const db = ctx.deps.db;
+  const online = `coalesce(d.beat_at > now() - make_interval(secs => ${ONLINE_SECONDS}), false)`;
+  const [devices, memory, kinds, sources, growth, events, top] = await Promise.all([
+    db.query(
+      `SELECT d.id, d.name, d.app_version, d.last_seen_at, d.beat_at, d.beat_state, d.beat, (${online}) AS online,
+              coalesce(m.active, 0) AS mem_active, coalesce(m.lessons, 0) AS mem_lessons, coalesce(m.verified, 0) AS mem_verified,
+              m.last_update AS mem_last_update
+         FROM devices d
+         LEFT JOIN (
+           SELECT device_id, count(*) FILTER (WHERE NOT deleted) AS active,
+                  count(*) FILTER (WHERE NOT deleted AND kind = 'lesson') AS lessons,
+                  count(*) FILTER (WHERE NOT deleted AND verified) AS verified,
+                  max(updated_at) AS last_update
+             FROM memory_entries GROUP BY device_id
+         ) m ON m.device_id = d.id
+        WHERE d.status = 'active'
+        ORDER BY (${online}) DESC, d.beat_at DESC NULLS LAST, d.last_seen_at DESC NULLS LAST
+        LIMIT 200`
+    ),
+    db.query(
+      `SELECT count(*) FILTER (WHERE NOT deleted) AS active,
+              count(*) FILTER (WHERE NOT deleted AND verified) AS verified,
+              count(*) FILTER (WHERE NOT deleted AND pinned) AS pinned,
+              coalesce(avg(confidence) FILTER (WHERE NOT deleted), 0) AS avg_confidence,
+              coalesce(sum(hits) FILTER (WHERE NOT deleted), 0) AS hits,
+              count(*) FILTER (WHERE NOT deleted AND created_at > now() - interval '1 day') AS added_today,
+              count(*) FILTER (WHERE deleted AND updated_at > now() - interval '1 day') AS forgotten_today
+         FROM memory_entries`
+    ),
+    db.query(`SELECT kind, count(*) AS n FROM memory_entries WHERE NOT deleted GROUP BY kind`),
+    db.query(`SELECT source, count(*) AS n FROM memory_entries WHERE NOT deleted GROUP BY source`),
+    db.query(
+      `SELECT to_char(day, 'YYYY-MM-DD') AS day,
+              (SELECT count(*) FROM memory_entries m WHERE m.created_at >= day AND m.created_at < day + interval '1 day') AS added,
+              (SELECT count(*) FROM brain_events e WHERE e.kind = 'task_completed' AND e.created_at >= day AND e.created_at < day + interval '1 day') AS tasks
+         FROM generate_series(date_trunc('day', now()) - interval '13 days', date_trunc('day', now()), interval '1 day') AS day
+        ORDER BY day`
+    ),
+    db.query(
+      `SELECT e.id, e.kind, e.title, e.created_at, e.device_id, d.name AS device_name
+         FROM brain_events e LEFT JOIN devices d ON d.id = e.device_id
+        ORDER BY e.created_at DESC LIMIT 60`
+    ),
+    db.query(
+      `SELECT m.id, m.kind, m.content, m.hits, m.confidence, m.verified, d.name AS device_name
+         FROM memory_entries m LEFT JOIN devices d ON d.id = m.device_id
+        WHERE NOT m.deleted ORDER BY m.hits DESC, m.updated_at DESC LIMIT 8`
+    )
+  ]);
+  const deviceRows = devices.rows.map((r) => {
+    const beat = obj(r.beat);
+    const isOnline = r.online === true;
+    return {
+      id: r.id,
+      name: r.name,
+      appVersion: r.app_version ?? beat.appVersion ?? null,
+      lastSeenAt: r.last_seen_at,
+      beatAt: r.beat_at,
+      online: isOnline,
+      working: isOnline && r.beat_state === "running",
+      tasks: isOnline && Array.isArray(beat.tasks) ? beat.tasks : [],
+      lastStep: beat.lastStep ?? null,
+      counters: beat.counters ?? null,
+      localMemory: beat.memory ?? null,
+      memory: { active: num(r.mem_active), lessons: num(r.mem_lessons), verified: num(r.mem_verified), lastUpdate: r.mem_last_update ?? null }
+    };
+  });
+  const m = memory.rows[0] ?? {};
+  const byKind = { fact: 0, preference: 0, lesson: 0, decision: 0 };
+  for (const r of kinds.rows) byKind[String(r.kind)] = num(r.n);
+  const bySource = { user: 0, agent: 0, system: 0 };
+  for (const r of sources.rows) bySource[String(r.source)] = num(r.n);
+  sendJson(ctx.res, 200, {
+    onlineSeconds: ONLINE_SECONDS,
+    summary: {
+      devices: deviceRows.length,
+      online: deviceRows.filter((d) => d.online).length,
+      working: deviceRows.filter((d) => d.working).length,
+      activeTasks: deviceRows.reduce((n, d) => n + d.tasks.length, 0)
+    },
+    memory: {
+      active: num(m.active),
+      verified: num(m.verified),
+      pinned: num(m.pinned),
+      avgConfidence: Math.round(num(m.avg_confidence) * 100) / 100,
+      hits: num(m.hits),
+      addedToday: num(m.added_today),
+      forgottenToday: num(m.forgotten_today),
+      byKind,
+      bySource
+    },
+    growth: growth.rows.map((r) => ({ day: r.day, added: num(r.added), tasks: num(r.tasks) })),
+    devices: deviceRows,
+    events: events.rows.map((r) => ({ id: String(r.id), kind: r.kind, title: r.title, at: r.created_at, deviceId: r.device_id, deviceName: r.device_name ?? null })),
+    topMemories: top.rows.map((r) => ({ id: r.id, kind: r.kind, content: r.content, hits: num(r.hits), confidence: Number(r.confidence), verified: r.verified === true, deviceName: r.device_name ?? null }))
+  });
+}
+
 // src/app.ts
 var R = (method, path2, handler) => ({ method, parts: path2.split("/").filter(Boolean), handler });
 var routes = [
@@ -4864,6 +5054,7 @@ var routes = [
   R("POST", "/v1/chat/completions", chatCompletions),
   R("GET", "/v1/models", apiModelsRoute),
   R("POST", "/v1/memory/sync", syncMemories),
+  R("POST", "/v1/brain/beat", brainBeat),
   R("POST", "/v1/search", search),
   R("GET", "/v1/skills", desktopSkills),
   R("GET", "/v1/agents", desktopAgents),
@@ -4906,6 +5097,7 @@ var routes = [
   R("PUT", "/admin/api/devices/:id/models", putDeviceModels),
   R("GET", "/admin/api/usage", usage),
   R("GET", "/admin/api/logs", logs),
+  R("GET", "/admin/api/brain", adminBrain),
   R("GET", "/admin/api/memory", adminListMemory),
   R("DELETE", "/admin/api/memory", adminClearAllMemory),
   R("DELETE", "/admin/api/memory/:id", adminClearDeviceMemory),
@@ -5000,10 +5192,20 @@ function applyCors(req, res, deps) {
   res.setHeader("access-control-allow-credentials", "true");
   if (req.method === "OPTIONS") {
     res.setHeader("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE");
-    res.setHeader("access-control-allow-headers", "content-type, x-csrf-token");
+    res.setHeader("access-control-allow-headers", "content-type, x-csrf-token, x-api-key");
     res.setHeader("access-control-max-age", "600");
   }
   return true;
+}
+var KEYLESS_PATHS = /* @__PURE__ */ new Set(["/healthz", "/readyz", "/v1/auth/oauth/callback"]);
+function hasApiKey(req, pathname, deps) {
+  const expected = deps.config.apiAccessKey;
+  if (!expected || KEYLESS_PATHS.has(pathname)) return true;
+  const got = req.headers["x-api-key"];
+  if (typeof got !== "string" || !got) return false;
+  const a = crypto8.createHash("sha256").update(got).digest();
+  const b = crypto8.createHash("sha256").update(expected).digest();
+  return crypto8.timingSafeEqual(a, b);
 }
 function createHandler(input) {
   const deps = {
@@ -5032,6 +5234,7 @@ function createHandler(input) {
         }
         return;
       }
+      if (!hasApiKey(req, url.pathname, deps)) throw new HttpError(401, "invalid_api_key", "a valid API key is required");
       let matched = null;
       let pathExists = false;
       for (const route of routes) {
@@ -5232,6 +5435,9 @@ function loadConfig(env = process.env) {
   const ignoredSettings = [];
   const adminOrigin = origin(env.ADMIN_ORIGIN, "ADMIN_ORIGIN", production, ignoredSettings);
   if (production && !adminOrigin) throw new Error("ADMIN_ORIGIN is required in production (the https address of the admin website)");
+  const apiAccessKey = (env.API_ACCESS_KEY ?? "").trim() || null;
+  if (production && !apiAccessKey) throw new Error("API_ACCESS_KEY is required in production (the secret key the admin panel and desktop app must send)");
+  if (apiAccessKey && apiAccessKey.length < 24) throw new Error("API_ACCESS_KEY must be at least 24 characters");
   const statusMessage = (env.DEVORA_STATUS_MESSAGE ?? "").trim();
   if (statusMessage.length > 200) throw new Error("DEVORA_STATUS_MESSAGE may be at most 200 characters");
   const headersTimeoutMs = int2(env.HEADERS_TIMEOUT_MS, 3e4, 1e3, 12e4, "HEADERS_TIMEOUT_MS");
@@ -5244,6 +5450,7 @@ function loadConfig(env = process.env) {
     database: parseDatabase(env, production),
     poolSize: int2(env.DATABASE_POOL_SIZE, 10, 1, 50, "DATABASE_POOL_SIZE"),
     adminOrigin,
+    apiAccessKey,
     cookieSecure,
     trustProxy: bool2(env.TRUST_PROXY, false),
     keyring,
@@ -5307,32 +5514,32 @@ var PgError = class extends Error {
   }
 };
 var OID = { bool: 16, bytea: 17, int8: 20, int2: 21, int4: 23, json: 114, float4: 700, float8: 701, numeric: 1700, timestamp: 1114, timestamptz: 1184, jsonb: 3802 };
-function decodeValue(oid, text) {
-  if (text === null) return null;
+function decodeValue(oid, text2) {
+  if (text2 === null) return null;
   switch (oid) {
     case OID.bool:
-      return text === "t";
+      return text2 === "t";
     case OID.int2:
     case OID.int4:
     case OID.int8:
     case OID.float4:
     case OID.float8:
     case OID.numeric:
-      return Number(text);
+      return Number(text2);
     case OID.json:
     case OID.jsonb:
-      return JSON.parse(text);
+      return JSON.parse(text2);
     case OID.bytea:
-      return text.startsWith("\\x") ? Buffer.from(text.slice(2), "hex") : Buffer.from(text);
+      return text2.startsWith("\\x") ? Buffer.from(text2.slice(2), "hex") : Buffer.from(text2);
     case OID.timestamp:
     case OID.timestamptz:
-      return parseTimestamp(text);
+      return parseTimestamp(text2);
     default:
-      return text;
+      return text2;
   }
 }
-function parseTimestamp(text) {
-  let t = text.replace(" ", "T");
+function parseTimestamp(text2) {
+  let t = text2.replace(" ", "T");
   t = t.replace(/(\.\d{3})\d+/, "$1");
   if (/[+-]\d{2}$/.test(t)) t += ":00";
   else if (!/(Z|[+-]\d{2}:\d{2})$/.test(t)) t += "Z";
@@ -5589,10 +5796,10 @@ var PgConnection = class _PgConnection {
           for (let i = 0; i < n; i++) {
             const len = m.body.readInt32BE(p);
             p += 4;
-            const text = len === -1 ? null : m.body.toString("utf8", p, p + len);
+            const text2 = len === -1 ? null : m.body.toString("utf8", p, p + len);
             if (len !== -1) p += len;
             const col = cols[i];
-            row[col.name] = decodeValue(col.oid, text);
+            row[col.name] = decodeValue(col.oid, text2);
           }
           rows.push(row);
           break;

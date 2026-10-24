@@ -24,6 +24,7 @@ import * as releases from './modules/releases.ts';
 import * as apiKeys from './modules/api-keys.ts';
 import * as agents from './modules/agents.ts';
 import * as desktopConfig from './modules/desktop-config.ts';
+import * as brain from './modules/brain.ts';
 
 type Handler = (ctx: Ctx) => Promise<void>;
 interface Route {
@@ -47,6 +48,7 @@ const routes: Route[] = [
   R('POST', '/v1/chat/completions', chat.chatCompletions),
   R('GET', '/v1/models', catalogue.apiModelsRoute),
   R('POST', '/v1/memory/sync', memory.syncMemories),
+  R('POST', '/v1/brain/beat', brain.brainBeat),
   R('POST', '/v1/search', search.search),
   R('GET', '/v1/skills', skills.desktopSkills),
   R('GET', '/v1/agents', agents.desktopAgents),
@@ -95,6 +97,7 @@ const routes: Route[] = [
 
   R('GET', '/admin/api/usage', data.usage),
   R('GET', '/admin/api/logs', data.logs),
+  R('GET', '/admin/api/brain', brain.adminBrain),
   R('GET', '/admin/api/memory', memory.adminListMemory),
   R('DELETE', '/admin/api/memory', memory.adminClearAllMemory),
   R('DELETE', '/admin/api/memory/:id', memory.adminClearDeviceMemory),
