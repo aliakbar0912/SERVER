@@ -1,10 +1,11 @@
 // Central chat routing: POST /v1/chat/completions for authenticated desktop devices.
 // The client selects a catalogue model by its internal id. The server decides the upstream model, base URL and key.
 import type { ServerResponse } from 'node:http';
-import type { Ctx, Deps, DeviceAuth } from '../context.ts';
+import type { Ctx, Deps } from '../context.ts';
 import { HttpError, fail, int, log, readJson, sendOpenAiError, UUID } from '../http/util.ts';
 import { REASONING_LEVELS, normalizeCapabilities } from './catalogue.ts';
 import { authenticateDevice } from './devices.ts';
+import { authenticateApiKey, apiKeyRateLimit } from './api-keys.ts';
 import { acquireSlot, releaseSlot } from '../persistent-limits.ts';
 import { providerApiKey } from './providers.ts';
 import { UpstreamError } from './upstream.ts';
@@ -175,6 +176,22 @@ export function idempotencyKey(req: { headers: Record<string, string | string[] 
   return raw;
 }
 
+/**
+ * Who made the request: a registered desktop device or an owner-created API key (Bearer dvk_...).
+ * Both get rate limits, concurrency slots and usage logs; only the owner column differs.
+ */
+export type Caller =
+  | { kind: 'device'; deviceId: string; modelAccess: 'all' | 'selected' }
+  | { kind: 'key'; keyId: string; keyName: string };
+
+function callerDevice(c: Caller): string | null {
+  return c.kind === 'device' ? c.deviceId : null;
+}
+
+function callerKey(c: Caller): string | null {
+  return c.kind === 'key' ? c.keyId : null;
+}
+
 async function policyNumber(deps: Deps, key: string, fallback: number): Promise<number> {
   const { rows } = await deps.db.query('SELECT (value)::text::int AS v FROM settings WHERE key = $1', [key]);
   return rows[0]?.v ?? fallback;
@@ -184,16 +201,26 @@ export async function chatCompletions(ctx: Ctx): Promise<void> {
   const { res, deps } = ctx;
   let deviceId: string | null = null;
   try {
-    const device = await authenticateDevice(ctx);
-    deviceId = device.deviceId;
+    // An owner API key (Bearer dvk_...) and a device token are distinguished by their prefix.
+    const asKey = await authenticateApiKey(ctx, 'chat');
+    let caller: Caller;
+    if (asKey) {
+      caller = { kind: 'key', keyId: asKey.keyId, keyName: asKey.name };
+    } else {
+      const device = await authenticateDevice(ctx);
+      deviceId = device.deviceId;
+      caller = { kind: 'device', deviceId: device.deviceId, modelAccess: device.modelAccess };
+    }
     const clientRequestId = idempotencyKey(ctx.req);
     // Rate counts and concurrency leases are stored in PostgreSQL, so they hold across restarts and across replicas.
-    const perMinute = await policyNumber(deps, 'rate_limit_per_minute', 60);
-    const rl = await deps.limits.hit(`chat:dev:${device.deviceId}`, perMinute, 60);
-    if (!rl.allowed) fail(429, 'rate_limited', 'too many requests from this device; wait and try again', { 'retry-after': String(rl.retryAfterSeconds) });
+    const rateKey = caller.kind === 'key' ? `chat:key:${caller.keyId}` : `chat:dev:${caller.deviceId}`;
+    const perMinute = caller.kind === 'key' ? await apiKeyRateLimit(deps.db) : await policyNumber(deps, 'rate_limit_per_minute', 60);
+    const rl = await deps.limits.hit(rateKey, perMinute, 60);
+    if (!rl.allowed) fail(429, 'rate_limited', 'too many requests; wait and try again', { 'retry-after': String(rl.retryAfterSeconds) });
     const maxConcurrent = await policyNumber(deps, 'max_concurrent_per_device', 2);
     const slot = await acquireSlot(deps.db, {
-      deviceId: device.deviceId,
+      deviceId: callerDevice(caller),
+      apiKeyId: callerKey(caller),
       requestId: ctx.requestId,
       clientRequestId,
       maxConcurrent,
@@ -202,7 +229,7 @@ export async function chatCompletions(ctx: Ctx): Promise<void> {
     if (slot === 'duplicate') fail(409, 'duplicate_request', 'this request was already received; send a new Idempotency-Key for a new request');
     if (slot === 'busy') fail(429, 'too_many_requests', 'this device already has requests running; wait for one to finish');
     try {
-      await handle(ctx, device, clientRequestId);
+      await handle(ctx, caller, clientRequestId);
     } finally {
       await releaseSlot(deps.db, ctx.requestId).catch((e) => log('error', 'could not release request slot', { requestId: ctx.requestId, error: errText(e) }));
     }
@@ -229,14 +256,14 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.name + ': ' + e.message.slice(0, 300) : 'unknown error';
 }
 
-async function handle(ctx: Ctx, device: DeviceAuth, clientRequestId: string | null): Promise<void> {
+async function handle(ctx: Ctx, caller: Caller, clientRequestId: string | null): Promise<void> {
   const { deps, req } = ctx;
-  const deviceId = device.deviceId;
+  const deviceId = callerDevice(caller);
   const body = await readJson(req, BODY_LIMIT);
   const policy = await deps.db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'max_output_tokens'");
   const parsed = parseChatRequest(body, policy.rows[0]?.v ?? 8192);
 
-  const allowed = await allowedModelIds(deps.db, deviceId, device.modelAccess);
+  const allowed = await allowedModelIds(deps.db, deviceId, caller.kind === 'device' ? caller.modelAccess : 'all');
   const m = await loadRoute(deps, parsed.model);
   if (!m || !isAllowed(allowed, m.id)) throw oa('model_not_found', 'this model is not in the catalogue for this computer; refresh the model list', 404);
   if (!m.model_enabled || !m.provider_enabled) throw oa('model_disabled', 'this model is currently disabled; choose another model', 403);
@@ -250,7 +277,7 @@ async function handle(ctx: Ctx, device: DeviceAuth, clientRequestId: string | nu
   }
 
   for (let i = 0; i < chain.length; i++) {
-    const done = await attempt(ctx, deviceId, clientRequestId, parsed, chain[i], { requested: m, canFallBack: i < chain.length - 1 });
+    const done = await attempt(ctx, caller, clientRequestId, parsed, chain[i], { requested: m, canFallBack: i < chain.length - 1 });
     if (done) return;
   }
 }
@@ -310,13 +337,15 @@ function shouldFallBack(e: unknown): boolean {
  */
 async function attempt(
   ctx: Ctx,
-  deviceId: string,
+  caller: Caller,
   clientRequestId: string | null,
   parsed: ChatRequest,
   m: RouteRow,
   route: { requested: RouteRow; canFallBack: boolean },
 ): Promise<boolean> {
   const { deps, res } = ctx;
+  const deviceId = callerDevice(caller);
+  const apiKeyId = callerKey(caller);
   const isFallback = m.id !== route.requested.id;
   let key: string | null = null;
   if (m.auth_scheme === 'bearer') {
@@ -390,6 +419,7 @@ async function attempt(
       // The idempotency key belongs to the request, so only the attempt that answers carries it (the column is unique).
       clientRequestId: movedOn ? null : clientRequestId,
       deviceId,
+      apiKeyId,
       modelId: m.id,
       modelName: m.display_name,
       providerId: m.provider_id,
@@ -577,7 +607,7 @@ async function pipeStream(
     }
     res.end();
     return { status: 'ok', http: 200, code: null, ttft, usage };
-  } catch (e) {
+  } catch {
     clearTimeout(idle);
     await reader.cancel().catch(() => undefined);
     if (controller.signal.aborted && !timeoutFlag.get(controller)) {
@@ -603,7 +633,8 @@ async function writeLog(
   r: {
     requestId: string;
     clientRequestId: string | null;
-    deviceId: string;
+    deviceId: string | null;
+    apiKeyId: string | null;
     modelId: string;
     modelName: string;
     providerId: string;
@@ -620,6 +651,7 @@ async function writeLog(
   const reported = r.usage.p !== null || r.usage.c !== null;
   const params = [
     r.deviceId,
+    r.apiKeyId,
     r.modelId,
     r.modelName,
     r.providerId,
@@ -637,8 +669,8 @@ async function writeLog(
     r.clientRequestId,
   ];
   // Usage is written once per request. A short retry covers a brief database hiccup; a duplicate client key is ignored.
-  const sql = `INSERT INTO request_logs (device_id, model_id, model_name, provider_id, provider_name, status, http_status, error_code, stream, latency_ms, ttft_ms, prompt_tokens, completion_tokens, usage_source, request_id, client_request_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+  const sql = `INSERT INTO request_logs (device_id, api_key_id, model_id, model_name, provider_id, provider_name, status, http_status, error_code, stream, latency_ms, ttft_ms, prompt_tokens, completion_tokens, usage_source, request_id, client_request_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        ON CONFLICT DO NOTHING`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {

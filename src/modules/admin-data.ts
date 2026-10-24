@@ -17,7 +17,9 @@ export async function overview(ctx: Ctx): Promise<void> {
       (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours') AS requests_24h,
       (SELECT count(*)::int FROM request_logs WHERE created_at > now() - interval '24 hours' AND status <> 'ok') AS failed_24h,
       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p50_ms,
-      (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms`);
+      (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms,
+      (SELECT count(*)::int FROM api_keys WHERE enabled) AS api_keys_enabled,
+      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled`);
   const providers = await ctx.deps.db.query('SELECT name, enabled, last_test_ok, last_test_at, last_test_message FROM providers ORDER BY name');
   sendJson(ctx.res, 200, {
     ...toCamel(rows[0]),
@@ -98,9 +100,9 @@ export async function logs(ctx: Ctx): Promise<void> {
     where.push(`r.id < $${params.length}`);
   }
   params.push(limit + 1);
-  const sql = `SELECT r.id, r.created_at, d.name AS device_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
+  const sql = `SELECT r.id, r.created_at, d.name AS device_name, k.name AS api_key_name, r.model_name, r.provider_name, r.status, r.http_status, r.error_code,
                       r.stream, r.latency_ms, r.ttft_ms, r.prompt_tokens, r.completion_tokens, r.usage_source
-                 FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id
+                 FROM request_logs r LEFT JOIN devices d ON d.id = r.device_id LEFT JOIN api_keys k ON k.id = r.api_key_id
                 ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
                 ORDER BY r.id DESC LIMIT $${params.length}`;
   const { rows } = await ctx.deps.db.query(sql, params);
@@ -110,6 +112,7 @@ export async function logs(ctx: Ctx): Promise<void> {
       id: Number(r.id),
       createdAt: r.created_at,
       deviceName: r.device_name ?? null,
+      apiKeyName: r.api_key_name ?? null,
       modelName: r.model_name,
       providerName: r.provider_name,
       status: r.status,
@@ -141,6 +144,7 @@ export async function currentSettings(db: Queryer) {
     allowAutoRegistration: s.allow_auto_registration !== false,
     requireLoginForCentralAi: s.require_login_for_central_ai === true,
     searchPerMinute: Number(s.search_per_minute ?? 20),
+    apiKeyRateLimitPerMinute: Number(s.api_key_rate_limit_per_minute ?? 30),
   };
 }
 
@@ -152,6 +156,7 @@ const SETTING_KEYS: Record<string, string> = {
   allowAutoRegistration: 'allow_auto_registration',
   requireLoginForCentralAi: 'require_login_for_central_ai',
   searchPerMinute: 'search_per_minute',
+  apiKeyRateLimitPerMinute: 'api_key_rate_limit_per_minute',
 };
 
 export async function patchSettings(ctx: Ctx): Promise<void> {
@@ -174,6 +179,8 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
   if (autoReg !== undefined) changes.push(['allow_auto_registration', autoReg]);
   const searchRate = int(body, 'searchPerMinute', { min: 1, max: 120, optional: true });
   if (searchRate !== undefined) changes.push(['search_per_minute', searchRate]);
+  const apiKeyRate = int(body, 'apiKeyRateLimitPerMinute', { min: 1, max: 600, optional: true });
+  if (apiKeyRate !== undefined) changes.push(['api_key_rate_limit_per_minute', apiKeyRate]);
   const requireLogin = bool(body, 'requireLoginForCentralAi', { optional: true });
   if (requireLogin !== undefined) {
     // Changes who may use central AI: password confirmation, and only when accounts are configured on this server.
