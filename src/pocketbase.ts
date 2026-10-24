@@ -181,6 +181,14 @@ export class PocketBase {
     return this.user(r.body?.record);
   }
 
+  /** Sets a new password (superuser). PocketBase also renews the user's tokenKey, so every existing user token stops working. */
+  async setPassword(id: string, password: string): Promise<void> {
+    if (!ID.test(id)) throw new PbError(400, 'invalid user id');
+    const r = await this.admin('PATCH', `/api/collections/${this.col()}/records/${encodeURIComponent(id)}`, { password, passwordConfirm: password });
+    if (r.status === 400) throw new PbError(400, 'the password was not accepted; use at least 8 characters');
+    if (r.status !== 200) throw new PbError(r.status || 0, 'the account service is unavailable');
+  }
+
   /** The user's current record, read as superuser. Null when the account no longer exists. */
   async getUser(id: string): Promise<PbUser | null> {
     if (!ID.test(id)) return null;

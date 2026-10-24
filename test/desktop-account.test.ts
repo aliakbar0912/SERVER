@@ -129,14 +129,22 @@ test('desktop: email-code signup and sign-in claims the existing registration, t
   // IPC validation rejects bad input before it reaches the core.
   await assert.rejects(d.call('account:requestCode', { email: 'not-an-email' }), /Invalid request/);
   await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code: 'abc' }), /Invalid request/);
-  // Sign up: name + email, then the code from the email. No password and no verification link.
+  await assert.rejects(d.call('account:signUp', { name: 'X', email: 'desk@example.test', password: 'short' }), /at least 8/);
+  // Sign up: name, email and password; the email is verified with the code sent to it (no links).
   let mark = pbt!.mails.length;
-  assert.deepEqual(await d.call('account:requestCode', { email: 'Desk@Example.test', name: 'Desk User', create: true }), { sent: true });
+  assert.deepEqual(await d.call('account:signUp', { name: 'Desk User', email: 'Desk@Example.test', password: 'desk-pass-123' }), { codeSent: true });
   const code = await pbt!.waitForOtp('desk@example.test', mark);
+  // Before verifying, a password sign-in asks for a code instead of signing in.
+  mark = pbt!.mails.length;
+  const pending = await d.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-123' });
+  assert.equal(pending.needsCode, true);
+  assert.equal(pending.signedIn, false);
+  const freshCode = await pbt!.waitForOtp('desk@example.test', mark);
   await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code: '00000000' }), /not correct/);
+  assert.ok(code);
 
   const deviceId = (await tdb!.db.query('SELECT id FROM devices WHERE token_hash = $1', [crypto.createHash('sha256').update(legacyToken!).digest('hex')])).rows[0].id;
-  const status = await d.call('account:verifyCode', { email: 'desk@example.test', code });
+  const status = await d.call('account:verifyCode', { email: 'desk@example.test', code: freshCode });
   assert.equal(status.signedIn, true);
   assert.equal(status.user.email, 'desk@example.test');
   assert.ok(!JSON.stringify(status).includes(d.secrets.get(CENTRAL_TOKEN_KEY)!), 'no device token in IPC results');
@@ -161,12 +169,29 @@ test('desktop: email-code signup and sign-in claims the existing registration, t
   const out = await d.call('account:signOut');
   assert.equal(out.signedIn, false);
 
-  // Signing in again later uses a fresh code; the old one cannot be replayed.
+  // Password sign-in; a wrong password is refused with a generic message.
+  await assert.rejects(d.call('account:signIn', { email: 'desk@example.test', password: 'wrong-password' }), /email or password is not correct/);
+  assert.equal((await d.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-123' })).signedIn, true);
+
+  // Change password (needs the current one), then sign in with the new one.
+  await assert.rejects(d.call('account:changePassword', { current: 'not-it', password: 'desk-pass-456' }), /current password/);
+  await d.call('account:changePassword', { current: 'desk-pass-123', password: 'desk-pass-456' });
+  assert.equal((await d.call('account:updateProfile', { name: 'Still Works' })).user.name, 'Still Works', 'PocketBase token refreshed after the change');
+  await d.call('account:signOut');
+
+  // Forgot password: a code by email (no link), a new password, and every old session ends.
+  const other = desktop();
+  await other.core.centralRefresh();
+  await other.call('account:config');
+  assert.equal((await other.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-456' })).signedIn, true);
   mark = pbt!.mails.length;
   await d.call('account:requestCode', { email: 'desk@example.test' });
-  await assert.rejects(d.call('account:verifyCode', { email: 'desk@example.test', code }), /not correct/);
-  const code2 = await pbt!.waitForOtp('desk@example.test', mark);
-  assert.equal((await d.call('account:verifyCode', { email: 'desk@example.test', code: code2 })).signedIn, true);
+  const resetCode = await pbt!.waitForOtp('desk@example.test', mark);
+  await assert.rejects(d.call('account:resetPassword', { email: 'desk@example.test', code: resetCode, password: 'short' }), /at least 8/);
+  assert.equal((await d.call('account:resetPassword', { email: 'desk@example.test', code: resetCode, password: 'brand-new-pass-1' })).signedIn, true);
+  await other.core.centralRefresh();
+  assert.equal((await other.call('account:status')).signedIn, false, 'the other computer was signed out by the reset');
+  await assert.rejects(d.call('account:signIn', { email: 'desk@example.test', password: 'desk-pass-456' }), /not correct/);
 
   // Deleting the account is confirmed with a code sent to the account's own email.
   mark = pbt!.mails.length;

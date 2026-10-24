@@ -108,6 +108,33 @@ export async function createSession(ctx: Ctx): Promise<void> {
   sendJson(ctx.res, 200, await signIn(ctx, user, installId, deviceName));
 }
 
+/**
+ * POST /v1/auth/password-reset { otpId, otpCode, password }: "forgot password" without email links. The user asked
+ * PocketBase for an email code; the server checks that code itself (proving control of the address), then sets the new
+ * password as superuser. PocketBase renews the user's tokenKey, so old PocketBase sessions end. Devora device sessions are
+ * ended too, so a stolen device cannot outlive a password reset.
+ */
+export async function resetPassword(ctx: Ctx): Promise<void> {
+  const p = pb(ctx.deps);
+  await limit(ctx, `auth:reset:ip:${ctx.ip}`, 10);
+  const body = requireObject(await readJson(ctx.req, 4 * 1024));
+  rejectUnknown(body, ['otpId', 'otpCode', 'password']);
+  const otpId = str(body, 'otpId', { min: 1, max: 64 })!;
+  const otpCode = str(body, 'otpCode', { min: 4, max: 12 })!;
+  const password = str(body, 'password', { min: 8, max: 200, trim: false })!;
+  let user: PbUser;
+  try {
+    user = await p.checkOtp(otpId, otpCode);
+    await p.setPassword(user.id, password);
+  } catch (e) {
+    if (e instanceof PbError && e.status === 400) fail(400, 'weak_password', 'use a password of at least 8 characters');
+    pbFail(e, 'the code is not correct or has expired');
+  }
+  await ctx.deps.db.transaction((q) => endUserSessions(q, user.id, 'password_reset'));
+  log('info', 'password reset with email code', {});
+  sendJson(ctx.res, 200, { reset: true });
+}
+
 /** POST /v1/auth/oauth/start { provider, purpose, loopbackPort, loopbackNonce, pbToken? }. */
 export async function oauthStart(ctx: Ctx): Promise<void> {
   const deps = ctx.deps;

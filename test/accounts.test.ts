@@ -1,7 +1,7 @@
 // Devora accounts against a real PocketBase (fresh instance per run) and a real PostgreSQL. Google/GitHub are replaced by
 // a local OpenID Connect provider configured in PocketBase as its "oidc" provider, so PocketBase's real OAuth2 code
 // exchange (client secret, exact redirect_uri, PKCE) runs; only the identity provider is a test double.
-import { after, before, describe, test } from 'node:test';
+import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import net, { type AddressInfo } from 'node:net';
@@ -92,6 +92,11 @@ after(async () => {
   await idp?.close();
   await pbt?.stop();
   await tdb?.drop();
+});
+
+// Every test here signs in from 127.0.0.1: start each one with fresh per-IP rate counters.
+beforeEach(async () => {
+  await tdb?.db.query('DELETE FROM rate_counters').catch(() => undefined);
 });
 
 const skip = (t: any) => {
@@ -620,5 +625,31 @@ describe('email codes (OTP)', () => {
     assert.ok(statuses.every((s) => s === 401 || s === 429), statuses.join(','));
     assert.equal((await get('/v1/catalogue', a.body.token)).status, 200, 'nothing was deleted');
     assert.ok(await pbt!.waitForOtp('otp-a@example.test', mark));
+  });
+});
+
+describe('password reset by email code', () => {
+  test('needs the right code, rejects short passwords, ends every session, and the new password works', async (t) => {
+    if (skip(t)) return;
+    await pbt!.createUser('reset-otp@example.test', 'old-password-1');
+    const s = await passwordSignIn('reset-otp@example.test', 'old-password-1');
+    let mark = pbt!.mails.length;
+    const req = await pbt!.api('POST', '/api/collections/users/request-otp', { email: 'reset-otp@example.test' });
+    const code = await pbt!.waitForOtp('reset-otp@example.test', mark);
+    // A too-short password is refused before the code is checked, so the code is not used up.
+    assert.equal((await post('/v1/auth/password-reset', { otpId: req.body.otpId, otpCode: code, password: 'short' })).status, 400);
+    const [req2, code2] = [req, code];
+    assert.ok(mark >= 0);
+    const ok = await post('/v1/auth/password-reset', { otpId: req2.body.otpId, otpCode: code2, password: 'new-password-1' });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal((await get('/v1/catalogue', s.body.token)).status, 401, 'old sessions ended');
+    assert.equal((await passwordSignIn('reset-otp@example.test', 'new-password-1')).status, 200);
+    await assert.rejects(pbt!.passwordToken('reset-otp@example.test', 'old-password-1'));
+    // Replaying the used code, or guessing, does nothing.
+    assert.notEqual((await post('/v1/auth/password-reset', { otpId: req2.body.otpId, otpCode: code2, password: 'attacker-pass-1' })).status, 200);
+    mark = pbt!.mails.length;
+    const req3 = await pbt!.api('POST', '/api/collections/users/request-otp', { email: 'reset-otp@example.test' });
+    assert.ok([401, 429].includes((await post('/v1/auth/password-reset', { otpId: req3.body.otpId, otpCode: '99999999', password: 'attacker-pass-1' })).status));
+    assert.equal((await passwordSignIn('reset-otp@example.test', 'new-password-1')).status, 200, 'unchanged by the failed attempts');
   });
 });

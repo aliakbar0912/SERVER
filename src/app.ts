@@ -44,6 +44,7 @@ const routes: Route[] = [
   R('GET', '/v1/updates/check', releases.checkForUpdate),
   R('GET', '/v1/auth/config', accounts.authConfig),
   R('POST', '/v1/auth/session', accounts.createSession),
+  R('POST', '/v1/auth/password-reset', accounts.resetPassword),
   R('POST', '/v1/auth/oauth/start', accounts.oauthStart),
   R('GET', '/v1/auth/oauth/callback', accounts.oauthCallback),
   R('POST', '/v1/auth/exchange', accounts.exchange),

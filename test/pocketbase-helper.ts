@@ -99,7 +99,7 @@ export async function startPocketBase(): Promise<TestPocketBase | null> {
   if (!fs.existsSync(PB_BIN)) return null;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'devora-pb-'));
   const adminEmail = 'server@devora.test';
-  const adminPassword = crypto.randomBytes(12).toString('base64url');
+  const adminPassword = `Pb${crypto.randomBytes(12).toString('hex')}`; // never starts with '-' (the CLI would read it as a flag)
   const up = spawnSync(PB_BIN, ['superuser', 'upsert', adminEmail, adminPassword, '--dir', dir], { encoding: 'utf8' });
   if (up.status !== 0) throw new Error(`pocketbase superuser upsert failed: ${up.stderr}`);
   const port = await freePort();
