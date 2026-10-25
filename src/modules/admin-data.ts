@@ -19,7 +19,9 @@ export async function overview(ctx: Ctx): Promise<void> {
       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p50_ms,
       (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms,
       (SELECT count(*)::int FROM api_keys WHERE enabled) AS api_keys_enabled,
-      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled`);
+      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled,
+      (SELECT count(*)::int FROM org_skills WHERE enabled) AS org_skills_enabled,
+      (SELECT count(*)::int FROM org_announcements WHERE enabled) AS org_announcements_enabled`);
   const providers = await ctx.deps.db.query('SELECT name, enabled, last_test_ok, last_test_at, last_test_message FROM providers ORDER BY name');
   sendJson(ctx.res, 200, {
     ...toCamel(rows[0]),
@@ -206,4 +208,50 @@ export async function patchSettings(ctx: Ctx): Promise<void> {
 export async function pruneLogs(db: Queryer, days: number): Promise<number> {
   const { rowCount } = await db.query("DELETE FROM request_logs WHERE created_at < now() - make_interval(days => $1)", [days]);
   return rowCount;
+}
+
+/**
+ * GET /admin/api/export: a JSON backup of everything the owner configured, safe to keep or re-import by hand.
+ * Secrets are never included: provider API keys appear only as hasKey flags, API keys appear without their hashes
+ * and tokens, and account/password material is left out entirely.
+ */
+export async function exportConfig(ctx: Ctx): Promise<void> {
+  await guardOwner(ctx, { write: false });
+  const q = ctx.deps.db;
+  const [providers, models, devices, agents, skills, announcements, searchProviders, apiKeys, settings, catalogueVersion] = await Promise.all([
+    q.query('SELECT name, adapter, base_url, auth_scheme, enabled, timeout_ms, max_retries, last_test_ok, last_test_at FROM providers ORDER BY name'),
+    q.query('SELECT m.upstream_model_id, m.display_name, m.description, m.enabled, m.is_default, m.context_window, m.capabilities, p.name AS provider_name FROM models m JOIN providers p ON p.id = m.provider_id ORDER BY m.display_name'),
+    q.query('SELECT name, status, created_at, last_seen_at FROM devices ORDER BY name'),
+    q.query('SELECT slug, name, description, instructions, access, suggested_model, enabled, revision FROM org_agents ORDER BY name'),
+    q.query('SELECT slug, name, description, triggers, instructions, examples, enabled, revision FROM org_skills ORDER BY name'),
+    q.query('SELECT slug, title, body, level, enabled, revision FROM org_announcements ORDER BY title'),
+    q.query('SELECT name, kind, base_url, options, enabled, is_default, priority FROM search_providers ORDER BY name'),
+    q.query('SELECT name, key_prefix, last4, enabled, scopes, expires_at, created_at, last_used_at FROM api_keys ORDER BY name'),
+    q.query("SELECT key, value, updated_at FROM settings WHERE key NOT LIKE '%token%' AND key NOT LIKE '%secret%' AND key NOT LIKE '%hash%' ORDER BY key"),
+    q.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'catalogue_version'"),
+  ]);
+  sendJson(ctx.res, 200, {
+    schema: 'devora-export',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    catalogueVersion: catalogueVersion.rows[0]?.v ?? 0,
+    settings: Object.fromEntries(settings.rows.map((r) => [r.key, r.value])),
+    providers: providers.rows.map((p) => ({ name: p.name, adapter: p.adapter, baseUrl: p.base_url, authScheme: p.auth_scheme, enabled: p.enabled, timeoutMs: p.timeout_ms, maxRetries: p.max_retries, lastTestOk: p.last_test_ok, lastTestAt: p.last_test_at })),
+    models: models.rows.map((m) => ({
+      upstreamModelId: m.upstream_model_id,
+      displayName: m.display_name,
+      description: m.description,
+      providerName: m.provider_name,
+      enabled: m.enabled,
+      isDefault: m.is_default,
+      contextWindow: m.context_window,
+      capabilities: m.capabilities,
+    })),
+    devices: devices.rows.map((d) => ({ name: d.name, status: d.status, createdAt: d.created_at, lastSeenAt: d.last_seen_at })),
+    agents: agents.rows.map((a) => ({ slug: a.slug, name: a.name, description: a.description, instructions: a.instructions, access: a.access, suggestedModel: a.suggested_model, enabled: a.enabled, revision: a.revision })),
+    skills: skills.rows.map((s) => ({ slug: s.slug, name: s.name, description: s.description, triggers: s.triggers ?? [], instructions: s.instructions, examples: s.examples, enabled: s.enabled, revision: s.revision })),
+    announcements: announcements.rows.map((a) => ({ slug: a.slug, title: a.title, body: a.body, level: a.level, enabled: a.enabled, revision: a.revision })),
+    searchProviders: searchProviders.rows.map((s) => ({ name: s.name, kind: s.kind, baseUrl: s.base_url, options: s.options ?? {}, enabled: s.enabled, isDefault: s.is_default, priority: s.priority })),
+    apiKeys: apiKeys.rows.map((k) => ({ name: k.name, keyPrefix: k.key_prefix, last4: k.last4, enabled: k.enabled, scopes: k.scopes, expiresAt: k.expires_at, createdAt: k.created_at, lastUsedAt: k.last_used_at })),
+  });
 }

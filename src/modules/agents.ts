@@ -14,6 +14,112 @@ export const LIMITS = { name: 80, description: 1024, instructions: 8_000, sugges
 export const ACCESS_LEVELS = ['read', 'commands', 'docs', 'write', 'write_commands'] as const;
 export type AgentAccess = (typeof ACCESS_LEVELS)[number];
 
+/** Ready-made presets the admin site offers when writing a new agent; served with the list, stored nowhere. */
+export const TEMPLATES: { name: string; description: string; instructions: string; access: AgentAccess; suggestedModel: string | null }[] = [
+  {
+    name: 'Code reviewer',
+    description: 'Reviews recent changes for correctness, style and hidden bugs, and reports findings without editing anything.',
+    instructions: `Review the changes you were given (or the most recent commit when nothing specific was given).
+
+Steps:
+1. List the files that changed and skim each diff.
+2. Look for correctness bugs, missing error handling, edge cases and security issues.
+3. Note style or naming problems only when they hurt readability.
+4. Report findings in order of severity, each with the file, the line area and a one-line suggestion.
+
+Rules:
+- Never change any file.
+- Say clearly when you found nothing worth reporting.`,
+    access: 'read',
+    suggestedModel: null,
+  },
+  {
+    name: 'Test writer',
+    description: 'Writes focused unit tests for a given file or feature and runs them to confirm they pass.',
+    instructions: `Write tests for the feature or file you were given.
+
+Steps:
+1. Read the code under test and the existing test setup; follow the project's existing test style.
+2. Cover the happy path first, then the important edge cases and error paths.
+3. Add the tests to the right existing file, or a new one next to them when the project expects that.
+4. Run the test suite and fix your tests until they pass.
+
+Rules:
+- Do not change production code to make a test pass; report the problem instead.
+- Keep each test independent and named so a failure explains itself.`,
+    access: 'commands',
+    suggestedModel: null,
+  },
+  {
+    name: 'Docs writer',
+    description: 'Updates README, CHANGELOG and other documentation to match the current state of the project.',
+    instructions: `Update the project documentation you were asked to touch.
+
+Steps:
+1. Read the current docs and the relevant code or changes they describe.
+2. Fix anything that is out of date; prefer small, precise edits over rewrites.
+3. Keep the existing tone, structure and heading style.
+4. Only edit documentation files (README, CHANGELOG, docs folder) and never code.
+
+Rules:
+- Do not invent features that do not exist.
+- Keep examples short and runnable.`,
+    access: 'docs',
+    suggestedModel: null,
+  },
+  {
+    name: 'Dependency updater',
+    description: 'Bumps outdated dependencies, runs the tests and reports what changed and what broke.',
+    instructions: `Update the dependencies you were asked to update.
+
+Steps:
+1. List the current versions and the target versions.
+2. Update the manifest and lockfile with the project's package manager.
+3. Run the build and the test suite.
+4. Summarize what was updated, what passed and what failed, with the exact error output for failures.
+
+Rules:
+- Update one dependency group at a time so failures are easy to attribute.
+- Never edit a lockfile by hand; always use the package manager.`,
+    access: 'write_commands',
+    suggestedModel: null,
+  },
+  {
+    name: 'Release notes writer',
+    description: 'Turns recent commits and diffs into clean, user-facing release notes.',
+    instructions: `Write release notes for the changes you were given.
+
+Steps:
+1. Read the commits and diffs since the last release.
+2. Group them into Added, Changed, Fixed and Removed.
+3. Write one line per user-visible change; skip internal chores unless they matter to users.
+4. Return the notes as a markdown list, ready to paste into the changelog.
+
+Rules:
+- Never change any file.
+- Describe changes from the user's point of view, not the implementation's.`,
+    access: 'read',
+    suggestedModel: null,
+  },
+  {
+    name: 'Bug triage',
+    description: 'Investigates a reported bug, finds the likely cause in the code and proposes a fix plan.',
+    instructions: `Investigate the bug report you were given.
+
+Steps:
+1. Restate the bug in one sentence: expected behavior, actual behavior.
+2. Search the code for the feature involved and trace the likely path.
+3. Name the most probable cause with file and line references, and say how confident you are.
+4. Propose a minimal fix plan (steps, touched files, risks) without implementing it.
+
+Rules:
+- Read-only: never change files.
+- When the cause is not in the code (environment, data, config), say so and list what to check.`,
+    access: 'read',
+    suggestedModel: null,
+  },
+];
+
 function slugify(name: string): string {
   return (
     name
@@ -80,7 +186,7 @@ function readAccess(v: unknown): AgentAccess {
 export async function listOrgAgents(ctx: Ctx): Promise<void> {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query('SELECT * FROM org_agents ORDER BY name');
-  sendJson(ctx.res, 200, { agents: rows.map(view), version: await agentsVersion(ctx.deps.db), limits: LIMITS, accessLevels: ACCESS_LEVELS });
+  sendJson(ctx.res, 200, { agents: rows.map(view), version: await agentsVersion(ctx.deps.db), limits: LIMITS, accessLevels: ACCESS_LEVELS, templates: TEMPLATES });
 }
 
 export async function createOrgAgent(ctx: Ctx): Promise<void> {

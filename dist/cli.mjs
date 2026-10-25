@@ -4173,7 +4173,9 @@ async function overview(ctx) {
       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p50_ms,
       (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM request_logs WHERE created_at > now() - interval '24 hours' AND status = 'ok')::int AS p95_ms,
       (SELECT count(*)::int FROM api_keys WHERE enabled) AS api_keys_enabled,
-      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled`);
+      (SELECT count(*)::int FROM org_agents WHERE enabled) AS org_agents_enabled,
+      (SELECT count(*)::int FROM org_skills WHERE enabled) AS org_skills_enabled,
+      (SELECT count(*)::int FROM org_announcements WHERE enabled) AS org_announcements_enabled`);
   const providers = await ctx.deps.db.query("SELECT name, enabled, last_test_ok, last_test_at, last_test_message FROM providers ORDER BY name");
   sendJson(ctx.res, 200, {
     ...toCamel(rows[0]),
@@ -4350,6 +4352,46 @@ async function patchSettings(ctx) {
 async function pruneLogs(db, days) {
   const { rowCount } = await db.query("DELETE FROM request_logs WHERE created_at < now() - make_interval(days => $1)", [days]);
   return rowCount;
+}
+async function exportConfig(ctx) {
+  await guardOwner(ctx, { write: false });
+  const q = ctx.deps.db;
+  const [providers, models, devices, agents, skills, announcements, searchProviders, apiKeys, settings, catalogueVersion2] = await Promise.all([
+    q.query("SELECT name, adapter, base_url, auth_scheme, enabled, timeout_ms, max_retries, last_test_ok, last_test_at FROM providers ORDER BY name"),
+    q.query("SELECT m.upstream_model_id, m.display_name, m.description, m.enabled, m.is_default, m.context_window, m.capabilities, p.name AS provider_name FROM models m JOIN providers p ON p.id = m.provider_id ORDER BY m.display_name"),
+    q.query("SELECT name, status, created_at, last_seen_at FROM devices ORDER BY name"),
+    q.query("SELECT slug, name, description, instructions, access, suggested_model, enabled, revision FROM org_agents ORDER BY name"),
+    q.query("SELECT slug, name, description, triggers, instructions, examples, enabled, revision FROM org_skills ORDER BY name"),
+    q.query("SELECT slug, title, body, level, enabled, revision FROM org_announcements ORDER BY title"),
+    q.query("SELECT name, kind, base_url, options, enabled, is_default, priority FROM search_providers ORDER BY name"),
+    q.query("SELECT name, key_prefix, last4, enabled, scopes, expires_at, created_at, last_used_at FROM api_keys ORDER BY name"),
+    q.query("SELECT key, value, updated_at FROM settings WHERE key NOT LIKE '%token%' AND key NOT LIKE '%secret%' AND key NOT LIKE '%hash%' ORDER BY key"),
+    q.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'catalogue_version'")
+  ]);
+  sendJson(ctx.res, 200, {
+    schema: "devora-export",
+    version: 1,
+    exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    catalogueVersion: catalogueVersion2.rows[0]?.v ?? 0,
+    settings: Object.fromEntries(settings.rows.map((r) => [r.key, r.value])),
+    providers: providers.rows.map((p) => ({ name: p.name, adapter: p.adapter, baseUrl: p.base_url, authScheme: p.auth_scheme, enabled: p.enabled, timeoutMs: p.timeout_ms, maxRetries: p.max_retries, lastTestOk: p.last_test_ok, lastTestAt: p.last_test_at })),
+    models: models.rows.map((m) => ({
+      upstreamModelId: m.upstream_model_id,
+      displayName: m.display_name,
+      description: m.description,
+      providerName: m.provider_name,
+      enabled: m.enabled,
+      isDefault: m.is_default,
+      contextWindow: m.context_window,
+      capabilities: m.capabilities
+    })),
+    devices: devices.rows.map((d) => ({ name: d.name, status: d.status, createdAt: d.created_at, lastSeenAt: d.last_seen_at })),
+    agents: agents.rows.map((a) => ({ slug: a.slug, name: a.name, description: a.description, instructions: a.instructions, access: a.access, suggestedModel: a.suggested_model, enabled: a.enabled, revision: a.revision })),
+    skills: skills.rows.map((s) => ({ slug: s.slug, name: s.name, description: s.description, triggers: s.triggers ?? [], instructions: s.instructions, examples: s.examples, enabled: s.enabled, revision: s.revision })),
+    announcements: announcements.rows.map((a) => ({ slug: a.slug, title: a.title, body: a.body, level: a.level, enabled: a.enabled, revision: a.revision })),
+    searchProviders: searchProviders.rows.map((s) => ({ name: s.name, kind: s.kind, baseUrl: s.base_url, options: s.options ?? {}, enabled: s.enabled, isDefault: s.is_default, priority: s.priority })),
+    apiKeys: apiKeys.rows.map((k) => ({ name: k.name, keyPrefix: k.key_prefix, last4: k.last4, enabled: k.enabled, scopes: k.scopes, expiresAt: k.expires_at, createdAt: k.created_at, lastUsedAt: k.last_used_at }))
+  });
 }
 
 // src/modules/health.ts
@@ -4715,6 +4757,110 @@ function forgetPublishedVersions() {
 // src/modules/agents.ts
 var LIMITS2 = { name: 80, description: 1024, instructions: 8e3, suggestedModel: 200 };
 var ACCESS_LEVELS = ["read", "commands", "docs", "write", "write_commands"];
+var TEMPLATES = [
+  {
+    name: "Code reviewer",
+    description: "Reviews recent changes for correctness, style and hidden bugs, and reports findings without editing anything.",
+    instructions: `Review the changes you were given (or the most recent commit when nothing specific was given).
+
+Steps:
+1. List the files that changed and skim each diff.
+2. Look for correctness bugs, missing error handling, edge cases and security issues.
+3. Note style or naming problems only when they hurt readability.
+4. Report findings in order of severity, each with the file, the line area and a one-line suggestion.
+
+Rules:
+- Never change any file.
+- Say clearly when you found nothing worth reporting.`,
+    access: "read",
+    suggestedModel: null
+  },
+  {
+    name: "Test writer",
+    description: "Writes focused unit tests for a given file or feature and runs them to confirm they pass.",
+    instructions: `Write tests for the feature or file you were given.
+
+Steps:
+1. Read the code under test and the existing test setup; follow the project's existing test style.
+2. Cover the happy path first, then the important edge cases and error paths.
+3. Add the tests to the right existing file, or a new one next to them when the project expects that.
+4. Run the test suite and fix your tests until they pass.
+
+Rules:
+- Do not change production code to make a test pass; report the problem instead.
+- Keep each test independent and named so a failure explains itself.`,
+    access: "commands",
+    suggestedModel: null
+  },
+  {
+    name: "Docs writer",
+    description: "Updates README, CHANGELOG and other documentation to match the current state of the project.",
+    instructions: `Update the project documentation you were asked to touch.
+
+Steps:
+1. Read the current docs and the relevant code or changes they describe.
+2. Fix anything that is out of date; prefer small, precise edits over rewrites.
+3. Keep the existing tone, structure and heading style.
+4. Only edit documentation files (README, CHANGELOG, docs folder) and never code.
+
+Rules:
+- Do not invent features that do not exist.
+- Keep examples short and runnable.`,
+    access: "docs",
+    suggestedModel: null
+  },
+  {
+    name: "Dependency updater",
+    description: "Bumps outdated dependencies, runs the tests and reports what changed and what broke.",
+    instructions: `Update the dependencies you were asked to update.
+
+Steps:
+1. List the current versions and the target versions.
+2. Update the manifest and lockfile with the project's package manager.
+3. Run the build and the test suite.
+4. Summarize what was updated, what passed and what failed, with the exact error output for failures.
+
+Rules:
+- Update one dependency group at a time so failures are easy to attribute.
+- Never edit a lockfile by hand; always use the package manager.`,
+    access: "write_commands",
+    suggestedModel: null
+  },
+  {
+    name: "Release notes writer",
+    description: "Turns recent commits and diffs into clean, user-facing release notes.",
+    instructions: `Write release notes for the changes you were given.
+
+Steps:
+1. Read the commits and diffs since the last release.
+2. Group them into Added, Changed, Fixed and Removed.
+3. Write one line per user-visible change; skip internal chores unless they matter to users.
+4. Return the notes as a markdown list, ready to paste into the changelog.
+
+Rules:
+- Never change any file.
+- Describe changes from the user's point of view, not the implementation's.`,
+    access: "read",
+    suggestedModel: null
+  },
+  {
+    name: "Bug triage",
+    description: "Investigates a reported bug, finds the likely cause in the code and proposes a fix plan.",
+    instructions: `Investigate the bug report you were given.
+
+Steps:
+1. Restate the bug in one sentence: expected behavior, actual behavior.
+2. Search the code for the feature involved and trace the likely path.
+3. Name the most probable cause with file and line references, and say how confident you are.
+4. Propose a minimal fix plan (steps, touched files, risks) without implementing it.
+
+Rules:
+- Read-only: never change files.
+- When the cause is not in the code (environment, data, config), say so and list what to check.`,
+    access: "read",
+    suggestedModel: null
+  }
+];
 function slugify2(name) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "agent";
 }
@@ -4768,7 +4914,7 @@ function readAccess(v) {
 async function listOrgAgents(ctx) {
   await guardOwner(ctx, { write: false });
   const { rows } = await ctx.deps.db.query("SELECT * FROM org_agents ORDER BY name");
-  sendJson(ctx.res, 200, { agents: rows.map(view5), version: await agentsVersion(ctx.deps.db), limits: LIMITS2, accessLevels: ACCESS_LEVELS });
+  sendJson(ctx.res, 200, { agents: rows.map(view5), version: await agentsVersion(ctx.deps.db), limits: LIMITS2, accessLevels: ACCESS_LEVELS, templates: TEMPLATES });
 }
 async function createOrgAgent(ctx) {
   await guardOwner(ctx, { write: true });
@@ -4844,6 +4990,136 @@ async function desktopAgents(ctx) {
     {
       version: version2,
       agents: rows.map((r) => ({ slug: r.slug, name: r.name, description: r.description, instructions: r.instructions, access: r.access, suggestedModel: r.suggested_model, revision: r.revision, updatedAt: r.updated_at }))
+    },
+    { etag }
+  );
+}
+
+// src/modules/announcements.ts
+var LIMITS3 = { title: 120, body: 4e3 };
+var LEVELS = ["info", "warning", "critical"];
+var MAX_ANNOUNCEMENTS = 100;
+function slugify3(title) {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "announcement";
+}
+function view6(r) {
+  return {
+    id: r.id,
+    slug: r.slug,
+    title: r.title,
+    body: r.body,
+    level: r.level,
+    enabled: r.enabled,
+    revision: r.revision,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at
+  };
+}
+async function bumpAnnouncements(q) {
+  await q.query("UPDATE settings SET value = to_jsonb((value::text::int) + 1), updated_at = now() WHERE key = 'announcements_version'");
+  await bumpCatalogue(q);
+}
+async function announcementsVersion(db) {
+  try {
+    const { rows } = await db.query("SELECT (value)::text::int AS v FROM settings WHERE key = 'announcements_version'");
+    return rows[0]?.v ?? 0;
+  } catch {
+    return 0;
+  }
+}
+function readLevel(v) {
+  if (typeof v !== "string" || !LEVELS.includes(v)) {
+    fail(400, "invalid_request", `level must be one of: ${LEVELS.join(", ")}`);
+  }
+  return v;
+}
+function readAnnouncement(body, partial) {
+  const title = str(body, "title", { min: 1, max: LIMITS3.title, optional: partial });
+  if (title !== void 0 && /[\r\n]/.test(title)) fail(400, "invalid_request", "the title must be a single line");
+  const bodyText = str(body, "body", { min: 1, max: LIMITS3.body, optional: partial, trim: false });
+  const level = body.level === void 0 ? void 0 : readLevel(body.level);
+  const enabled = bool(body, "enabled", { optional: true });
+  return { title, body: bodyText?.trim(), level, enabled };
+}
+async function listOrgAnnouncements(ctx) {
+  await guardOwner(ctx, { write: false });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_announcements ORDER BY updated_at DESC");
+  sendJson(ctx.res, 200, { announcements: rows.map(view6), version: await announcementsVersion(ctx.deps.db), limits: LIMITS3, levels: LEVELS });
+}
+async function createOrgAnnouncement(ctx) {
+  await guardOwner(ctx, { write: true });
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["title", "body", "level", "enabled"]);
+  const a = readAnnouncement(body, false);
+  if (a.level === void 0) fail(400, "invalid_request", "level is required");
+  const { rows: countRows } = await ctx.deps.db.query("SELECT count(*)::int AS n FROM org_announcements");
+  if (countRows[0].n >= MAX_ANNOUNCEMENTS) fail(409, "too_many", `at most ${MAX_ANNOUNCEMENTS} announcements; delete an old one first`);
+  const id = await ctx.deps.db.transaction(async (q) => {
+    let slug = slugify3(a.title);
+    for (let i = 2; (await q.query("SELECT 1 FROM org_announcements WHERE slug = $1", [slug])).rows.length; i++) slug = `${slugify3(a.title).slice(0, 55)}-${i}`;
+    const { rows: rows2 } = await q.query(
+      `INSERT INTO org_announcements (slug, title, body, level, enabled) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [slug, a.title, a.body, a.level, a.enabled ?? true]
+    );
+    await bumpAnnouncements(q);
+    return rows2[0].id;
+  });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_announcements WHERE id = $1", [id]);
+  sendJson(ctx.res, 201, { announcement: view6(rows[0]) });
+}
+async function updateOrgAnnouncement(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  const body = requireObject(await readJson(ctx.req, 64 * 1024));
+  rejectUnknown(body, ["title", "body", "level", "enabled"]);
+  const a = readAnnouncement(body, true);
+  const sets = [];
+  const vals = [id];
+  const add = (col, v) => {
+    vals.push(v);
+    sets.push(`${col} = $${vals.length}`);
+  };
+  if (a.title !== void 0) add("title", a.title);
+  if (a.body !== void 0) add("body", a.body);
+  if (a.level !== void 0) add("level", a.level);
+  if (a.enabled !== void 0) add("enabled", a.enabled);
+  if (!sets.length) fail(400, "invalid_request", "nothing to change");
+  await ctx.deps.db.transaction(async (q) => {
+    const { rowCount } = await q.query(`UPDATE org_announcements SET ${sets.join(", ")}, revision = revision + 1, updated_at = now() WHERE id = $1`, vals);
+    if (!rowCount) fail(404, "not_found", "announcement not found");
+    await bumpAnnouncements(q);
+  });
+  const { rows } = await ctx.deps.db.query("SELECT * FROM org_announcements WHERE id = $1", [id]);
+  sendJson(ctx.res, 200, { announcement: view6(rows[0]) });
+}
+async function deleteOrgAnnouncement(ctx) {
+  await guardOwner(ctx, { write: true });
+  const id = uuidParam(ctx.params.id);
+  await ctx.deps.db.transaction(async (q) => {
+    const { rowCount } = await q.query("DELETE FROM org_announcements WHERE id = $1", [id]);
+    if (!rowCount) fail(404, "not_found", "announcement not found");
+    await bumpAnnouncements(q);
+  });
+  sendJson(ctx.res, 200, { deleted: true });
+}
+async function desktopAnnouncements(ctx) {
+  await authenticateDevice(ctx);
+  const version2 = await announcementsVersion(ctx.deps.db);
+  const etag = `"announcements-${version2}"`;
+  if (ctx.req.headers["if-none-match"] === etag) {
+    ctx.res.writeHead(304, { etag, "cache-control": "no-store" });
+    ctx.res.end();
+    return;
+  }
+  const { rows } = await ctx.deps.db.query(
+    "SELECT slug, title, body, level, revision, updated_at FROM org_announcements WHERE enabled ORDER BY updated_at DESC"
+  );
+  sendJson(
+    ctx.res,
+    200,
+    {
+      version: version2,
+      announcements: rows.map((r) => ({ slug: r.slug, title: r.title, body: r.body, level: r.level, revision: r.revision, updatedAt: r.updated_at }))
     },
     { etag }
   );
@@ -5039,6 +5315,73 @@ async function adminBrain(ctx) {
   });
 }
 
+// src/modules/audit.ts
+async function record2(db, actor, action, target, detail = {}) {
+  try {
+    await db.query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)", [
+      actor.slice(0, 254),
+      action.slice(0, 120),
+      target.slice(0, 200),
+      JSON.stringify(detail)
+    ]);
+  } catch {
+  }
+}
+function withAudit(action, handler) {
+  return async (ctx) => {
+    await handler(ctx);
+    try {
+      const session = await ownerSession(ctx);
+      await record2(ctx.deps.db, session.email, action, ctx.params.id ?? "", routeDetail(ctx));
+    } catch {
+    }
+  };
+}
+function routeDetail(ctx) {
+  const detail = { method: ctx.req.method ?? "" };
+  for (const [k, v] of Object.entries(ctx.params)) detail[k] = v;
+  const query = ctx.url.searchParams.get("action");
+  if (query && !detail.action) detail.queryAction = query.slice(0, 60);
+  return detail;
+}
+async function listAudit(ctx) {
+  await guardOwner(ctx, { write: false });
+  const q = ctx.url.searchParams;
+  const limit2 = Math.min(200, Math.max(1, Number(q.get("limit") ?? 50) || 50));
+  const where = [];
+  const params = [];
+  if (q.get("action")) {
+    params.push(q.get("action").slice(0, 120));
+    where.push(`action = $${params.length}`);
+  }
+  if (q.get("actor")) {
+    params.push(q.get("actor").slice(0, 254));
+    where.push(`actor = $${params.length}`);
+  }
+  if (q.get("cursor")) {
+    const c = Number(q.get("cursor"));
+    if (!Number.isInteger(c) || c < 1) fail(400, "invalid_request", "cursor is not valid");
+    params.push(c);
+    where.push(`id < $${params.length}`);
+  }
+  params.push(limit2 + 1);
+  const { rows } = await ctx.deps.db.query(
+    `SELECT id, created_at, actor, action, target, detail FROM audit_log
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+     ORDER BY id DESC LIMIT $${params.length}`,
+    params
+  );
+  const page2 = rows.slice(0, limit2);
+  sendJson(ctx.res, 200, {
+    entries: page2.map((r) => ({ id: Number(r.id), createdAt: r.created_at, actor: r.actor, action: r.action, target: r.target, detail: r.detail ?? {} })),
+    nextCursor: rows.length > limit2 ? String(page2[page2.length - 1].id) : null
+  });
+}
+async function pruneAudit(db, days) {
+  const { rowCount } = await db.query("DELETE FROM audit_log WHERE created_at < now() - make_interval(days => $1)", [days]);
+  return rowCount ?? 0;
+}
+
 // src/app.ts
 var R = (method, path2, handler) => ({ method, parts: path2.split("/").filter(Boolean), handler });
 var routes = [
@@ -5055,6 +5398,7 @@ var routes = [
   R("GET", "/v1/models", apiModelsRoute),
   R("POST", "/v1/memory/sync", syncMemories),
   R("POST", "/v1/brain/beat", brainBeat),
+  R("GET", "/v1/announcements", desktopAnnouncements),
   R("POST", "/v1/search", search),
   R("GET", "/v1/skills", desktopSkills),
   R("GET", "/v1/agents", desktopAgents),
@@ -5078,23 +5422,23 @@ var routes = [
   R("GET", "/admin/api/overview", overview),
   R("GET", "/admin/api/health", adminHealth),
   R("GET", "/admin/api/providers", listProviders),
-  R("POST", "/admin/api/providers", createProvider),
-  R("PATCH", "/admin/api/providers/:id", updateProvider),
-  R("DELETE", "/admin/api/providers/:id", deleteProvider),
-  R("PUT", "/admin/api/providers/:id/api-key", setProviderKey),
-  R("DELETE", "/admin/api/providers/:id/api-key", clearProviderKey),
-  R("POST", "/admin/api/providers/:id/test", testProvider),
-  R("POST", "/admin/api/providers/:id/discover", discoverModels),
+  R("POST", "/admin/api/providers", withAudit("provider.create", createProvider)),
+  R("PATCH", "/admin/api/providers/:id", withAudit("provider.update", updateProvider)),
+  R("DELETE", "/admin/api/providers/:id", withAudit("provider.delete", deleteProvider)),
+  R("PUT", "/admin/api/providers/:id/api-key", withAudit("provider.set_key", setProviderKey)),
+  R("DELETE", "/admin/api/providers/:id/api-key", withAudit("provider.clear_key", clearProviderKey)),
+  R("POST", "/admin/api/providers/:id/test", withAudit("provider.test", testProvider)),
+  R("POST", "/admin/api/providers/:id/discover", withAudit("provider.discover", discoverModels)),
   R("GET", "/admin/api/models", listModels),
-  R("POST", "/admin/api/models", createModel),
-  R("PATCH", "/admin/api/models/:id", updateModel),
-  R("POST", "/admin/api/models/:id/default", setDefaultModel),
-  R("DELETE", "/admin/api/models/:id", deleteModel),
+  R("POST", "/admin/api/models", withAudit("model.create", createModel)),
+  R("PATCH", "/admin/api/models/:id", withAudit("model.update", updateModel)),
+  R("POST", "/admin/api/models/:id/default", withAudit("model.set_default", setDefaultModel)),
+  R("DELETE", "/admin/api/models/:id", withAudit("model.delete", deleteModel)),
   R("GET", "/admin/api/devices", listDevices),
-  R("POST", "/admin/api/devices/:id/revoke", revokeDevice),
-  R("POST", "/admin/api/devices/:id/unblock", unblockDevice),
+  R("POST", "/admin/api/devices/:id/revoke", withAudit("device.revoke", revokeDevice)),
+  R("POST", "/admin/api/devices/:id/unblock", withAudit("device.unblock", unblockDevice)),
   R("GET", "/admin/api/devices/:id/models", getDeviceModels),
-  R("PUT", "/admin/api/devices/:id/models", putDeviceModels),
+  R("PUT", "/admin/api/devices/:id/models", withAudit("device.set_models", putDeviceModels)),
   R("GET", "/admin/api/usage", usage),
   R("GET", "/admin/api/logs", logs),
   R("GET", "/admin/api/brain", adminBrain),
@@ -5102,38 +5446,44 @@ var routes = [
   R("DELETE", "/admin/api/memory", adminClearAllMemory),
   R("DELETE", "/admin/api/memory/:id", adminClearDeviceMemory),
   R("GET", "/admin/api/releases", listReleases),
-  R("POST", "/admin/api/releases", createRelease),
+  R("POST", "/admin/api/releases", withAudit("release.create", createRelease)),
   R("PUT", "/admin/api/releases/:id/chunks/:seq", uploadChunk),
-  R("POST", "/admin/api/releases/:id/complete", completeUpload),
-  R("PATCH", "/admin/api/releases/:id", updateRelease),
-  R("DELETE", "/admin/api/releases/:id", deleteRelease),
+  R("POST", "/admin/api/releases/:id/complete", withAudit("release.complete", completeUpload)),
+  R("PATCH", "/admin/api/releases/:id", withAudit("release.update", updateRelease)),
+  R("DELETE", "/admin/api/releases/:id", withAudit("release.delete", deleteRelease)),
   R("GET", "/admin/api/search-providers", listSearchProviders),
-  R("POST", "/admin/api/search-providers", createSearchProvider),
-  R("PATCH", "/admin/api/search-providers/:id", updateSearchProvider),
-  R("DELETE", "/admin/api/search-providers/:id", deleteSearchProvider),
-  R("PUT", "/admin/api/search-providers/:id/api-key", setSearchProviderKey),
-  R("DELETE", "/admin/api/search-providers/:id/api-key", clearSearchProviderKey),
-  R("POST", "/admin/api/search-providers/:id/test", testSearchProvider),
+  R("POST", "/admin/api/search-providers", withAudit("search_provider.create", createSearchProvider)),
+  R("PATCH", "/admin/api/search-providers/:id", withAudit("search_provider.update", updateSearchProvider)),
+  R("DELETE", "/admin/api/search-providers/:id", withAudit("search_provider.delete", deleteSearchProvider)),
+  R("PUT", "/admin/api/search-providers/:id/api-key", withAudit("search_provider.set_key", setSearchProviderKey)),
+  R("DELETE", "/admin/api/search-providers/:id/api-key", withAudit("search_provider.clear_key", clearSearchProviderKey)),
+  R("POST", "/admin/api/search-providers/:id/test", withAudit("search_provider.test", testSearchProvider)),
   R("GET", "/admin/api/skills", listOrgSkills),
-  R("POST", "/admin/api/skills", createOrgSkill),
-  R("PATCH", "/admin/api/skills/:id", updateOrgSkill),
-  R("DELETE", "/admin/api/skills/:id", deleteOrgSkill),
+  R("POST", "/admin/api/skills", withAudit("skill.create", createOrgSkill)),
+  R("PATCH", "/admin/api/skills/:id", withAudit("skill.update", updateOrgSkill)),
+  R("DELETE", "/admin/api/skills/:id", withAudit("skill.delete", deleteOrgSkill)),
   R("GET", "/admin/api/users", adminListUsers),
   R("GET", "/admin/api/users/:id/activity", adminUserActivity),
   R("GET", "/admin/api/users/:id", adminGetUser),
-  R("POST", "/admin/api/users/:id/:action", adminUserAction),
+  R("POST", "/admin/api/users/:id/:action", withAudit("user.action", adminUserAction)),
   R("GET", "/admin/api/settings", getSettings),
-  R("PATCH", "/admin/api/settings", patchSettings),
+  R("PATCH", "/admin/api/settings", withAudit("settings.update", patchSettings)),
   R("GET", "/admin/api/api-keys", listApiKeys),
-  R("POST", "/admin/api/api-keys", createApiKey),
-  R("PATCH", "/admin/api/api-keys/:id", updateApiKey),
-  R("DELETE", "/admin/api/api-keys/:id", deleteApiKey),
+  R("POST", "/admin/api/api-keys", withAudit("api_key.create", createApiKey)),
+  R("PATCH", "/admin/api/api-keys/:id", withAudit("api_key.update", updateApiKey)),
+  R("DELETE", "/admin/api/api-keys/:id", withAudit("api_key.delete", deleteApiKey)),
   R("GET", "/admin/api/agents", listOrgAgents),
-  R("POST", "/admin/api/agents", createOrgAgent),
-  R("PATCH", "/admin/api/agents/:id", updateOrgAgent),
-  R("DELETE", "/admin/api/agents/:id", deleteOrgAgent),
+  R("POST", "/admin/api/agents", withAudit("agent.create", createOrgAgent)),
+  R("PATCH", "/admin/api/agents/:id", withAudit("agent.update", updateOrgAgent)),
+  R("DELETE", "/admin/api/agents/:id", withAudit("agent.delete", deleteOrgAgent)),
   R("GET", "/admin/api/desktop-config", getDesktopConfig),
-  R("PATCH", "/admin/api/desktop-config", patchDesktopConfig)
+  R("PATCH", "/admin/api/desktop-config", withAudit("desktop_config.update", patchDesktopConfig)),
+  R("GET", "/admin/api/announcements", listOrgAnnouncements),
+  R("POST", "/admin/api/announcements", withAudit("announcement.create", createOrgAnnouncement)),
+  R("PATCH", "/admin/api/announcements/:id", withAudit("announcement.update", updateOrgAnnouncement)),
+  R("DELETE", "/admin/api/announcements/:id", withAudit("announcement.delete", deleteOrgAnnouncement)),
+  R("GET", "/admin/api/audit", listAudit),
+  R("GET", "/admin/api/export", exportConfig)
 ];
 function match(route, pathname) {
   const segs = pathname.split("/").filter(Boolean);
@@ -5962,7 +6312,7 @@ async function serve() {
   log("info", "devora backend listening", { port: config.port, env: config.env, schemaVersion: status.currentVersion });
   const prune = async () => {
     try {
-      const n = await limits.withLock("prune-logs", 10 * 6e4, async () => await pruneLogs(db, config.logRetentionDays) + await pruneSearchLogs(db, config.logRetentionDays));
+      const n = await limits.withLock("prune-logs", 10 * 6e4, async () => await pruneLogs(db, config.logRetentionDays) + await pruneSearchLogs(db, config.logRetentionDays) + await pruneAudit(db, config.logRetentionDays));
       if (n) log("info", "pruned old request logs", { deleted: n, retentionDays: config.logRetentionDays });
     } catch (e) {
       log("error", "log pruning failed", { error: e instanceof Error ? e.name : "unknown" });

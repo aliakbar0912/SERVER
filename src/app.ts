@@ -23,8 +23,10 @@ import * as clientConfig from './modules/client-config.ts';
 import * as releases from './modules/releases.ts';
 import * as apiKeys from './modules/api-keys.ts';
 import * as agents from './modules/agents.ts';
+import * as announcements from './modules/announcements.ts';
 import * as desktopConfig from './modules/desktop-config.ts';
 import * as brain from './modules/brain.ts';
+import * as audit from './modules/audit.ts';
 
 type Handler = (ctx: Ctx) => Promise<void>;
 interface Route {
@@ -49,6 +51,7 @@ const routes: Route[] = [
   R('GET', '/v1/models', catalogue.apiModelsRoute),
   R('POST', '/v1/memory/sync', memory.syncMemories),
   R('POST', '/v1/brain/beat', brain.brainBeat),
+  R('GET', '/v1/announcements', announcements.desktopAnnouncements),
   R('POST', '/v1/search', search.search),
   R('GET', '/v1/skills', skills.desktopSkills),
   R('GET', '/v1/agents', agents.desktopAgents),
@@ -75,25 +78,25 @@ const routes: Route[] = [
   R('GET', '/admin/api/health', health.adminHealth),
 
   R('GET', '/admin/api/providers', providers.listProviders),
-  R('POST', '/admin/api/providers', providers.createProvider),
-  R('PATCH', '/admin/api/providers/:id', providers.updateProvider),
-  R('DELETE', '/admin/api/providers/:id', providers.deleteProvider),
-  R('PUT', '/admin/api/providers/:id/api-key', providers.setProviderKey),
-  R('DELETE', '/admin/api/providers/:id/api-key', providers.clearProviderKey),
-  R('POST', '/admin/api/providers/:id/test', providers.testProvider),
-  R('POST', '/admin/api/providers/:id/discover', providers.discoverModels),
+  R('POST', '/admin/api/providers', audit.withAudit('provider.create', providers.createProvider)),
+  R('PATCH', '/admin/api/providers/:id', audit.withAudit('provider.update', providers.updateProvider)),
+  R('DELETE', '/admin/api/providers/:id', audit.withAudit('provider.delete', providers.deleteProvider)),
+  R('PUT', '/admin/api/providers/:id/api-key', audit.withAudit('provider.set_key', providers.setProviderKey)),
+  R('DELETE', '/admin/api/providers/:id/api-key', audit.withAudit('provider.clear_key', providers.clearProviderKey)),
+  R('POST', '/admin/api/providers/:id/test', audit.withAudit('provider.test', providers.testProvider)),
+  R('POST', '/admin/api/providers/:id/discover', audit.withAudit('provider.discover', providers.discoverModels)),
 
   R('GET', '/admin/api/models', models.listModels),
-  R('POST', '/admin/api/models', models.createModel),
-  R('PATCH', '/admin/api/models/:id', models.updateModel),
-  R('POST', '/admin/api/models/:id/default', models.setDefaultModel),
-  R('DELETE', '/admin/api/models/:id', models.deleteModel),
+  R('POST', '/admin/api/models', audit.withAudit('model.create', models.createModel)),
+  R('PATCH', '/admin/api/models/:id', audit.withAudit('model.update', models.updateModel)),
+  R('POST', '/admin/api/models/:id/default', audit.withAudit('model.set_default', models.setDefaultModel)),
+  R('DELETE', '/admin/api/models/:id', audit.withAudit('model.delete', models.deleteModel)),
 
   R('GET', '/admin/api/devices', devices.listDevices),
-  R('POST', '/admin/api/devices/:id/revoke', devices.revokeDevice),
-  R('POST', '/admin/api/devices/:id/unblock', devices.unblockDevice),
+  R('POST', '/admin/api/devices/:id/revoke', audit.withAudit('device.revoke', devices.revokeDevice)),
+  R('POST', '/admin/api/devices/:id/unblock', audit.withAudit('device.unblock', devices.unblockDevice)),
   R('GET', '/admin/api/devices/:id/models', devices.getDeviceModels),
-  R('PUT', '/admin/api/devices/:id/models', devices.putDeviceModels),
+  R('PUT', '/admin/api/devices/:id/models', audit.withAudit('device.set_models', devices.putDeviceModels)),
 
   R('GET', '/admin/api/usage', data.usage),
   R('GET', '/admin/api/logs', data.logs),
@@ -102,41 +105,49 @@ const routes: Route[] = [
   R('DELETE', '/admin/api/memory', memory.adminClearAllMemory),
   R('DELETE', '/admin/api/memory/:id', memory.adminClearDeviceMemory),
   R('GET', '/admin/api/releases', releases.listReleases),
-  R('POST', '/admin/api/releases', releases.createRelease),
+  R('POST', '/admin/api/releases', audit.withAudit('release.create', releases.createRelease)),
   R('PUT', '/admin/api/releases/:id/chunks/:seq', releases.uploadChunk),
-  R('POST', '/admin/api/releases/:id/complete', releases.completeUpload),
-  R('PATCH', '/admin/api/releases/:id', releases.updateRelease),
-  R('DELETE', '/admin/api/releases/:id', releases.deleteRelease),
+  R('POST', '/admin/api/releases/:id/complete', audit.withAudit('release.complete', releases.completeUpload)),
+  R('PATCH', '/admin/api/releases/:id', audit.withAudit('release.update', releases.updateRelease)),
+  R('DELETE', '/admin/api/releases/:id', audit.withAudit('release.delete', releases.deleteRelease)),
   R('GET', '/admin/api/search-providers', search.listSearchProviders),
-  R('POST', '/admin/api/search-providers', search.createSearchProvider),
-  R('PATCH', '/admin/api/search-providers/:id', search.updateSearchProvider),
-  R('DELETE', '/admin/api/search-providers/:id', search.deleteSearchProvider),
-  R('PUT', '/admin/api/search-providers/:id/api-key', search.setSearchProviderKey),
-  R('DELETE', '/admin/api/search-providers/:id/api-key', search.clearSearchProviderKey),
-  R('POST', '/admin/api/search-providers/:id/test', search.testSearchProvider),
+  R('POST', '/admin/api/search-providers', audit.withAudit('search_provider.create', search.createSearchProvider)),
+  R('PATCH', '/admin/api/search-providers/:id', audit.withAudit('search_provider.update', search.updateSearchProvider)),
+  R('DELETE', '/admin/api/search-providers/:id', audit.withAudit('search_provider.delete', search.deleteSearchProvider)),
+  R('PUT', '/admin/api/search-providers/:id/api-key', audit.withAudit('search_provider.set_key', search.setSearchProviderKey)),
+  R('DELETE', '/admin/api/search-providers/:id/api-key', audit.withAudit('search_provider.clear_key', search.clearSearchProviderKey)),
+  R('POST', '/admin/api/search-providers/:id/test', audit.withAudit('search_provider.test', search.testSearchProvider)),
   R('GET', '/admin/api/skills', skills.listOrgSkills),
-  R('POST', '/admin/api/skills', skills.createOrgSkill),
-  R('PATCH', '/admin/api/skills/:id', skills.updateOrgSkill),
-  R('DELETE', '/admin/api/skills/:id', skills.deleteOrgSkill),
+  R('POST', '/admin/api/skills', audit.withAudit('skill.create', skills.createOrgSkill)),
+  R('PATCH', '/admin/api/skills/:id', audit.withAudit('skill.update', skills.updateOrgSkill)),
+  R('DELETE', '/admin/api/skills/:id', audit.withAudit('skill.delete', skills.deleteOrgSkill)),
   R('GET', '/admin/api/users', accounts.adminListUsers),
   R('GET', '/admin/api/users/:id/activity', accounts.adminUserActivity),
   R('GET', '/admin/api/users/:id', accounts.adminGetUser),
-  R('POST', '/admin/api/users/:id/:action', accounts.adminUserAction),
+  R('POST', '/admin/api/users/:id/:action', audit.withAudit('user.action', accounts.adminUserAction)),
   R('GET', '/admin/api/settings', data.getSettings),
-  R('PATCH', '/admin/api/settings', data.patchSettings),
+  R('PATCH', '/admin/api/settings', audit.withAudit('settings.update', data.patchSettings)),
 
   R('GET', '/admin/api/api-keys', apiKeys.listApiKeys),
-  R('POST', '/admin/api/api-keys', apiKeys.createApiKey),
-  R('PATCH', '/admin/api/api-keys/:id', apiKeys.updateApiKey),
-  R('DELETE', '/admin/api/api-keys/:id', apiKeys.deleteApiKey),
+  R('POST', '/admin/api/api-keys', audit.withAudit('api_key.create', apiKeys.createApiKey)),
+  R('PATCH', '/admin/api/api-keys/:id', audit.withAudit('api_key.update', apiKeys.updateApiKey)),
+  R('DELETE', '/admin/api/api-keys/:id', audit.withAudit('api_key.delete', apiKeys.deleteApiKey)),
 
   R('GET', '/admin/api/agents', agents.listOrgAgents),
-  R('POST', '/admin/api/agents', agents.createOrgAgent),
-  R('PATCH', '/admin/api/agents/:id', agents.updateOrgAgent),
-  R('DELETE', '/admin/api/agents/:id', agents.deleteOrgAgent),
+  R('POST', '/admin/api/agents', audit.withAudit('agent.create', agents.createOrgAgent)),
+  R('PATCH', '/admin/api/agents/:id', audit.withAudit('agent.update', agents.updateOrgAgent)),
+  R('DELETE', '/admin/api/agents/:id', audit.withAudit('agent.delete', agents.deleteOrgAgent)),
 
   R('GET', '/admin/api/desktop-config', desktopConfig.getDesktopConfig),
-  R('PATCH', '/admin/api/desktop-config', desktopConfig.patchDesktopConfig),
+  R('PATCH', '/admin/api/desktop-config', audit.withAudit('desktop_config.update', desktopConfig.patchDesktopConfig)),
+
+  R('GET', '/admin/api/announcements', announcements.listOrgAnnouncements),
+  R('POST', '/admin/api/announcements', audit.withAudit('announcement.create', announcements.createOrgAnnouncement)),
+  R('PATCH', '/admin/api/announcements/:id', audit.withAudit('announcement.update', announcements.updateOrgAnnouncement)),
+  R('DELETE', '/admin/api/announcements/:id', audit.withAudit('announcement.delete', announcements.deleteOrgAnnouncement)),
+
+  R('GET', '/admin/api/audit', audit.listAudit),
+  R('GET', '/admin/api/export', data.exportConfig),
 ];
 
 function match(route: Route, pathname: string): Record<string, string> | null {
