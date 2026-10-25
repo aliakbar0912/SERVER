@@ -27,6 +27,7 @@ import * as announcements from './modules/announcements.ts';
 import * as desktopConfig from './modules/desktop-config.ts';
 import * as brain from './modules/brain.ts';
 import * as audit from './modules/audit.ts';
+import * as website from './modules/website.ts';
 
 type Handler = (ctx: Ctx) => Promise<void>;
 interface Route {
@@ -145,6 +146,17 @@ const routes: Route[] = [
   R('POST', '/admin/api/announcements', audit.withAudit('announcement.create', announcements.createOrgAnnouncement)),
   R('PATCH', '/admin/api/announcements/:id', audit.withAudit('announcement.update', announcements.updateOrgAnnouncement)),
   R('DELETE', '/admin/api/announcements/:id', audit.withAudit('announcement.delete', announcements.deleteOrgAnnouncement)),
+
+  // The Devora website's companion data (plans published on /pricing, the support-form inbox,
+  // the Paddle webhook audit ledger) — stored in PocketBase's website_* collections.
+  R('GET', '/admin/api/website/pricing', website.listWebsitePricing),
+  R('POST', '/admin/api/website/pricing', audit.withAudit('website_pricing.create', website.createWebsitePricing)),
+  R('PATCH', '/admin/api/website/pricing/:id', audit.withAudit('website_pricing.update', website.updateWebsitePricing)),
+  R('DELETE', '/admin/api/website/pricing/:id', audit.withAudit('website_pricing.delete', website.deleteWebsitePricing)),
+  R('GET', '/admin/api/website/support-messages', website.listWebsiteSupport),
+  R('PATCH', '/admin/api/website/support-messages/:id', audit.withAudit('website_support.update', website.updateWebsiteSupport)),
+  R('DELETE', '/admin/api/website/support-messages/:id', audit.withAudit('website_support.delete', website.deleteWebsiteSupport)),
+  R('GET', '/admin/api/website/webhook-events', website.listWebsiteWebhookEvents),
 
   R('GET', '/admin/api/audit', audit.listAudit),
   R('GET', '/admin/api/export', data.exportConfig),

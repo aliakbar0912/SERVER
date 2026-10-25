@@ -232,4 +232,61 @@ export class PocketBase {
     if (r.status !== 204 && r.status !== 200 && r.status !== 404) throw new PbError(r.status || 0, 'the account could not be deleted in the account service');
     return true;
   }
+
+  // ------------------------------------------------- generic record access (superuser)
+  // Used for the Devora website's companion collections (website_pricing,
+  // website_support_messages, website_webhook_events) that the owner manages
+  // from the admin panel. Only for collections this server knows by name.
+
+  /** Lists records of a known companion collection, as superuser. */
+  async listRecords(collection: string, opts: { page?: number; perPage?: number; sort?: string; filter?: string } = {}): Promise<{ items: any[]; total: number }> {
+    this.assertCompanion(collection);
+    const q = new URLSearchParams({ page: String(Math.max(1, opts.page ?? 1)), perPage: String(Math.min(200, Math.max(1, opts.perPage ?? 100))) });
+    if (opts.sort) q.set('sort', opts.sort);
+    if (opts.filter) q.set('filter', opts.filter);
+    const r = await this.admin('GET', `/api/collections/${encodeURIComponent(collection)}/records?${q}`);
+    if (r.status !== 200 || !Array.isArray(r.body?.items)) throw new PbError(r.status === 404 ? 404 : r.status || 0, `the "${collection}" collection is not available in the account service`);
+    return { items: r.body.items, total: Number(r.body.totalItems ?? r.body.items.length) };
+  }
+
+  /** Creates a record in a known companion collection. Returns the stored record. */
+  async createRecord(collection: string, data: Record<string, unknown>): Promise<any> {
+    this.assertCompanion(collection);
+    const r = await this.admin('POST', `/api/collections/${encodeURIComponent(collection)}/records`, data);
+    if ((r.status !== 200 && r.status !== 201) || !r.body?.id) {
+      const detail = r.body?.message ? `: ${String(r.body.message).slice(0, 200)}` : '';
+      throw new PbError(r.status || 0, `the record could not be saved in the account service${detail}`);
+    }
+    return r.body;
+  }
+
+  /** Updates a record in a known companion collection. Returns the stored record. */
+  async updateRecord(collection: string, id: string, data: Record<string, unknown>): Promise<any> {
+    this.assertCompanion(collection);
+    if (!ID.test(id)) throw new PbError(400, 'invalid record id');
+    const r = await this.admin('PATCH', `/api/collections/${encodeURIComponent(collection)}/records/${encodeURIComponent(id)}`, data);
+    if (r.status !== 200 || !r.body?.id) {
+      const detail = r.body?.message ? `: ${String(r.body.message).slice(0, 200)}` : '';
+      throw new PbError(r.status === 404 ? 404 : r.status || 0, `the record could not be updated in the account service${detail}`);
+    }
+    return r.body;
+  }
+
+  /** Deletes a record in a known companion collection. True also when it was already gone. */
+  async deleteRecord(collection: string, id: string): Promise<true> {
+    this.assertCompanion(collection);
+    if (!ID.test(id)) throw new PbError(400, 'invalid record id');
+    const r = await this.admin('DELETE', `/api/collections/${encodeURIComponent(collection)}/records/${encodeURIComponent(id)}`);
+    if (r.status !== 204 && r.status !== 200 && r.status !== 404) throw new PbError(r.status || 0, 'the record could not be deleted in the account service');
+    return true;
+  }
+
+  /** Only these collections are reachable through the generic helpers — never the users collection itself. */
+  private assertCompanion(collection: string): void {
+    if (!COMPANION_COLLECTIONS.includes(collection)) throw new PbError(400, 'this collection is not managed by the admin panel');
+  }
 }
+
+/** The website companion collections the admin panel may manage. */
+export const COMPANION_COLLECTIONS: readonly string[] = ['website_pricing', 'website_support_messages', 'website_webhook_events'];
+
